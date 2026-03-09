@@ -1,0 +1,30 @@
+[package]
+name = "kbui"
+version = "0.1.0"
+edition = "2024"
+
+[package.metadata.bundle]
+name = "KBUI"
+identifier = "com.kbui.app"
+icon = ["assets/macos/AppIcon.icns"]
+
+[dependencies]
+gpui = { version = "0.2.2", default-features = false, features = ["font-kit"] }
+unicode-segmentation = "1.12.0"
+tokio = { version = "1", features = ["rt-multi-thread", "net", "sync", "time", "io-util"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["fmt"] }
+rmpv = "1"
+rocksdb = "0.22"
+tantivy = "0.22"
+directories = "5"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+rmp-serde = "1"
+base64 = "0.22"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+emojis = "0.8.0"
+ffmpeg-next = "8"
+image = "0.25"
+sha2 = "0.10.9"
+chrono = "0.4.44"
