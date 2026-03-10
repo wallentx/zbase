@@ -1,3 +1,4 @@
+use crate::domain::ids::UserId;
 use crate::domain::route::Route;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -8,6 +9,7 @@ pub enum RightPaneMode {
     Members,
     Files,
     Search,
+    Profile(UserId),
 }
 
 #[derive(Clone, Debug)]

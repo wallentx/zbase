@@ -1,5 +1,6 @@
 use crate::{
     domain::{
+        affinity::Affinity,
         attachment::AttachmentKind,
         ids::{MessageId, UserId},
         message::{BroadcastKind, LinkPreview, MessageFragment, MessageRecord, MessageSendState},
@@ -10,6 +11,7 @@ use crate::{
     models::{
         conversation_model::ConversationModel,
         navigation_model::{NavigationModel, RightPaneMode},
+        profile_panel_model::ProfilePanelModel,
         search_model::SearchModel,
         thread_pane_model::ThreadPaneModel,
         timeline_model::{InlineEmojiRender, MessageRow, TimelineModel, TimelineRow},
@@ -17,29 +19,31 @@ use crate::{
     util::formatting::message_timestamp_label,
     views::{
         CUSTOM_EMOJI_EMOJI_ONLY_SIZE_PX, CUSTOM_EMOJI_INLINE_SIZE_PX,
-        RIGHT_PANE_RESIZE_HANDLE_WIDTH_PX, RIGHT_PANE_WIDTH_PX, accent, accent_soft,
+        RIGHT_PANE_RESIZE_HANDLE_WIDTH_PX, accent, accent_soft,
         app_window::{AppWindow, video_preview_cache_key},
         attachment_display_label, attachment_image_source, attachment_lightbox_source,
         avatar::{Avatar, default_avatar_background},
-        badge, border, chevron_down_icon, close_icon, composer_tool, danger, danger_soft,
-        emoji_icon, glass_surface_strong,
+        badge, border, chevron_down_icon, close_icon, danger, danger_soft, emoji_icon,
+        glass_surface_strong,
         inline_markdown::{InlineMarkdownConfig, apply_inline_markdown, remap_source_byte_range},
         input::TextField,
-        mention, mention_icon, mention_soft, panel_alt_bg, panel_alt_surface, panel_bg,
-        panel_surface, plus_icon,
+        is_dark_theme, mention_colors_for_user, mention_soft, panel_alt_bg, panel_alt_surface,
+        panel_bg,
         selectable_text::{
             InlineAttachment, LinkRange, SelectableText, StyledRange, resolve_selectable_text,
             resolve_selectable_text_inline, resolve_selectable_text_with_attachments,
         },
         subtle_surface, text_primary, text_secondary,
         timeline::TimelineList,
+        tint,
     },
 };
 use gpui::prelude::FluentBuilder;
 use gpui::{
-    AnyElement, Context, CursorStyle, Entity, FontWeight, ImageSource, InteractiveElement,
-    IntoElement, MouseButton, ObjectFit, ParentElement, RenderImage, ScrollHandle, SharedString,
-    StatefulInteractiveElement, Styled, StyledImage, div, img, px, rgb,
+    AnyElement, AppContext, Context, CursorStyle, Entity, ExternalPaths, FontWeight, ImageSource,
+    InteractiveElement, IntoElement, MouseButton, ObjectFit, ParentElement, Render, RenderImage,
+    ScrollHandle, SharedString, StatefulInteractiveElement, Styled, StyledImage, Window, div, img,
+    px, rgb,
 };
 use std::{
     collections::{HashMap, HashSet},
@@ -48,6 +52,18 @@ use std::{
 
 #[derive(Default)]
 pub struct RightPaneHost;
+
+#[derive(Clone, Debug)]
+pub(crate) struct RightPaneResizeDrag;
+
+#[derive(Default)]
+struct RightPaneResizeDragPreview;
+
+impl Render for RightPaneResizeDragPreview {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        div().w(px(0.)).h(px(0.))
+    }
+}
 
 #[derive(Default)]
 pub struct ThreadPane;
@@ -58,6 +74,7 @@ impl RightPaneHost {
         navigation: &NavigationModel,
         thread: &ThreadPaneModel,
         conversation: &ConversationModel,
+        profile_panel: &ProfilePanelModel,
         search: &SearchModel,
         timeline: &TimelineModel,
         video_render_cache: &HashMap<String, Arc<RenderImage>>,
@@ -69,7 +86,7 @@ impl RightPaneHost {
     ) -> AnyElement {
         let content = match navigation.right_pane {
             RightPaneMode::Hidden => div().into_any_element(),
-            RightPaneMode::Thread => ThreadPane::default().render(
+            RightPaneMode::Thread => ThreadPane.render(
                 thread,
                 timeline,
                 video_render_cache,
@@ -85,13 +102,15 @@ impl RightPaneHost {
             RightPaneMode::Search => {
                 render_search_panel(conversation, search, video_render_cache, cx)
             }
+            RightPaneMode::Profile(_) => {
+                crate::views::profile::render_profile_panel(profile_panel, cx)
+            }
         };
 
         div()
-            .w(px(match navigation.right_pane {
-                RightPaneMode::Thread => thread.width_px,
-                _ => RIGHT_PANE_WIDTH_PX,
-            }))
+            // Use the resizable width for all right-pane modes (thread, profile, etc.)
+            // so the resize handle always does something visible.
+            .w(px(thread.width_px))
             .flex_shrink_0()
             .h_full()
             .flex()
@@ -103,6 +122,9 @@ impl RightPaneHost {
                     .bg(glass_surface_strong())
                     .cursor(CursorStyle::ResizeColumn)
                     .id("thread-pane-resize-handle")
+                    .on_drag(RightPaneResizeDrag, |_, _, _, cx| {
+                        cx.new(|_| RightPaneResizeDragPreview)
+                    })
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(AppWindow::begin_thread_resize),
@@ -154,6 +176,22 @@ impl ThreadPane {
             .flex_col()
             .overflow_hidden()
             .text_color(rgb(text_primary()))
+            .drag_over::<ExternalPaths>(|style, _, _, _| {
+                style
+                    .bg(if is_dark_theme() {
+                        tint(0x0b1117, 0.72)
+                    } else {
+                        tint(0xe8eef5, 0.70)
+                    })
+                    .border_2()
+                    .border_color(rgb(accent()))
+            })
+            .on_drop(cx.listener(|this, paths: &ExternalPaths, _, cx| {
+                let file_paths = paths.paths().to_vec();
+                if !file_paths.is_empty() {
+                    this.open_thread_file_upload_with_paths(file_paths, cx);
+                }
+            }))
             .child(
                 div()
                     .px_4()
@@ -186,13 +224,14 @@ impl ThreadPane {
             .child(
                 div()
                     .flex_1()
+                    .min_h(px(0.))
                     .id("thread-pane-scroll")
                     .overflow_y_scroll()
                     .scrollbar_width(px(8.))
                     .track_scroll(thread_scroll)
                     .on_scroll_wheel(cx.listener(AppWindow::thread_scrolled))
-                    .pr_2()
-                    .child(div().mx_4().my_4().flex().flex_col().gap_5().children(
+                    .pr_8()
+                    .child(div().mt_4().pb_4().flex().flex_col().gap_1().children(
                         thread_rows.into_iter().map(|row| {
                             let timeline_row = TimelineRow::Message(row);
                             TimelineList::render_thread_row(
@@ -234,142 +273,32 @@ impl ThreadPane {
                     .mx_4()
                     .mb_4()
                     .flex_shrink_0()
-                    .rounded_lg()
-                    .border_1()
-                    .border_color(rgb(border()))
-                    .bg(panel_surface())
-                    .p_2p5()
-                    .flex()
-                    .flex_col()
-                    .gap_2()
-                    .justify_between()
+                    .rounded_md()
+                    .bg(panel_alt_surface())
+                    .text_sm()
+                    .line_height(px(22.))
+                    .text_color(rgb(text_primary()))
+                    .relative()
+                    .id("thread-pane-input-surface")
+                    .on_click(cx.listener(AppWindow::focus_thread_input))
+                    .child(div().px_3().py_2().pr(px(36.)).child(reply_input.clone()))
                     .child(
-                        div()
-                            .rounded_md()
-                            .bg(panel_alt_surface())
-                            .overflow_hidden()
-                            .px_3()
-                            .py_2p5()
-                            .text_sm()
-                            .line_height(px(24.))
-                            .text_color(rgb(text_primary()))
-                            .id("thread-pane-input-surface")
-                            .on_click(cx.listener(AppWindow::focus_thread_input))
-                            .child(reply_input.clone()),
-                    )
-                    .when(!thread.reply_attachments.is_empty(), |container| {
-                        container.child(div().flex().gap_2().children(
-                            thread.reply_attachments.iter().enumerate().map(
-                                |(index, attachment)| {
-                                    let attachment_label = attachment_display_label(attachment);
-                                    div()
-                                        .rounded_md()
-                                        .bg(panel_alt_surface())
-                                        .px_2()
-                                        .py_1()
-                                        .flex()
-                                        .items_center()
-                                        .gap_2()
-                                        .child(attachment_label)
-                                        .child(
-                                            div()
-                                                .id(("thread-attachment-remove", index))
-                                                .on_click(cx.listener(move |this, _, _, cx| {
-                                                    this.thread_remove_attachment(index, cx);
-                                                }))
-                                                .child(badge("Remove", panel_bg(), text_primary())),
-                                        )
-                                        .into_any_element()
-                                },
-                            ),
-                        ))
-                    })
-                    .when_some(
-                        thread.reply_autocomplete.as_ref(),
-                        |container, autocomplete| {
-                            container.child(
-                                div()
-                                    .px_2()
-                                    .text_xs()
-                                    .text_color(rgb(text_secondary()))
-                                    .child(format!(
-                                        "Autocomplete · {}{}",
-                                        autocomplete.trigger, autocomplete.query
-                                    )),
-                            )
-                        },
-                    )
-                    .child(
-                        div()
-                            .pt_2()
-                            .border_t_1()
-                            .border_color(rgb(border()))
-                            .flex()
-                            .flex_col()
-                            .child(
-                                div()
-                                    .flex()
-                                    .items_center()
-                                    .gap_2()
-                                    .flex_wrap()
-                                    .child(
-                                        div()
-                                            .id("thread-tool-attach")
-                                            .on_click(cx.listener(|this, _, _, cx| {
-                                                this.thread_add_attachment(cx);
-                                                this.open_attachment_modal("thread", cx);
-                                            }))
-                                            .child(composer_tool(
-                                                plus_icon(text_secondary()),
-                                                text_secondary(),
-                                            )),
-                                    )
-                                    .child(
-                                        div()
-                                            .id("thread-tool-emoji")
-                                            .on_click(cx.listener(|this, _, _, cx| {
-                                                this.toggle_emoji_picker(cx);
-                                            }))
-                                            .child(composer_tool(
-                                                emoji_icon(text_secondary()),
-                                                text_secondary(),
-                                            )),
-                                    )
-                                    .child(
-                                        div()
-                                            .id("thread-tool-mention")
-                                            .on_click(cx.listener(|this, _, _, cx| {
-                                                this.thread_insert_mention(cx);
-                                            }))
-                                            .child(composer_tool(
-                                                mention_icon(text_secondary()),
-                                                text_secondary(),
-                                            )),
-                                    ),
-                            )
-                            .child(
-                                div()
-                                    .flex()
-                                    .items_center()
-                                    .justify_end()
-                                    .gap_2()
-                                    .pt_2()
-                                    .flex_wrap()
-                                    .child(
-                                        div()
-                                            .text_xs()
-                                            .text_color(rgb(text_secondary()))
-                                            .child("Enter sends"),
-                                    )
-                                    .child(
-                                        div()
-                                            .id("thread-pane-send")
-                                            .on_click(cx.listener(|this, _, window, cx| {
-                                                this.send_thread_reply(window, cx);
-                                            }))
-                                            .child(badge("Send", accent(), panel_bg())),
-                                    ),
-                            ),
+                        div().absolute().bottom_1().right_1().child(
+                            div()
+                                .id("thread-emoji-inline")
+                                .w(px(24.))
+                                .h(px(24.))
+                                .rounded_md()
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .cursor(gpui::CursorStyle::PointingHand)
+                                .hover(|s| s.bg(rgb(0x00000010)))
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.toggle_emoji_picker(cx);
+                                }))
+                                .child(emoji_icon(text_secondary())),
+                        ),
                     ),
             )
             .into_any_element()
@@ -402,7 +331,7 @@ fn plain_text_from_fragments(fragments: &[MessageFragment]) -> String {
             | MessageFragment::InlineCode(value)
             | MessageFragment::Code(value)
             | MessageFragment::Quote(value) => text.push_str(value),
-            MessageFragment::Emoji { alias } => text.push_str(&format!(":{alias}:")),
+            MessageFragment::Emoji { alias, .. } => text.push_str(&format!(":{alias}:")),
             MessageFragment::Mention(user_id) => text.push_str(&format!("@{}", user_id.0)),
             MessageFragment::ChannelMention { name } => text.push_str(&format!("#{name}")),
             MessageFragment::BroadcastMention(BroadcastKind::Here) => text.push_str("@here"),
@@ -417,7 +346,10 @@ fn render_parent_message(
     author_name: String,
     avatar_asset: Option<String>,
     message: MessageRecord,
+    affinity_index: &HashMap<UserId, Affinity>,
+    current_user_id: Option<&UserId>,
     emoji_index: &HashMap<String, InlineEmojiRender>,
+    emoji_source_index: &HashMap<String, InlineEmojiRender>,
     video_render_cache: &HashMap<String, Arc<RenderImage>>,
     selectable_texts: &mut HashMap<String, Entity<SelectableText>>,
     cx: &mut Context<AppWindow>,
@@ -470,7 +402,15 @@ fn render_parent_message(
                     if image_attachment_message {
                         div().into_any_element()
                     } else {
-                        render_message_fragments(&message, emoji_index, selectable_texts, cx)
+                        render_message_fragments(
+                            &message,
+                            affinity_index,
+                            current_user_id,
+                            emoji_index,
+                            emoji_source_index,
+                            selectable_texts,
+                            cx,
+                        )
                     }
                 })
                 .when(!message.link_previews.is_empty(), |container| {
@@ -513,6 +453,8 @@ fn render_parent_message(
                                         let lightbox_source =
                                             attachment_lightbox_source(attachment);
                                         let caption_text = message_caption_text(&message);
+                                        let lightbox_width = preview_width;
+                                        let lightbox_height = preview_height;
                                         return div()
                                             .id(SharedString::from(format!(
                                                 "right-pane-attachment-image-{}-{index}",
@@ -529,6 +471,8 @@ fn render_parent_message(
                                                         this.open_image_lightbox(
                                                             lightbox_source.clone(),
                                                             caption_text.clone(),
+                                                            lightbox_width,
+                                                            lightbox_height,
                                                             cx,
                                                         );
                                                     }))
@@ -570,7 +514,10 @@ fn render_parent_message(
                     |container| {
                         container.child(render_message_fragments(
                             &message,
+                            affinity_index,
+                            current_user_id,
                             emoji_index,
+                            emoji_source_index,
                             selectable_texts,
                             cx,
                         ))
@@ -589,7 +536,7 @@ fn message_caption_text(message: &MessageRecord) -> Option<String> {
             | MessageFragment::Code(text)
             | MessageFragment::Quote(text) => text.clone(),
             MessageFragment::InlineCode(text) => format!("`{text}`"),
-            MessageFragment::Emoji { alias } => format!(":{alias}:"),
+            MessageFragment::Emoji { alias, .. } => format!(":{alias}:"),
             MessageFragment::Mention(user_id) => format!("@{}", user_id.0),
             MessageFragment::ChannelMention { name } => format!("#{name}"),
             MessageFragment::BroadcastMention(BroadcastKind::Here) => "@here".to_string(),
@@ -604,7 +551,10 @@ fn message_caption_text(message: &MessageRecord) -> Option<String> {
 
 fn render_message_fragments(
     message: &MessageRecord,
+    affinity_index: &HashMap<UserId, Affinity>,
+    current_user_id: Option<&UserId>,
     emoji_index: &HashMap<String, InlineEmojiRender>,
+    emoji_source_index: &HashMap<String, InlineEmojiRender>,
     selectable_texts: &mut HashMap<String, Entity<SelectableText>>,
     cx: &mut Context<AppWindow>,
 ) -> AnyElement {
@@ -629,7 +579,10 @@ fn render_message_fragments(
             &message.id.0,
             format!("right-pane-{}-inline", message.id.0),
             &message.fragments,
+            affinity_index,
+            current_user_id,
             emoji_index,
+            emoji_source_index,
             emoji_only,
             selectable_texts,
             cx,
@@ -663,7 +616,10 @@ fn render_message_fragments(
                 &message.id.0,
                 key,
                 &inline_group,
+                affinity_index,
+                current_user_id,
                 emoji_index,
+                emoji_source_index,
                 emoji_only,
                 selectable_texts,
                 cx,
@@ -677,7 +633,10 @@ fn render_message_fragments(
             index,
             fragment,
             false,
+            affinity_index,
+            current_user_id,
             emoji_index,
+            emoji_source_index,
             emoji_only,
             selectable_texts,
             cx,
@@ -689,7 +648,10 @@ fn render_message_fragments(
             &message.id.0,
             key,
             &inline_group,
+            affinity_index,
+            current_user_id,
             emoji_index,
+            emoji_source_index,
             emoji_only,
             selectable_texts,
             cx,
@@ -946,9 +908,17 @@ fn render_members_panel(
     cx: &mut Context<AppWindow>,
 ) -> AnyElement {
     let members = match conversation.summary.title.as_str() {
-        "design" => vec!["You", "Sam Rivera", "Alice Johnson"],
-        "Alice Johnson" => vec!["You", "Alice Johnson"],
-        _ => vec!["You", "Alice Johnson", "Sam Rivera"],
+        "design" => vec![
+            ("you", "You"),
+            ("sam_rivera", "Sam Rivera"),
+            ("alice_johnson", "Alice Johnson"),
+        ],
+        "Alice Johnson" => vec![("you", "You"), ("alice_johnson", "Alice Johnson")],
+        _ => vec![
+            ("you", "You"),
+            ("alice_johnson", "Alice Johnson"),
+            ("sam_rivera", "Sam Rivera"),
+        ],
     };
 
     div()
@@ -961,16 +931,28 @@ fn render_members_panel(
         .flex_col()
         .gap_3()
         .child(pane_header("Members", "members-pane-close", cx))
-        .children(members.into_iter().map(|member| {
-            div()
-                .rounded_lg()
-                .bg(panel_alt_surface())
-                .px_3()
-                .py_2()
-                .text_sm()
-                .child(member)
-                .into_any_element()
-        }))
+        .children(
+            members
+                .into_iter()
+                .enumerate()
+                .map(|(index, (id, member))| {
+                    let user_id = UserId::new(id.to_string());
+                    let label = member.to_string();
+                    div()
+                        .id(("members-pane-row", index))
+                        .rounded_lg()
+                        .bg(panel_alt_surface())
+                        .px_3()
+                        .py_2()
+                        .text_sm()
+                        .cursor(CursorStyle::PointingHand)
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.open_user_profile_card(user_id.clone(), cx);
+                        }))
+                        .child(label)
+                        .into_any_element()
+                }),
+        )
         .into_any_element()
 }
 
@@ -1011,7 +993,6 @@ fn render_files_panel(timeline: &TimelineModel, cx: &mut Context<AppWindow>) -> 
                 .into_iter()
                 .enumerate()
                 .map(|(index, attachment)| {
-                    let attachment_name = attachment.name.clone();
                     let attachment_label = attachment_display_label(&attachment);
                     div()
                         .id(("right-pane-file", index))
@@ -1023,14 +1004,6 @@ fn render_files_panel(timeline: &TimelineModel, cx: &mut Context<AppWindow>) -> 
                         .items_center()
                         .justify_between()
                         .child(attachment_label)
-                        .child(
-                            div()
-                                .id(("right-pane-file-action", index))
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.open_attachment_context_menu(attachment_name.clone(), cx);
-                                }))
-                                .child(badge("Actions", panel_bg(), text_primary())),
-                        )
                         .into_any_element()
                 }),
         )
@@ -1118,7 +1091,10 @@ fn render_inline_fragments(
     _message_key: &str,
     render_key: String,
     fragments: &[MessageFragment],
+    affinity_index: &HashMap<UserId, Affinity>,
+    current_user_id: Option<&UserId>,
     emoji_index: &HashMap<String, InlineEmojiRender>,
+    emoji_source_index: &HashMap<String, InlineEmojiRender>,
     emoji_only: bool,
     selectable_texts: &mut HashMap<String, Entity<SelectableText>>,
     cx: &mut Context<AppWindow>,
@@ -1154,9 +1130,13 @@ fn render_inline_fragments(
             MessageFragment::InlineCode(code) => {
                 push_inline_code_span(&mut combined, &mut styled_ranges, code);
             }
-            MessageFragment::Emoji { alias } => {
-                let key = alias.to_ascii_lowercase();
-                if let Some(render) = emoji_index.get(&key) {
+            MessageFragment::Emoji { alias, source_ref } => {
+                if let Some(render) = resolved_emoji_render(
+                    alias,
+                    source_ref.as_ref(),
+                    emoji_index,
+                    emoji_source_index,
+                ) {
                     if let Some(unicode) = render.unicode.as_ref() {
                         combined.push_str(unicode);
                         continue;
@@ -1172,17 +1152,29 @@ fn render_inline_fragments(
                         continue;
                     }
                 }
-                combined.push_str(&inline_emoji_text(alias, emoji_index));
+                combined.push_str(&inline_emoji_text(
+                    alias,
+                    source_ref.as_ref(),
+                    emoji_index,
+                    emoji_source_index,
+                ));
             }
             MessageFragment::Mention(user_id) => {
                 let label = format!("@{}", user_id.0);
+                let start = combined.len();
+                let (foreground, background) =
+                    mention_colors_for_user(affinity_index, current_user_id, user_id);
                 push_styled_span(
                     &mut combined,
                     &mut styled_ranges,
                     &label,
-                    mention(),
-                    mention_soft(),
+                    foreground,
+                    background,
                 );
+                link_ranges.push(LinkRange {
+                    byte_range: start..combined.len(),
+                    url: format!("kbui-mention:{}", user_id.0),
+                });
             }
             MessageFragment::ChannelMention { name } => {
                 let label = format!("#{name}");
@@ -1277,7 +1269,10 @@ fn render_inline_fragments(
 fn render_inline_fragments_with_asset_emojis(
     message_key: &str,
     fragments: &[MessageFragment],
+    affinity_index: &HashMap<UserId, Affinity>,
+    current_user_id: Option<&UserId>,
     emoji_index: &HashMap<String, InlineEmojiRender>,
+    emoji_source_index: &HashMap<String, InlineEmojiRender>,
     emoji_only: bool,
     selectable_texts: &mut HashMap<String, Entity<SelectableText>>,
     cx: &mut Context<AppWindow>,
@@ -1288,13 +1283,13 @@ fn render_inline_fragments_with_asset_emojis(
     let mut asset_emojis: Vec<AnyElement> = Vec::new();
 
     for fragment in fragments {
-        if fragment_requires_asset_emoji_box(fragment, emoji_index) {
-            let MessageFragment::Emoji { alias } = fragment else {
+        if fragment_requires_asset_emoji_box(fragment, emoji_index, emoji_source_index) {
+            let MessageFragment::Emoji { alias, source_ref } = fragment else {
                 continue;
             };
-            let key = alias.to_ascii_lowercase();
-            if let Some(render) = emoji_index.get(&key) {
-                if let Some(asset_path) = render.asset_path.as_ref() {
+            if let Some(render) =
+                resolved_emoji_render(alias, source_ref.as_ref(), emoji_index, emoji_source_index)
+                && let Some(asset_path) = render.asset_path.as_ref() {
                     let size = custom_emoji_size_px(emoji_only);
                     asset_emojis.push(
                         div()
@@ -1323,7 +1318,6 @@ fn render_inline_fragments_with_asset_emojis(
                             .into_any_element(),
                     );
                 }
-            }
             continue;
         }
 
@@ -1349,18 +1343,30 @@ fn render_inline_fragments_with_asset_emojis(
             MessageFragment::InlineCode(code) => {
                 push_inline_code_span(&mut combined, &mut styled_ranges, code);
             }
-            MessageFragment::Emoji { alias } => {
-                combined.push_str(&inline_emoji_text(alias, emoji_index));
+            MessageFragment::Emoji { alias, source_ref } => {
+                combined.push_str(&inline_emoji_text(
+                    alias,
+                    source_ref.as_ref(),
+                    emoji_index,
+                    emoji_source_index,
+                ));
             }
             MessageFragment::Mention(user_id) => {
                 let label = format!("@{}", user_id.0);
+                let start = combined.len();
+                let (foreground, background) =
+                    mention_colors_for_user(affinity_index, current_user_id, user_id);
                 push_styled_span(
                     &mut combined,
                     &mut styled_ranges,
                     &label,
-                    mention(),
-                    mention_soft(),
+                    foreground,
+                    background,
                 );
+                link_ranges.push(LinkRange {
+                    byte_range: start..combined.len(),
+                    url: format!("kbui-mention:{}", user_id.0),
+                });
             }
             MessageFragment::ChannelMention { name } => {
                 let label = format!("#{name}");
@@ -1480,7 +1486,10 @@ fn render_fragment(
     index: usize,
     fragment: &MessageFragment,
     compact_inline: bool,
+    affinity_index: &HashMap<UserId, Affinity>,
+    current_user_id: Option<&UserId>,
     emoji_index: &HashMap<String, InlineEmojiRender>,
+    emoji_source_index: &HashMap<String, InlineEmojiRender>,
     emoji_only: bool,
     selectable_texts: &mut HashMap<String, Entity<SelectableText>>,
     cx: &mut Context<AppWindow>,
@@ -1600,9 +1609,10 @@ fn render_fragment(
                 .child(selectable)
                 .into_any_element()
         }
-        MessageFragment::Emoji { alias } => {
-            let key = alias.to_ascii_lowercase();
-            if let Some(render) = emoji_index.get(&key) {
+        MessageFragment::Emoji { alias, source_ref } => {
+            if let Some(render) =
+                resolved_emoji_render(alias, source_ref.as_ref(), emoji_index, emoji_source_index)
+            {
                 if let Some(unicode) = render.unicode.as_ref() {
                     return div()
                         .text_color(rgb(text_primary()))
@@ -1671,16 +1681,22 @@ fn render_fragment(
                 .child(format!(":{alias}:"))
                 .into_any_element()
         }
-        MessageFragment::Mention(user_id) => render_styled_fragment_text(
-            message_key,
-            index,
-            format!("@{}", user_id.0),
-            mention(),
-            mention_soft(),
-            compact_inline,
-            selectable_texts,
-            cx,
-        ),
+        MessageFragment::Mention(user_id) => {
+            let label = format!("@{}", user_id.0);
+            let (foreground, background) =
+                mention_colors_for_user(affinity_index, current_user_id, user_id);
+            render_linked_styled_fragment_text(
+                message_key,
+                index,
+                &label,
+                format!("kbui-mention:{}", user_id.0),
+                foreground,
+                background,
+                compact_inline,
+                selectable_texts,
+                cx,
+            )
+        }
         MessageFragment::ChannelMention { name } => {
             let label = format!("#{name}");
             render_linked_styled_fragment_text(
@@ -1929,10 +1945,28 @@ fn push_inline_asset_emoji_attachment(
     }
 }
 
-fn inline_emoji_text(alias: &str, emoji_index: &HashMap<String, InlineEmojiRender>) -> String {
+fn resolved_emoji_render<'a>(
+    alias: &str,
+    source_ref: Option<&crate::domain::message::EmojiSourceRef>,
+    emoji_index: &'a HashMap<String, InlineEmojiRender>,
+    emoji_source_index: &'a HashMap<String, InlineEmojiRender>,
+) -> Option<&'a InlineEmojiRender> {
+    if let Some(source_ref) = source_ref
+        && let Some(render) = emoji_source_index.get(&source_ref.cache_key())
+    {
+        return Some(render);
+    }
     let key = alias.to_ascii_lowercase();
-    if let Some(unicode) = emoji_index
-        .get(&key)
+    emoji_index.get(&key)
+}
+
+fn inline_emoji_text(
+    alias: &str,
+    source_ref: Option<&crate::domain::message::EmojiSourceRef>,
+    emoji_index: &HashMap<String, InlineEmojiRender>,
+    emoji_source_index: &HashMap<String, InlineEmojiRender>,
+) -> String {
+    if let Some(unicode) = resolved_emoji_render(alias, source_ref, emoji_index, emoji_source_index)
         .and_then(|render| render.unicode.clone())
     {
         return unicode;
@@ -1946,13 +1980,12 @@ fn inline_emoji_text(alias: &str, emoji_index: &HashMap<String, InlineEmojiRende
 fn fragment_requires_asset_emoji_box(
     fragment: &MessageFragment,
     emoji_index: &HashMap<String, InlineEmojiRender>,
+    emoji_source_index: &HashMap<String, InlineEmojiRender>,
 ) -> bool {
-    let MessageFragment::Emoji { alias } = fragment else {
+    let MessageFragment::Emoji { alias, source_ref } = fragment else {
         return false;
     };
-    let key = alias.to_ascii_lowercase();
-    emoji_index
-        .get(&key)
+    resolved_emoji_render(alias, source_ref.as_ref(), emoji_index, emoji_source_index)
         .map(|render| render.unicode.is_none() && render.asset_path.is_some())
         .unwrap_or(false)
 }
@@ -2145,6 +2178,23 @@ fn build_thread_message_rows(
     thread: &ThreadPaneModel,
     timeline: &TimelineModel,
 ) -> Vec<MessageRow> {
+    const NON_TEXT_PLACEHOLDER_BODY: &str = "<non-text message>";
+    fn is_non_text_placeholder_message(message: &MessageRecord) -> bool {
+        if message.event.is_some() {
+            return false;
+        }
+        if !message.attachments.is_empty() || !message.link_previews.is_empty() {
+            return false;
+        }
+        if message.fragments.len() != 1 {
+            return false;
+        }
+        matches!(
+            message.fragments.first(),
+            Some(MessageFragment::Text(text)) if text.trim() == NON_TEXT_PLACEHOLDER_BODY
+        )
+    }
+
     let mut messages = thread.replies.clone();
     if let Some(root_id) = thread.root_message_id.as_ref()
         && !messages.iter().any(|message| &message.id == root_id)
@@ -2156,12 +2206,12 @@ fn build_thread_message_rows(
     messages.sort_by_key(|message| message.id.0.parse::<u64>().unwrap_or(0));
     let mut seen_ids = HashSet::new();
     messages.retain(|message| seen_ids.insert(message.id.clone()));
+    messages.retain(|message| !is_non_text_placeholder_message(message));
 
     let mut rows = Vec::with_capacity(messages.len());
     let mut previous_message: Option<(UserId, Option<i64>)> = None;
     for message in messages {
-        let show_header = previous_message.as_ref().map_or(
-            true,
+        let show_header = previous_message.as_ref().is_none_or(
             |(previous_author_id, previous_timestamp_ms)| {
                 if previous_author_id != &message.author_id {
                     return true;
@@ -2208,6 +2258,7 @@ fn resolve_thread_author_summary(timeline: &TimelineModel, author_id: &UserId) -
             availability: Availability::Offline,
             status_text: None,
         },
+        affinity: Affinity::None,
     }
 }
 

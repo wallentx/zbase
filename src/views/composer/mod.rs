@@ -1,15 +1,14 @@
 use crate::{
     models::composer_model::{ComposerMode, ComposerModel},
     views::{
-        accent, app_window::AppWindow, attachment_display_label, badge, composer_tool,
-        content_surface, emoji_icon, format_icon, input::TextField, link_icon, mention_icon,
-        panel_alt_bg, panel_bg, plus_icon, shell_border, text_primary, text_secondary, video_icon,
+        accent, accent_soft, app_window::AppWindow, emoji_icon, input::TextField, is_dark_theme,
+        paperclip_icon, shell_border, text_primary, text_secondary, tint,
     },
 };
 use gpui::prelude::FluentBuilder;
 use gpui::{
-    AnyElement, Context, Entity, InteractiveElement, IntoElement, ParentElement,
-    StatefulInteractiveElement, Styled, div, px, rgb,
+    AnyElement, Context, CursorStyle, Entity, FontWeight, InteractiveElement, IntoElement,
+    ParentElement, StatefulInteractiveElement, Styled, div, px, rgb,
 };
 
 #[derive(Default)]
@@ -24,16 +23,28 @@ impl ComposerPanel {
     ) -> AnyElement {
         let mode_banner = match &composer.mode {
             ComposerMode::Compose => None,
-            ComposerMode::Edit { message_id } => Some(badge(
-                format!("Editing {}", message_id.0),
-                panel_alt_bg(),
-                text_primary(),
-            )),
-            ComposerMode::ReplyInThread { root_id } => Some(badge(
-                format!("Replying in thread {}", root_id.0),
-                panel_alt_bg(),
-                text_primary(),
-            )),
+            ComposerMode::Edit { .. } => Some(
+                div()
+                    .pl_2()
+                    .border_l_2()
+                    .border_color(rgb(accent()))
+                    .text_xs()
+                    .font_weight(FontWeight::MEDIUM)
+                    .text_color(rgb(text_secondary()))
+                    .child("Editing · press Escape to cancel")
+                    .into_any_element(),
+            ),
+            ComposerMode::ReplyInThread { .. } => Some(
+                div()
+                    .pl_2()
+                    .border_l_2()
+                    .border_color(rgb(accent()))
+                    .text_xs()
+                    .font_weight(FontWeight::MEDIUM)
+                    .text_color(rgb(text_secondary()))
+                    .child("Replying in thread")
+                    .into_any_element(),
+            ),
         };
 
         div()
@@ -49,178 +60,72 @@ impl ComposerPanel {
             .child(
                 div()
                     .rounded_md()
-                    .bg(content_surface())
-                    .overflow_hidden()
-                    .px_3()
-                    .py_2()
+                    .bg(if is_dark_theme() {
+                        tint(0x141d25, 0.34)
+                    } else {
+                        tint(0xffffff, 0.86)
+                    })
                     .w_full()
                     .text_sm()
                     .line_height(px(22.))
                     .text_color(rgb(text_primary()))
+                    .relative()
                     .id("composer-input-surface")
                     .on_click(cx.listener(AppWindow::focus_composer_input))
-                    .child(editor.clone()),
-            )
-            .when(!composer.attachments.is_empty(), |container| {
-                container.child(
-                    div()
-                        .flex()
-                        .gap_2()
-                        .children(composer.attachments.iter().enumerate().map(
-                            |(index, attachment)| {
-                                let attachment_name = attachment.name.clone();
-                                let attachment_label = attachment_display_label(attachment);
-                                div()
-                                    .rounded_md()
-                                    .bg(content_surface())
-                                    .px_2()
-                                    .py_1()
-                                    .flex()
-                                    .items_center()
-                                    .gap_2()
-                                    .child(
-                                        div()
-                                            .text_xs()
-                                            .text_color(rgb(text_primary()))
-                                            .child(attachment_label),
-                                    )
-                                    .child(
-                                        div()
-                                            .id(("composer-attachment-open", index))
-                                            .on_click(cx.listener(|this, _, _, cx| {
-                                                this.open_files_pane(cx);
-                                            }))
-                                            .child(badge("Open", panel_bg(), text_primary())),
-                                    )
-                                    .child(
-                                        div()
-                                            .id(("composer-attachment-remove", index))
-                                            .on_click(cx.listener(move |this, _, _, cx| {
-                                                this.composer_remove_attachment(index, cx);
-                                            }))
-                                            .child(badge("Remove", panel_bg(), text_primary())),
-                                    )
-                                    .child(
-                                        div()
-                                            .id(("composer-attachment-menu", index))
-                                            .on_click(cx.listener(move |this, _, _, cx| {
-                                                this.open_attachment_context_menu(
-                                                    attachment_name.clone(),
-                                                    cx,
-                                                );
-                                            }))
-                                            .child(badge("More", panel_bg(), text_primary())),
-                                    )
-                                    .into_any_element()
-                            },
-                        )),
-                )
-            })
-            .when_some(composer.autocomplete.as_ref(), |container, autocomplete| {
-                container.child(
-                    div()
-                        .px_2()
-                        .text_xs()
-                        .text_color(rgb(text_secondary()))
-                        .child(format!(
-                            "Autocomplete · {}{}",
-                            autocomplete.trigger, autocomplete.query
-                        )),
-                )
-            })
-            .child(
-                div()
-                    .pt_1p5()
-                    .border_t_1()
-                    .border_color(shell_border())
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .gap_2()
+                    .child(div().px_3().py_2().pr(px(64.)).child(editor.clone()))
                     .child(
                         div()
+                            .absolute()
+                            .top_0()
+                            .bottom_0()
+                            .right_1()
                             .flex()
                             .items_center()
-                            .gap_2()
-                            .child(Self::tool_button(
-                                "composer-tool-attach",
-                                composer_tool(plus_icon(text_secondary()), text_secondary()),
-                                cx.listener(|this, _, _, cx| {
-                                    this.composer_add_attachment(cx);
-                                    this.open_attachment_modal("composer", cx);
-                                }),
-                            ))
-                            .child(Self::tool_button(
-                                "composer-tool-emoji",
-                                composer_tool(emoji_icon(text_secondary()), text_secondary()),
-                                cx.listener(|this, _, _, cx| {
-                                    this.toggle_emoji_picker(cx);
-                                }),
-                            ))
-                            .child(Self::tool_button(
-                                "composer-tool-mention",
-                                composer_tool(mention_icon(text_secondary()), text_secondary()),
-                                cx.listener(|this, _, _, cx| {
-                                    this.composer_insert_mention(cx);
-                                }),
-                            ))
-                            .child(Self::tool_button(
-                                "composer-tool-format",
-                                composer_tool(format_icon(text_secondary()), text_secondary()),
-                                cx.listener(|this, _, _, cx| {
-                                    this.composer_insert_formatting(cx);
-                                }),
-                            ))
-                            .child(Self::tool_button(
-                                "composer-tool-link",
-                                composer_tool(link_icon(text_secondary()), text_secondary()),
-                                cx.listener(|this, _, _, cx| {
-                                    this.composer_insert_link(cx);
-                                }),
-                            ))
-                            .child(Self::tool_button(
-                                "composer-tool-call",
-                                composer_tool(video_icon(text_secondary()), text_secondary()),
-                                cx.listener(|this, _, window, cx| {
-                                    this.start_or_open_call(window, cx);
-                                }),
-                            )),
-                    )
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .justify_end()
-                            .gap_2()
-                            .flex_shrink_0()
+                            .gap_1()
                             .child(
                                 div()
-                                    .text_xs()
-                                    .text_color(rgb(text_secondary()))
-                                    .child("Enter sends"),
+                                    .id("composer-attach-inline")
+                                    .w(px(24.))
+                                    .h(px(24.))
+                                    .rounded_md()
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .cursor(CursorStyle::PointingHand)
+                                    .hover(|s| {
+                                        s.bg(tint(
+                                            accent_soft(),
+                                            if is_dark_theme() { 0.34 } else { 0.70 },
+                                        ))
+                                    })
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.open_composer_file_upload_picker(cx);
+                                    }))
+                                    .child(paperclip_icon(text_secondary())),
                             )
                             .child(
                                 div()
-                                    .id("composer-send")
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        this.send_composer_message(window, cx);
+                                    .id("composer-emoji-inline")
+                                    .w(px(24.))
+                                    .h(px(24.))
+                                    .rounded_md()
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .cursor(CursorStyle::PointingHand)
+                                    .hover(|s| {
+                                        s.bg(tint(
+                                            accent_soft(),
+                                            if is_dark_theme() { 0.34 } else { 0.70 },
+                                        ))
+                                    })
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.toggle_emoji_picker(cx);
                                     }))
-                                    .child(badge("Send", accent(), panel_bg())),
+                                    .child(emoji_icon(text_secondary())),
                             ),
                     ),
             )
-            .into_any_element()
-    }
-
-    fn tool_button(
-        id: &'static str,
-        content: AnyElement,
-        listener: impl Fn(&gpui::ClickEvent, &mut gpui::Window, &mut gpui::App) + 'static,
-    ) -> AnyElement {
-        div()
-            .id(id)
-            .on_click(listener)
-            .child(content)
             .into_any_element()
     }
 }

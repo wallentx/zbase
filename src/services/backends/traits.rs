@@ -4,7 +4,9 @@ use crate::{
             AccountId, BackendCapabilities, BackendId, ProviderConversationRef, ProviderMessageRef,
             ProviderWorkspaceRef,
         },
-        ids::{CallId, ConversationId, WorkspaceId},
+        conversation::ConversationKind,
+        ids::{CallId, ConversationId, UserId, WorkspaceId},
+        profile::SocialGraphListType,
         search::SearchFilter,
     },
     state::{
@@ -60,6 +62,15 @@ pub enum RoutedBackendCommand {
         attachments: Vec<UploadedAttachment>,
         reply_to: Option<ProviderMessageRef>,
     },
+    SendAttachment {
+        op_id: OpId,
+        account_id: AccountId,
+        conversation: ProviderConversationRef,
+        client_message_id: ClientMessageId,
+        local_path: String,
+        filename: String,
+        caption: String,
+    },
     EditMessage {
         op_id: OpId,
         account_id: AccountId,
@@ -104,6 +115,18 @@ pub enum RoutedBackendCommand {
         query: String,
         filters: Vec<SearchFilter>,
     },
+    SearchUsers {
+        account_id: AccountId,
+        query_id: QueryId,
+        query: String,
+    },
+    CreateConversation {
+        op_id: OpId,
+        account_id: AccountId,
+        workspace: ProviderWorkspaceRef,
+        participants: Vec<String>,
+        kind: ConversationKind,
+    },
     StartCall {
         op_id: OpId,
         account_id: AccountId,
@@ -113,6 +136,28 @@ pub enum RoutedBackendCommand {
         op_id: OpId,
         account_id: AccountId,
         call_id: CallId,
+    },
+    LoadUserProfile {
+        account_id: AccountId,
+        user_id: UserId,
+    },
+    RefreshParticipants {
+        account_id: AccountId,
+        user_id: UserId,
+        conversation_id: Option<ConversationId>,
+    },
+    LoadSocialGraphList {
+        account_id: AccountId,
+        user_id: UserId,
+        list_type: SocialGraphListType,
+    },
+    FollowUser {
+        account_id: AccountId,
+        user_id: UserId,
+    },
+    UnfollowUser {
+        account_id: AccountId,
+        user_id: UserId,
     },
 }
 

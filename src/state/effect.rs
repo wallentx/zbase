@@ -1,7 +1,9 @@
 use crate::domain::{
     attachment::AttachmentKind,
     backend::AccountId,
-    ids::{CallId, ConversationId, MessageId, WorkspaceId},
+    conversation::ConversationKind,
+    ids::{CallId, ConversationId, MessageId, UserId, WorkspaceId},
+    profile::SocialGraphListType,
     search::SearchFilter,
 };
 
@@ -62,6 +64,15 @@ pub enum BackendCommand {
         attachments: Vec<UploadedAttachment>,
         reply_to: Option<MessageId>,
     },
+    SendAttachment {
+        op_id: OpId,
+        draft_key: DraftKey,
+        conversation_id: ConversationId,
+        client_message_id: ClientMessageId,
+        local_path: String,
+        filename: String,
+        caption: String,
+    },
     EditMessage {
         op_id: OpId,
         conversation_id: ConversationId,
@@ -98,6 +109,15 @@ pub enum BackendCommand {
         query: String,
         filters: Vec<SearchFilter>,
     },
+    SearchUsers {
+        query_id: QueryId,
+        query: String,
+    },
+    CreateConversation {
+        op_id: OpId,
+        participants: Vec<UserId>,
+        kind: ConversationKind,
+    },
     StartCall {
         op_id: OpId,
         conversation_id: ConversationId,
@@ -105,6 +125,23 @@ pub enum BackendCommand {
     LeaveCall {
         op_id: OpId,
         call_id: CallId,
+    },
+    LoadUserProfile {
+        user_id: UserId,
+    },
+    RefreshParticipants {
+        user_id: UserId,
+        conversation_id: Option<ConversationId>,
+    },
+    LoadSocialGraphList {
+        user_id: UserId,
+        list_type: SocialGraphListType,
+    },
+    FollowUser {
+        user_id: UserId,
+    },
+    UnfollowUser {
+        user_id: UserId,
     },
 }
 

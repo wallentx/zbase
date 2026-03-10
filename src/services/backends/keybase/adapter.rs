@@ -1,5 +1,6 @@
 use crate::{
     domain::{
+        affinity::Affinity,
         attachment::{AttachmentKind, AttachmentPreview, AttachmentSource, AttachmentSummary},
         backend::{
             AccountId, BackendCapabilities, BackendId, ProviderConversationRef, ProviderMessageRef,
@@ -8,12 +9,18 @@ use crate::{
         conversation::{ConversationGroup, ConversationKind, ConversationSummary},
         ids::{ChannelId, ConversationId, DmId, MessageId, UserId, WorkspaceId},
         message::{
-            BroadcastKind, ChatEvent, EditMeta, LinkPreview, MessageFragment, MessageReaction,
-            MessageRecord, MessageSendState,
+            BroadcastKind, ChatEvent, EditMeta, EmojiSourceRef, LinkPreview, MessageFragment,
+            MessageReaction, MessageRecord, MessageSendState,
         },
         pins::{PinnedItem, PinnedPreview, PinnedState, PinnedTarget},
+        presence::{Availability, Presence},
+        profile::{
+            IdentityProof, ProfileSection, ProofState, SocialGraph, SocialGraphEntry,
+            SocialGraphListType, TeamShowcaseEntry, UserProfile,
+        },
         route::Route,
         search::SearchResult,
+        user::UserSummary,
     },
     services::{
         backends::traits::{BackendError, ChatBackend, RoutedBackendCommand},
@@ -27,8 +34,9 @@ use crate::{
         bindings::{ConversationBinding, MessageBinding, WorkspaceBinding},
         event::{
             BackendEvent, BootstrapPayload, ConversationEmojiEntry, MessageReactionEntry,
-            MessageReactionsForMessage, TeamRoleEntry, TeamRoleKind,
+            MessageReactionsForMessage, PresencePatch, TeamRoleEntry, TeamRoleKind,
         },
+        ids::{ClientMessageId, OpId},
     },
     util::interactive_qos::crawl_throttle_delay,
 };
@@ -38,13 +46,13 @@ use rmpv::Value;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     io,
     path::{Path, PathBuf},
     sync::mpsc::{self, Receiver, Sender},
     sync::{Arc, Mutex, OnceLock},
     thread::{self, JoinHandle},
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tokio::runtime::Builder;
 use tracing::warn;
@@ -65,9 +73,16 @@ pub struct KeybaseBackend {
     backend_id: BackendId,
     local_store: Arc<LocalStore>,
     search_index: Arc<SearchIndex>,
+    pending_outbox_sends: Arc<Mutex<HashMap<String, PendingSendMeta>>>,
     inbound_events: Option<Receiver<BackendEvent>>,
     inbound_sender: Option<Sender<BackendEvent>>,
     listener_handle: Option<JoinHandle<()>>,
+}
+
+#[derive(Clone, Debug)]
+struct PendingSendMeta {
+    op_id: OpId,
+    client_message_id: ClientMessageId,
 }
 
 impl KeybaseBackend {
@@ -81,9 +96,10 @@ impl KeybaseBackend {
                 panic!("failed to initialize local Tantivy index: {error}")
             }));
         Self {
-            backend_id: BackendId::new("keybase"),
+            backend_id: BackendId::new(KEYBASE_BACKEND_ID),
             local_store,
             search_index,
+            pending_outbox_sends: Arc::new(Mutex::new(HashMap::new())),
             inbound_events: None,
             inbound_sender: None,
             listener_handle: None,
@@ -100,34 +116,24 @@ impl KeybaseBackend {
         self.inbound_sender = Some(sender.clone());
         let local_store = Arc::clone(&self.local_store);
         let search_index = Arc::clone(&self.search_index);
+        let pending_outbox_sends = Arc::clone(&self.pending_outbox_sends);
         self.listener_handle = Some(thread::spawn(move || {
-            run_listener(sender, local_store, search_index)
+            run_listener(sender, local_store, search_index, pending_outbox_sends)
         }));
     }
 
-    fn map_notify_event(event: KeybaseNotifyEvent) -> BackendEvent {
-        fn preview(raw_params: &rmpv::Value) -> Option<String> {
-            let text = format!("{raw_params:?}");
-            if text.trim().is_empty() {
-                return None;
-            }
-            if text.len() > 240 {
-                Some(format!("{}…", &text[..240]))
-            } else {
-                Some(text)
-            }
+    fn map_notify_event(event: KeybaseNotifyEvent) -> Option<BackendEvent> {
+        let method = match event {
+            KeybaseNotifyEvent::Known { kind, .. } => kind.method_name().to_string(),
+            KeybaseNotifyEvent::Unknown { method, .. } => method,
+        };
+        if matches!(method.as_str(), "chat.1.NotifyChat.ChatTypingUpdate") {
+            return None;
         }
-
-        match event {
-            KeybaseNotifyEvent::Known { kind, raw_params } => BackendEvent::KeybaseNotifyStub {
-                method: kind.method_name().to_string(),
-                payload_preview: preview(&raw_params),
-            },
-            KeybaseNotifyEvent::Unknown { method, raw_params } => BackendEvent::KeybaseNotifyStub {
-                method,
-                payload_preview: preview(&raw_params),
-            },
-        }
+        Some(BackendEvent::KeybaseNotifyStub {
+            method,
+            payload_preview: None,
+        })
     }
 }
 
@@ -203,12 +209,17 @@ impl ChatBackend for KeybaseBackend {
                         CONVERSATION_OPEN_CACHE_LOAD_LIMIT,
                     )
                     .unwrap_or_default();
-                let (cached_messages, filtered_placeholder_count) = if self.inbound_sender.is_some()
-                {
-                    strip_placeholder_messages(cached_messages)
-                } else {
-                    (cached_messages, 0)
-                };
+                let (mut cached_messages, filtered_placeholder_count) =
+                    if self.inbound_sender.is_some() {
+                        strip_placeholder_messages(cached_messages)
+                    } else {
+                        (cached_messages, 0)
+                    };
+                strip_reaction_delete_tombstones(
+                    &self.local_store,
+                    &conversation_id,
+                    &mut cached_messages,
+                );
                 if filtered_placeholder_count > 0
                     && let Some(sender) = self.inbound_sender.clone()
                 {
@@ -227,21 +238,22 @@ impl ChatBackend for KeybaseBackend {
                         ]),
                     );
                 }
-                let mut events = cached_messages
-                    .iter()
-                    .cloned()
-                    .map(BackendEvent::MessageUpserted)
-                    .collect::<Vec<_>>();
+                let older_cursor = cached_messages.first().map(|message| message.id.0.clone());
+                let newer_cursor = cached_messages.last().map(|message| message.id.0.clone());
+                let mut events = vec![BackendEvent::TimelineReplaced {
+                    conversation_id: conversation_id.clone(),
+                    messages: cached_messages,
+                    older_cursor,
+                    newer_cursor,
+                }];
                 if let Ok(cached_emojis) =
                     self.local_store.load_conversation_emojis(&conversation_id)
-                {
-                    if !cached_emojis.is_empty() {
+                    && !cached_emojis.is_empty() {
                         events.push(BackendEvent::ConversationEmojisSynced {
                             conversation_id: conversation_id.clone(),
                             emojis: cached_emoji_entries(&cached_emojis),
                         });
                     }
-                }
                 if let Some(team_roles_event) =
                     team_roles_event_from_cache(&self.local_store, &conversation_id)
                 {
@@ -253,10 +265,20 @@ impl ChatBackend for KeybaseBackend {
                     let search_index = Arc::clone(&self.search_index);
                     let dedupe_key = format!("load_conversation:{}", conversation_id.0);
                     let sender_for_stats = sender.clone();
-                    let _ =
-                        task_runtime::spawn_task(TaskPriority::High, Some(dedupe_key), move || {
-                            run_load_conversation(sender, conversation, local_store, search_index)
-                        });
+                    let queued_at = Instant::now();
+                    let _ = task_runtime::spawn_task(
+                        TaskPriority::Interactive,
+                        Some(dedupe_key),
+                        move || {
+                            run_load_conversation(
+                                sender,
+                                conversation,
+                                local_store,
+                                search_index,
+                                queued_at,
+                            )
+                        },
+                    );
                     emit_task_runtime_stats(&sender_for_stats, "load_conversation.schedule");
                 }
 
@@ -484,7 +506,7 @@ impl ChatBackend for KeybaseBackend {
                         "load_older:{}:{}",
                         conversation_id_for_fetch.0, before_id_for_fetch.0
                     );
-                    let _ =
+                    let started =
                         task_runtime::spawn_task(TaskPriority::High, Some(dedupe_key), move || {
                             run_load_older_messages(
                                 sender,
@@ -497,6 +519,13 @@ impl ChatBackend for KeybaseBackend {
                             );
                         });
                     emit_task_runtime_stats(&sender_for_stats, "load_older.schedule");
+                    if !started {
+                        return Ok(vec![BackendEvent::MessagesPrepended {
+                            key: crate::state::state::TimelineKey::Conversation(conversation_id),
+                            messages: Vec::new(),
+                            cursor: Some(before_id.0),
+                        }]);
+                    }
                     return Ok(Vec::new());
                 }
                 if needs_remote_fetch
@@ -507,7 +536,7 @@ impl ChatBackend for KeybaseBackend {
                 {
                     let conversation_id_for_fetch = conversation_id.clone();
                     let before_id_for_fetch = before_id.clone();
-                    if let Ok(fetched) = runtime.block_on(async move {
+                    if let Ok(mut fetched) = runtime.block_on(async move {
                         let transport = FramedMsgpackTransport::connect(&path).await?;
                         let mut client = KeybaseRpcClient::new(transport);
                         fetch_thread_messages_before_anchor(
@@ -521,9 +550,18 @@ impl ChatBackend for KeybaseBackend {
                     }) {
                         fetched_page_has_more =
                             page_may_have_more_older_messages(&fetched, LOAD_OLDER_PAGE_SIZE);
-                        persist_reaction_deltas(&self.local_store, &fetched.reaction_deltas);
+                        persist_reaction_deltas(
+                            self.inbound_sender.as_ref(),
+                            &self.local_store,
+                            &fetched.reaction_deltas,
+                        );
                         reaction_delete_events =
                             reaction_op_delete_events(&fetched.reaction_deltas);
+                        strip_reaction_delete_tombstones(
+                            &self.local_store,
+                            &conversation_id,
+                            &mut fetched.messages,
+                        );
                         let message_ids = fetched
                             .messages
                             .iter()
@@ -626,12 +664,21 @@ impl ChatBackend for KeybaseBackend {
                             page_may_have_more_older_messages(&older_page, LOAD_OLDER_PAGE_SIZE);
                         let mut reaction_deltas = older_page.reaction_deltas;
                         reaction_deltas.extend(newer_page.reaction_deltas);
-                        persist_reaction_deltas(&self.local_store, &reaction_deltas);
+                        persist_reaction_deltas(
+                            self.inbound_sender.as_ref(),
+                            &self.local_store,
+                            &reaction_deltas,
+                        );
                         reaction_delete_events = reaction_op_delete_events(&reaction_deltas);
 
                         let mut fetched_messages = older_page.messages;
                         fetched_messages.extend(newer_page.messages);
                         normalize_message_records(&mut fetched_messages);
+                        strip_reaction_delete_tombstones(
+                            &self.local_store,
+                            &conversation_id,
+                            &mut fetched_messages,
+                        );
                         let message_ids = fetched_messages
                             .iter()
                             .map(|message| message.id.clone())
@@ -711,6 +758,407 @@ impl ChatBackend for KeybaseBackend {
                     newer_cursor,
                 });
                 Ok(events)
+            }
+            RoutedBackendCommand::SendMessage {
+                op_id,
+                account_id: _,
+                conversation,
+                client_message_id,
+                text,
+                attachments: _,
+                reply_to,
+            } => {
+                let conversation_id = canonical_conversation_id_from_provider_ref(&conversation);
+                let Some(raw_conversation_id) =
+                    provider_ref_to_conversation_id_bytes(&conversation)
+                else {
+                    return Ok(vec![BackendEvent::MessageSendFailed {
+                        op_id,
+                        client_message_id,
+                        error: "missing provider conversation id".to_string(),
+                    }]);
+                };
+                let client_prev = self
+                    .local_store
+                    .load_recent_messages_for_conversation(&conversation_id, 1)
+                    .ok()
+                    .and_then(|messages| {
+                        messages
+                            .last()
+                            .and_then(|message| message.id.0.parse::<i64>().ok())
+                    })
+                    .unwrap_or(0);
+                let reply_to_id = reply_to
+                    .as_ref()
+                    .and_then(provider_message_ref_to_message_id)
+                    .and_then(|message_id| message_id.0.parse::<i64>().ok());
+                let mut emitted = Vec::new();
+                if let Some(path) = socket_path()
+                    && let Ok(runtime) = Builder::new_current_thread().enable_all().build()
+                {
+                    let raw_for_call = raw_conversation_id.clone();
+                    let text_for_call = text.clone();
+                    let send_result = runtime.block_on(async move {
+                        let transport = FramedMsgpackTransport::connect(&path).await?;
+                        let mut client = KeybaseRpcClient::new(transport);
+                        let inbox =
+                            fetch_inbox_for_conversation_id(&mut client, &raw_for_call).await?;
+                        let Some((tlf_name, _, tlf_public)) =
+                            extract_team_lookup_params_from_inbox_response(&inbox)
+                        else {
+                            return Err(io::Error::other("missing tlf metadata"));
+                        };
+                        call_post_text_nonblock(
+                            &mut client,
+                            &raw_for_call,
+                            &tlf_name,
+                            tlf_public,
+                            &text_for_call,
+                            client_prev,
+                            reply_to_id,
+                        )
+                        .await
+                    });
+                    match send_result {
+                        Ok(response) => {
+                            if let Some(outbox_id) = extract_outbox_id_from_post_response(&response)
+                                && let Ok(mut pending) = self.pending_outbox_sends.lock() {
+                                    pending.insert(
+                                        outbox_id,
+                                        PendingSendMeta {
+                                            op_id,
+                                            client_message_id,
+                                        },
+                                    );
+                                }
+                        }
+                        Err(error) => {
+                            emitted.push(BackendEvent::MessageSendFailed {
+                                op_id,
+                                client_message_id,
+                                error: error.to_string(),
+                            });
+                        }
+                    }
+                } else {
+                    emitted.push(BackendEvent::MessageSendFailed {
+                        op_id,
+                        client_message_id,
+                        error: "keybase socket unavailable".to_string(),
+                    });
+                }
+                Ok(emitted)
+            }
+            RoutedBackendCommand::SendAttachment {
+                op_id,
+                account_id: _,
+                conversation,
+                client_message_id,
+                local_path,
+                filename,
+                caption,
+            } => {
+                let conversation_id = canonical_conversation_id_from_provider_ref(&conversation);
+                let Some(raw_conversation_id) =
+                    provider_ref_to_conversation_id_bytes(&conversation)
+                else {
+                    return Ok(vec![BackendEvent::MessageSendFailed {
+                        op_id,
+                        client_message_id,
+                        error: "missing provider conversation id".to_string(),
+                    }]);
+                };
+                let client_prev = self
+                    .local_store
+                    .load_recent_messages_for_conversation(&conversation_id, 1)
+                    .ok()
+                    .and_then(|messages| {
+                        messages
+                            .last()
+                            .and_then(|message| message.id.0.parse::<i64>().ok())
+                    })
+                    .unwrap_or(0);
+                let mut emitted = Vec::new();
+                if let Some(path) = socket_path()
+                    && let Ok(runtime) = Builder::new_current_thread().enable_all().build()
+                {
+                    let raw_for_call = raw_conversation_id.clone();
+                    let local_path_for_call = local_path.clone();
+                    let filename_for_call = filename.clone();
+                    let caption_for_call = caption.clone();
+                    let send_result = runtime.block_on(async move {
+                        let transport = FramedMsgpackTransport::connect(&path).await?;
+                        let mut client = KeybaseRpcClient::new(transport);
+                        let inbox =
+                            fetch_inbox_for_conversation_id(&mut client, &raw_for_call).await?;
+                        let Some((tlf_name, _, tlf_public)) =
+                            extract_team_lookup_params_from_inbox_response(&inbox)
+                        else {
+                            return Err(io::Error::other("missing tlf metadata"));
+                        };
+                        call_post_file_attachment_nonblock(
+                            &mut client,
+                            &raw_for_call,
+                            &tlf_name,
+                            tlf_public,
+                            &local_path_for_call,
+                            &filename_for_call,
+                            &caption_for_call,
+                            client_prev,
+                        )
+                        .await
+                    });
+                    match send_result {
+                        Ok(response) => {
+                            if let Some(outbox_id) = extract_outbox_id_from_post_response(&response)
+                                && let Ok(mut pending) = self.pending_outbox_sends.lock() {
+                                    pending.insert(
+                                        outbox_id,
+                                        PendingSendMeta {
+                                            op_id,
+                                            client_message_id,
+                                        },
+                                    );
+                                }
+                        }
+                        Err(error) => {
+                            emitted.push(BackendEvent::MessageSendFailed {
+                                op_id,
+                                client_message_id,
+                                error: error.to_string(),
+                            });
+                        }
+                    }
+                } else {
+                    emitted.push(BackendEvent::MessageSendFailed {
+                        op_id,
+                        client_message_id,
+                        error: "keybase socket unavailable".to_string(),
+                    });
+                }
+                Ok(emitted)
+            }
+            RoutedBackendCommand::EditMessage {
+                op_id: _,
+                account_id: _,
+                conversation,
+                message,
+                text,
+            } => {
+                let Some(raw_conversation_id) =
+                    provider_ref_to_conversation_id_bytes(&conversation)
+                else {
+                    return Ok(Vec::new());
+                };
+                let Some(target_message_id) = provider_message_ref_to_message_id(&message)
+                    .and_then(|message_id| message_id.0.parse::<i64>().ok())
+                else {
+                    return Ok(Vec::new());
+                };
+                let conversation_id = canonical_conversation_id_from_provider_ref(&conversation);
+                let client_prev = self
+                    .local_store
+                    .load_recent_messages_for_conversation(&conversation_id, 1)
+                    .ok()
+                    .and_then(|messages| {
+                        messages
+                            .last()
+                            .and_then(|message| message.id.0.parse::<i64>().ok())
+                    })
+                    .unwrap_or(0);
+                let text = text.trim().to_string();
+                if text.is_empty() {
+                    return Ok(Vec::new());
+                }
+                if let Some(path) = socket_path()
+                    && let Ok(runtime) = Builder::new_current_thread().enable_all().build()
+                {
+                    let raw_for_call = raw_conversation_id.clone();
+                    let text_for_call = text.clone();
+                    let edit_result = runtime.block_on(async move {
+                        let transport = FramedMsgpackTransport::connect(&path).await?;
+                        let mut client = KeybaseRpcClient::new(transport);
+                        let inbox =
+                            fetch_inbox_for_conversation_id(&mut client, &raw_for_call).await?;
+                        let Some((tlf_name, _, tlf_public)) =
+                            extract_team_lookup_params_from_inbox_response(&inbox)
+                        else {
+                            return Err(io::Error::other("missing tlf metadata"));
+                        };
+                        call_post_edit_nonblock(
+                            &mut client,
+                            &raw_for_call,
+                            &tlf_name,
+                            tlf_public,
+                            target_message_id,
+                            &text_for_call,
+                            client_prev,
+                        )
+                        .await
+                    });
+                    if let Err(error) = edit_result {
+                        warn!(
+                            target: "kbui.keybase.send_edit",
+                            conversation_id = %conversation_id.0,
+                            message_id = target_message_id,
+                            %error,
+                            "failed to post edited message"
+                        );
+                    }
+                } else {
+                    warn!(
+                        target: "kbui.keybase.send_edit",
+                        conversation_id = %conversation_id.0,
+                        message_id = target_message_id,
+                        "skipping edit publish because keybase socket is unavailable"
+                    );
+                }
+                Ok(Vec::new())
+            }
+            RoutedBackendCommand::DeleteMessage {
+                op_id: _,
+                account_id: _,
+                conversation,
+                message,
+            } => {
+                let Some(raw_conversation_id) =
+                    provider_ref_to_conversation_id_bytes(&conversation)
+                else {
+                    return Ok(Vec::new());
+                };
+                let Some(target_message_id) = provider_message_ref_to_message_id(&message)
+                    .and_then(|message_id| message_id.0.parse::<i64>().ok())
+                else {
+                    return Ok(Vec::new());
+                };
+                let conversation_id = canonical_conversation_id_from_provider_ref(&conversation);
+                let client_prev = self
+                    .local_store
+                    .load_recent_messages_for_conversation(&conversation_id, 1)
+                    .ok()
+                    .and_then(|messages| {
+                        messages
+                            .last()
+                            .and_then(|message| message.id.0.parse::<i64>().ok())
+                    })
+                    .unwrap_or(0);
+                if let Some(path) = socket_path()
+                    && let Ok(runtime) = Builder::new_current_thread().enable_all().build()
+                {
+                    let raw_for_call = raw_conversation_id.clone();
+                    let delete_result = runtime.block_on(async move {
+                        let transport = FramedMsgpackTransport::connect(&path).await?;
+                        let mut client = KeybaseRpcClient::new(transport);
+                        let inbox =
+                            fetch_inbox_for_conversation_id(&mut client, &raw_for_call).await?;
+                        let Some((tlf_name, _, tlf_public)) =
+                            extract_team_lookup_params_from_inbox_response(&inbox)
+                        else {
+                            return Err(io::Error::other("missing tlf metadata"));
+                        };
+                        call_post_delete_nonblock(
+                            &mut client,
+                            &raw_for_call,
+                            &tlf_name,
+                            tlf_public,
+                            target_message_id,
+                            client_prev,
+                        )
+                        .await
+                    });
+                    if let Err(error) = delete_result {
+                        warn!(
+                            target: "kbui.keybase.delete_message",
+                            conversation_id = %conversation_id.0,
+                            message_id = target_message_id,
+                            %error,
+                            "failed to delete message"
+                        );
+                    }
+                } else {
+                    warn!(
+                        target: "kbui.keybase.delete_message",
+                        conversation_id = %conversation_id.0,
+                        message_id = target_message_id,
+                        "skipping message delete because keybase socket is unavailable"
+                    );
+                }
+                Ok(Vec::new())
+            }
+            RoutedBackendCommand::ReactToMessage {
+                op_id,
+                account_id: _,
+                conversation,
+                message,
+                reaction,
+            } => {
+                let Some(raw_conversation_id) =
+                    provider_ref_to_conversation_id_bytes(&conversation)
+                else {
+                    return Ok(vec![BackendEvent::ReactionFailed {
+                        op_id,
+                        error: "missing provider conversation id".to_string(),
+                    }]);
+                };
+                let Some(supersedes) = provider_message_ref_to_message_id(&message)
+                    .and_then(|message_id| message_id.0.parse::<i64>().ok())
+                else {
+                    return Ok(vec![BackendEvent::ReactionFailed {
+                        op_id,
+                        error: "invalid target message id".to_string(),
+                    }]);
+                };
+                let conversation_id = canonical_conversation_id_from_provider_ref(&conversation);
+                let client_prev = self
+                    .local_store
+                    .load_recent_messages_for_conversation(&conversation_id, 1)
+                    .ok()
+                    .and_then(|messages| {
+                        messages
+                            .last()
+                            .and_then(|message| message.id.0.parse::<i64>().ok())
+                    })
+                    .unwrap_or(0);
+                let mut emitted = Vec::new();
+                if let Some(path) = socket_path()
+                    && let Ok(runtime) = Builder::new_current_thread().enable_all().build()
+                {
+                    let raw_for_call = raw_conversation_id.clone();
+                    let reaction_for_call = reaction.clone();
+                    let react_result = runtime.block_on(async move {
+                        let transport = FramedMsgpackTransport::connect(&path).await?;
+                        let mut client = KeybaseRpcClient::new(transport);
+                        let inbox =
+                            fetch_inbox_for_conversation_id(&mut client, &raw_for_call).await?;
+                        let Some((tlf_name, _, tlf_public)) =
+                            extract_team_lookup_params_from_inbox_response(&inbox)
+                        else {
+                            return Err(io::Error::other("missing tlf metadata"));
+                        };
+                        call_post_reaction_nonblock(
+                            &mut client,
+                            &raw_for_call,
+                            &tlf_name,
+                            tlf_public,
+                            supersedes,
+                            &reaction_for_call,
+                            client_prev,
+                        )
+                        .await
+                    });
+                    if let Err(error) = react_result {
+                        emitted.push(BackendEvent::ReactionFailed {
+                            op_id,
+                            error: error.to_string(),
+                        });
+                    }
+                } else {
+                    emitted.push(BackendEvent::ReactionFailed {
+                        op_id,
+                        error: "keybase socket unavailable".to_string(),
+                    });
+                }
+                Ok(emitted)
             }
             RoutedBackendCommand::PinMessage {
                 op_id: _,
@@ -799,20 +1247,14 @@ impl ChatBackend for KeybaseBackend {
             RoutedBackendCommand::MarkRead {
                 account_id: _,
                 conversation,
-                message,
+                message: _,
             } => {
                 let conversation_id = canonical_conversation_id_from_provider_ref(&conversation);
-                let explicit_read_upto = message
-                    .as_ref()
-                    .and_then(provider_message_ref_to_message_id);
-                let read_upto = explicit_read_upto.clone().or_else(|| {
-                    message.as_ref().and_then(|_| {
-                        self.local_store
-                            .load_recent_messages_for_conversation(&conversation_id, 1)
-                            .ok()
-                            .and_then(|messages| messages.last().map(|message| message.id.clone()))
-                    })
-                });
+                let read_upto = self
+                    .local_store
+                    .load_recent_messages_for_conversation(&conversation_id, 1)
+                    .ok()
+                    .and_then(|messages| messages.last().map(|message| message.id.clone()));
 
                 let mut emitted = Vec::new();
                 let mut mark_read_succeeded = false;
@@ -821,18 +1263,11 @@ impl ChatBackend for KeybaseBackend {
                     && let Some(path) = socket_path()
                     && let Ok(runtime) = Builder::new_current_thread().enable_all().build()
                 {
-                    let read_upto_for_call = read_upto.clone();
                     let raw_for_call = raw_conversation_id.clone();
                     let mark_result = runtime.block_on(async move {
                         let transport = FramedMsgpackTransport::connect(&path).await?;
                         let mut client = KeybaseRpcClient::new(transport);
-                        call_mark_as_read_local(
-                            &mut client,
-                            &raw_for_call,
-                            read_upto_for_call.as_ref(),
-                            false,
-                        )
-                        .await
+                        call_mark_as_read_local(&mut client, &raw_for_call, None, false).await
                     });
 
                     match mark_result {
@@ -871,12 +1306,10 @@ impl ChatBackend for KeybaseBackend {
                 }
 
                 if mark_read_succeeded {
-                    if let Some(read_upto) = read_upto.clone() {
-                        emitted.push(BackendEvent::ReadMarkerUpdated {
-                            conversation_id: conversation_id.clone(),
-                            read_upto: Some(read_upto),
-                        });
-                    }
+                    emitted.push(BackendEvent::ReadMarkerUpdated {
+                        conversation_id: conversation_id.clone(),
+                        read_upto: read_upto.clone(),
+                    });
                     let snapshot = ConversationUnreadSnapshot {
                         conversation_id: conversation_id.clone(),
                         unread_count: 0,
@@ -961,6 +1394,214 @@ impl ChatBackend for KeybaseBackend {
                     is_complete: true,
                 }])
             }
+            RoutedBackendCommand::SearchUsers {
+                query_id, query, ..
+            } => {
+                let query = query.trim().to_string();
+                if query.is_empty() {
+                    return Ok(vec![BackendEvent::UserSearchResults {
+                        query_id,
+                        results: Vec::new(),
+                    }]);
+                }
+                let mut results = Vec::new();
+                if let Some(path) = socket_path()
+                    && let Ok(runtime) = Builder::new_current_thread().enable_all().build()
+                {
+                    let query_for_call = query.clone();
+                    let search_result = runtime.block_on(async move {
+                        let transport = FramedMsgpackTransport::connect(&path).await?;
+                        let mut client = KeybaseRpcClient::new(transport);
+                        call_user_search(&mut client, &query_for_call).await
+                    });
+                    match search_result {
+                        Ok(response) => {
+                            results = parse_user_search_results(&response);
+                        }
+                        Err(error) => {
+                            if let Some(sender) = self.inbound_sender.clone() {
+                                send_internal(
+                                    &sender,
+                                    "kbui.internal.user_search_failed",
+                                    Value::from(error.to_string()),
+                                );
+                            }
+                        }
+                    }
+                }
+                Ok(vec![BackendEvent::UserSearchResults { query_id, results }])
+            }
+            RoutedBackendCommand::CreateConversation {
+                op_id,
+                account_id,
+                participants,
+                kind,
+                ..
+            } => {
+                let mut emitted = Vec::new();
+                if let Some(path) = socket_path()
+                    && let Ok(runtime) = Builder::new_current_thread().enable_all().build()
+                {
+                    let participants_for_call = participants.clone();
+                    let create_result = runtime.block_on(async move {
+                        let transport = FramedMsgpackTransport::connect(&path).await?;
+                        let mut client = KeybaseRpcClient::new(transport);
+                        let create_response =
+                            call_new_conversation_local(&mut client, &participants_for_call)
+                                .await?;
+                        let raw_conversation_id = extract_new_conversation_raw_id(&create_response)
+                            .ok_or_else(|| {
+                                io::Error::other(
+                                    "missing conversation id in newConversationLocal response",
+                                )
+                            })?;
+                        let inbox =
+                            fetch_inbox_for_conversation_id(&mut client, &raw_conversation_id)
+                                .await?;
+                        Ok::<_, io::Error>((raw_conversation_id, inbox))
+                    });
+                    match create_result {
+                        Ok((raw_conversation_id, inbox)) => {
+                            let parsed = parse_inbox_conversations(&inbox, None);
+                            let created = parsed
+                                .iter()
+                                .find(|item| item.raw_conversation_id == raw_conversation_id)
+                                .cloned()
+                                .or_else(|| parsed.into_iter().next());
+                            let (summary, provider_ref) = if let Some(created) = created {
+                                (created.summary, created.provider_ref)
+                            } else {
+                                let conversation_id = ConversationId::new(format!(
+                                    "kb_conv:{}",
+                                    hex_encode(&raw_conversation_id)
+                                ));
+                                let provider_ref =
+                                    ProviderConversationRef::new(conversation_id.0.clone());
+                                let title = participants
+                                    .iter()
+                                    .map(|participant| participant.trim())
+                                    .filter(|participant| !participant.is_empty())
+                                    .collect::<Vec<_>>()
+                                    .join(", ");
+                                (
+                                    ConversationSummary {
+                                        id: conversation_id,
+                                        title: if title.is_empty() {
+                                            "New conversation".to_string()
+                                        } else {
+                                            title
+                                        },
+                                        kind,
+                                        topic: String::new(),
+                                        group: None,
+                                        unread_count: 0,
+                                        mention_count: 0,
+                                        muted: false,
+                                        last_activity_ms: 0,
+                                    },
+                                    provider_ref,
+                                )
+                            };
+                            let conversation_binding = ConversationBinding {
+                                conversation_id: summary.id.clone(),
+                                backend_id: self.backend_id.clone(),
+                                account_id: account_id.clone(),
+                                provider_conversation_ref: provider_ref,
+                            };
+                            emitted.push(BackendEvent::ConversationCreated {
+                                op_id,
+                                workspace_id: WorkspaceId::new(WORKSPACE_ID),
+                                conversation: summary,
+                                conversation_binding,
+                            });
+                        }
+                        Err(error) => {
+                            if let Some(sender) = self.inbound_sender.clone() {
+                                send_internal(
+                                    &sender,
+                                    "kbui.internal.create_conversation_failed",
+                                    Value::from(error.to_string()),
+                                );
+                            }
+                        }
+                    }
+                }
+                Ok(emitted)
+            }
+            RoutedBackendCommand::LoadUserProfile {
+                account_id,
+                user_id,
+            } => {
+                self.ensure_listener_started();
+                let Some(sender) = self.inbound_sender.clone() else {
+                    return Ok(Vec::new());
+                };
+                let local_store = Arc::clone(&self.local_store);
+                let dedupe_key = format!("load_user_profile:{}", user_id.0);
+                let _ = task_runtime::spawn_task(TaskPriority::High, Some(dedupe_key), move || {
+                    run_load_user_profile(sender, local_store, account_id, user_id)
+                });
+                Ok(Vec::new())
+            }
+            RoutedBackendCommand::RefreshParticipants {
+                user_id,
+                conversation_id,
+                ..
+            } => {
+                self.ensure_listener_started();
+                let Some(sender) = self.inbound_sender.clone() else {
+                    return Ok(Vec::new());
+                };
+                let local_store = Arc::clone(&self.local_store);
+                let dedupe_key = format!(
+                    "refresh_participants:{}:{}",
+                    user_id.0,
+                    conversation_id
+                        .as_ref()
+                        .map(|id| id.0.as_str())
+                        .unwrap_or("none")
+                );
+                let _ = task_runtime::spawn_task(TaskPriority::High, Some(dedupe_key), move || {
+                    run_refresh_profile_presence(sender, local_store, user_id, conversation_id)
+                });
+                Ok(Vec::new())
+            }
+            RoutedBackendCommand::LoadSocialGraphList {
+                user_id, list_type, ..
+            } => {
+                self.ensure_listener_started();
+                let Some(sender) = self.inbound_sender.clone() else {
+                    return Ok(Vec::new());
+                };
+                let local_store = Arc::clone(&self.local_store);
+                let dedupe_key = format!("load_social_graph:{}:{list_type:?}", user_id.0);
+                let _ = task_runtime::spawn_task(TaskPriority::High, Some(dedupe_key), move || {
+                    run_load_social_graph_list(sender, local_store, user_id, list_type)
+                });
+                Ok(Vec::new())
+            }
+            RoutedBackendCommand::FollowUser { user_id, .. } => {
+                self.ensure_listener_started();
+                let Some(sender) = self.inbound_sender.clone() else {
+                    return Ok(Vec::new());
+                };
+                let dedupe_key = format!("follow_user:{}", user_id.0);
+                let _ = task_runtime::spawn_task(TaskPriority::High, Some(dedupe_key), move || {
+                    run_follow_toggle(sender, user_id, true)
+                });
+                Ok(Vec::new())
+            }
+            RoutedBackendCommand::UnfollowUser { user_id, .. } => {
+                self.ensure_listener_started();
+                let Some(sender) = self.inbound_sender.clone() else {
+                    return Ok(Vec::new());
+                };
+                let dedupe_key = format!("unfollow_user:{}", user_id.0);
+                let _ = task_runtime::spawn_task(TaskPriority::High, Some(dedupe_key), move || {
+                    run_follow_toggle(sender, user_id, false)
+                });
+                Ok(Vec::new())
+            }
             _ => Ok(Vec::new()),
         }
     }
@@ -970,7 +1611,10 @@ impl ChatBackend for KeybaseBackend {
         let Some(receiver) = &self.inbound_events else {
             return events;
         };
-        while let Ok(event) = receiver.try_recv() {
+        while events.len() < MAX_EVENTS_PER_POLL {
+            let Ok(event) = receiver.try_recv() else {
+                break;
+            };
             events.push(event);
         }
         events
@@ -981,6 +1625,7 @@ fn run_listener(
     sender: mpsc::Sender<BackendEvent>,
     local_store: Arc<LocalStore>,
     search_index: Arc<SearchIndex>,
+    pending_outbox_sends: Arc<Mutex<HashMap<String, PendingSendMeta>>>,
 ) {
     send_internal(&sender, "kbui.internal.listener_starting", Value::Nil);
 
@@ -1041,6 +1686,8 @@ fn run_listener(
 
                 while let Some(message) = rx.recv().await {
                     let event = KeybaseNotifyEvent::from_method(&message.method, message.params);
+                    maybe_handle_tracking_notify(&event, &sender);
+                    maybe_handle_presence_notify(&event, &sender);
                     maybe_handle_profile_notify(&event, &sender, &local_store);
                     maybe_handle_emoji_notify(&event, &sender, &local_store);
                     maybe_handle_team_role_notify(&event, &sender, &local_store);
@@ -1073,8 +1720,8 @@ fn run_listener(
                     {
                         break;
                     }
-                    if should_refresh_inbox {
-                        if try_mark_inbox_unread_refresh_in_flight() {
+                    if should_refresh_inbox
+                        && try_mark_inbox_unread_refresh_in_flight() {
                             let sender_for_refresh = sender.clone();
                             let local_store_for_refresh = Arc::clone(&local_store);
                             let _ = task_runtime::spawn_task(
@@ -1089,7 +1736,6 @@ fn run_listener(
                                 },
                             );
                         }
-                    }
                     for (conversation_id, users) in parse_typing_updates_from_notify(&event) {
                         if sender
                             .send(BackendEvent::TypingUpdated {
@@ -1104,6 +1750,7 @@ fn run_listener(
                     let mut handled_reaction = false;
                     if let Some(reaction_delta) = parse_live_reaction_delta_from_notify(&event) {
                         persist_reaction_deltas(
+                            Some(&sender),
                             &local_store,
                             std::slice::from_ref(&reaction_delta),
                         );
@@ -1115,6 +1762,7 @@ fn run_listener(
                                 conversation_id: reaction_delta.conversation_id.clone(),
                                 message_id: reaction_delta.target_message_id.clone(),
                                 emoji: reaction_delta.emoji.clone(),
+                                source_ref: reaction_delta.source_ref.clone(),
                                 actor_id: reaction_delta.actor_id.clone(),
                                 updated_ms: reaction_delta.updated_ms,
                             })
@@ -1131,57 +1779,88 @@ fn run_listener(
                     if !handled_reaction
                         && let Some(mut live_message) = parse_live_message_from_notify(&event)
                     {
-                        let live_reaction_map_deltas = parse_live_reaction_map_deltas_from_notify(
-                            &event,
-                            &live_message.conversation_id,
-                            &live_message.id,
-                        );
-                        let username = live_message.author_id.0.clone();
-                        spawn_prefetch_user_profiles(&sender, &local_store, vec![username]);
-                        if message_contains_shortcode(&live_message) {
-                            spawn_sync_conversation_emojis(
-                                &sender,
-                                &local_store,
-                                live_message.conversation_id.clone(),
-                            );
-                        }
-                        ingest_message_record(
-                            Some(&sender),
-                            &local_store,
-                            &search_index,
-                            &mut live_message,
-                        );
-                        let reaction_sync_event = if live_reaction_map_deltas.is_empty() {
-                            None
-                        } else {
-                            persist_reaction_deltas(&local_store, &live_reaction_map_deltas);
-                            for delete_event in reaction_op_delete_events(&live_reaction_map_deltas)
-                            {
-                                if sender.send(delete_event).is_err() {
-                                    break;
-                                }
+                        if let Some(reaction_removed_event) =
+                            reaction_removed_event_for_live_delete(&local_store, &live_message)
+                        {
+                            if sender.send(reaction_removed_event).is_err() {
+                                break;
                             }
-                            message_reaction_sync_event(
+                        } else {
+                            let pending_send_meta =
+                                extract_outbox_id_from_notify(&event).and_then(|outbox_id| {
+                                    pending_outbox_sends
+                                        .lock()
+                                        .ok()
+                                        .and_then(|mut pending| pending.remove(&outbox_id))
+                                });
+                            let live_reaction_map_deltas =
+                                parse_live_reaction_map_deltas_from_notify(
+                                    &event,
+                                    &live_message.conversation_id,
+                                    &live_message.id,
+                                );
+                            let username = live_message.author_id.0.clone();
+                            spawn_prefetch_user_profiles(&sender, &local_store, vec![username]);
+                            if message_contains_shortcode(&live_message) {
+                                spawn_sync_conversation_emojis(
+                                    &sender,
+                                    &local_store,
+                                    live_message.conversation_id.clone(),
+                                );
+                            }
+                            ingest_message_record(
+                                Some(&sender),
                                 &local_store,
-                                &live_message.conversation_id,
-                                std::slice::from_ref(&live_message),
-                            )
-                        };
-                        if sender
-                            .send(BackendEvent::MessageUpserted(live_message))
-                            .is_err()
-                        {
-                            break;
-                        }
-                        if let Some(sync_event) = reaction_sync_event
-                            && sender.send(sync_event).is_err()
-                        {
-                            break;
+                                &search_index,
+                                &mut live_message,
+                            );
+                            let reaction_sync_event = if live_reaction_map_deltas.is_empty() {
+                                None
+                            } else {
+                                persist_reaction_deltas(
+                                    Some(&sender),
+                                    &local_store,
+                                    &live_reaction_map_deltas,
+                                );
+                                for delete_event in
+                                    reaction_op_delete_events(&live_reaction_map_deltas)
+                                {
+                                    if sender.send(delete_event).is_err() {
+                                        break;
+                                    }
+                                }
+                                message_reaction_sync_event(
+                                    &local_store,
+                                    &live_message.conversation_id,
+                                    std::slice::from_ref(&live_message),
+                                )
+                            };
+                            if let Some(pending_send) = pending_send_meta
+                                && sender
+                                    .send(BackendEvent::MessageSendConfirmed {
+                                        op_id: pending_send.op_id,
+                                        client_message_id: pending_send.client_message_id,
+                                        server_message: live_message.clone(),
+                                    })
+                                    .is_err()
+                            {
+                                break;
+                            }
+                            if sender
+                                .send(BackendEvent::MessageUpserted(live_message))
+                                .is_err()
+                            {
+                                break;
+                            }
+                            if let Some(sync_event) = reaction_sync_event
+                                && sender.send(sync_event).is_err()
+                            {
+                                break;
+                            }
                         }
                     }
-                    if sender
-                        .send(KeybaseBackend::map_notify_event(event))
-                        .is_err()
+                    if let Some(stub_event) = KeybaseBackend::map_notify_event(event)
+                        && sender.send(stub_event).is_err()
                     {
                         break;
                     }
@@ -1203,6 +1882,8 @@ fn run_listener(
 const WORKSPACE_ID: &str = "ws_primary";
 const WORKSPACE_NAME: &str = "Keybase";
 const PROVIDER_WORKSPACE_REF: &str = "keybase:workspace:primary";
+const KEYBASE_BACKEND_ID: &str = "keybase";
+const DEFAULT_ACCOUNT_ID: &str = "account_demo_keybase";
 const SESSION_ID: i64 = 0;
 
 const KEYBASE_GET_CURRENT_STATUS: &str = "keybase.1.config.getCurrentStatus";
@@ -1211,20 +1892,38 @@ const KEYBASE_LOAD_TEAM_AVATARS: &str = "keybase.1.avatars.loadTeamAvatars";
 const KEYBASE_LOAD_USER: &str = "keybase.1.user.loadUser";
 const KEYBASE_LOAD_USER_BY_NAME: &str = "keybase.1.user.loadUserByName";
 const KEYBASE_USER_CARD: &str = "keybase.1.user.userCard";
+const KEYBASE_LIST_TRACKING: &str = "keybase.1.user.listTracking";
+const KEYBASE_LIST_TRACKERS_UNVERIFIED: &str = "keybase.1.user.listTrackersUnverified";
+const KEYBASE_LIST_TRACKING_JSON: &str = "keybase.1.user.listTrackingJSON";
+const KEYBASE_LIST_TRACKING_FALLBACK: &str = "keybase.1.track.listTracking";
+const KEYBASE_IDENTIFY3: &str = "keybase.1.identify3.identify3";
+const KEYBASE_IDENTIFY3_FOLLOW_USER: &str = "keybase.1.identify3.identify3FollowUser";
 const KEYBASE_TEAM_GET_MEMBERS_BY_ID: &str = "keybase.1.teams.teamGetMembersByID";
 const CHAT_GET_INBOX_SUMMARY_CLI_LOCAL: &str = "chat.1.local.getInboxSummaryForCLILocal";
 const CHAT_GET_INBOX_AND_UNBOX_LOCAL: &str = "chat.1.local.getInboxAndUnboxLocal";
 const CHAT_GET_THREAD_LOCAL: &str = "chat.1.local.getThreadLocal";
+const CHAT_POST_TEXT_NONBLOCK: &str = "chat.1.local.postTextNonblock";
+const CHAT_POST_FILE_ATTACHMENT_LOCAL_NONBLOCK: &str =
+    "chat.1.local.postFileAttachmentLocalNonblock";
+const CHAT_POST_EDIT_NONBLOCK: &str = "chat.1.local.postEditNonblock";
+const CHAT_POST_DELETE_NONBLOCK: &str = "chat.1.local.postDeleteNonblock";
+const CHAT_POST_REACTION_NONBLOCK: &str = "chat.1.local.postReactionNonblock";
 const CHAT_DOWNLOAD_FILE_ATTACHMENT_LOCAL: &str = "chat.1.local.DownloadFileAttachmentLocal";
 const CHAT_USER_EMOJIS: &str = "chat.1.local.userEmojis";
 const CHAT_MARK_AS_READ_LOCAL: &str = "chat.1.local.markAsReadLocal";
+const CHAT_REFRESH_PARTICIPANTS_LOCAL: &str = "chat.1.local.refreshParticipants";
+const CHAT_GET_LAST_ACTIVE_FOR_TLF_LOCAL: &str = "chat.1.local.getLastActiveForTLF";
 const CHAT_PIN_MESSAGE_LOCAL: &str = "chat.1.local.pinMessage";
 const CHAT_UNPIN_MESSAGE_LOCAL: &str = "chat.1.local.unpinMessage";
+const CHAT_NEW_CONVERSATION_LOCAL: &str = "chat.1.local.newConversationLocal";
 const CHAT_TEAM_ID_OF_CONV: &str = "chat.1.remote.teamIDOfConv";
 const CHAT_TEAM_ID_FROM_TLF_NAME: &str = "chat.1.local.teamIDFromTLFName";
+const KEYBASE_USER_SEARCH: &str = "keybase.1.userSearch.userSearch";
 
 const TOPIC_TYPE_CHAT: i64 = 1;
 const TLF_VISIBILITY_ANY: i64 = 0;
+const TLF_VISIBILITY_PRIVATE: i64 = 0;
+const TLF_VISIBILITY_PUBLIC: i64 = 1;
 const GET_THREAD_REASON_FOREGROUND: i64 = 2;
 const IDENTIFY_BEHAVIOR_CHAT_GUI: i64 = 2;
 const TEAM_MEMBERS_TYPE: i64 = 1;
@@ -1291,12 +1990,14 @@ const THREAD_DEBUG_SAMPLE_LIMIT: usize = 20;
 const THREAD_DEBUG_DEFAULT_TARGET_ROOT: &str = "1101";
 const CRAWL_PROGRESS_EMIT_EVERY_PAGES: u64 = 10;
 const LOAD_OLDER_PAGE_SIZE: usize = 100;
+const MAX_EVENTS_PER_POLL: usize = 64;
 const NON_TEXT_PLACEHOLDER_BODY: &str = "<non-text message>";
 const LOAD_CONVERSATION_MAX_ATTEMPTS: usize = 3;
 const LOAD_CONVERSATION_RETRY_BASE_DELAY_MS: u64 = 150;
 const PROFILE_SYNC_COOLDOWN_MS: i64 = 15_000;
 const TEAM_AVATAR_SYNC_COOLDOWN_MS: i64 = 15_000;
 const EMOJI_SYNC_COOLDOWN_MS: i64 = 10_000;
+const EMOJI_SOURCE_SYNC_COOLDOWN_MS: i64 = 10_000;
 
 static REPLY_ANCESTOR_BACKFILL_IN_FLIGHT: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
 static PROFILE_SYNC_IN_FLIGHT: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
@@ -1305,7 +2006,70 @@ static TEAM_AVATAR_SYNC_IN_FLIGHT: OnceLock<Mutex<HashSet<String>>> = OnceLock::
 static TEAM_AVATAR_SYNC_LAST_START_MS: OnceLock<Mutex<HashMap<String, i64>>> = OnceLock::new();
 static EMOJI_SYNC_IN_FLIGHT: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
 static EMOJI_SYNC_LAST_START_MS: OnceLock<Mutex<HashMap<String, i64>>> = OnceLock::new();
+static EMOJI_SOURCE_SYNC_IN_FLIGHT: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+static EMOJI_SOURCE_SYNC_LAST_START_MS: OnceLock<Mutex<HashMap<String, i64>>> = OnceLock::new();
 static INBOX_UNREAD_REFRESH_IN_FLIGHT: OnceLock<Mutex<bool>> = OnceLock::new();
+static NON_TEXT_PLACEHOLDER_LOGGED: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+
+fn non_text_placeholder_key_preview(message_body: Option<&Value>) -> Vec<String> {
+    let Some(Value::Map(entries)) = message_body else {
+        return Vec::new();
+    };
+    entries
+        .iter()
+        .take(16)
+        .map(|(key, _)| match key {
+            Value::String(value) => value.as_str().unwrap_or("").to_string(),
+            other => format!("{other:?}"),
+        })
+        .filter(|key| !key.trim().is_empty())
+        .collect()
+}
+
+fn log_non_text_placeholder_once(
+    conversation_id: &ConversationId,
+    message_id: i64,
+    message_type: Option<i64>,
+    message_body: Option<&Value>,
+) {
+    let key = format!(
+        "{}:{}",
+        conversation_id.0,
+        message_type.map_or_else(|| "unknown".to_string(), |kind| kind.to_string())
+    );
+    let set = NON_TEXT_PLACEHOLDER_LOGGED.get_or_init(|| Mutex::new(HashSet::new()));
+    let mut set = set.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    if !set.insert(key.clone()) {
+        return;
+    }
+
+    let keys = non_text_placeholder_key_preview(message_body);
+    warn!(
+        target: "kbui.keybase.non_text_placeholder",
+        conversation_id = %conversation_id.0,
+        message_id = message_id,
+        message_type = message_type,
+        message_body_keys = %keys.join(","),
+        "suppressing non-text placeholder message; add parser mapping for this Keybase message type"
+    );
+}
+
+fn is_unset_message_type_only(message_body: Option<&Value>) -> bool {
+    let Some(body) = message_body else {
+        return false;
+    };
+    let keys = non_text_placeholder_key_preview(Some(body));
+    if keys.len() != 1 {
+        return false;
+    }
+    let key = keys[0].as_str();
+    if key != "messageType" && key != "mt" && key != "t" {
+        return false;
+    }
+    map_get_any(body, &["messageType", "mt", "t"])
+        .and_then(as_i64)
+        .is_some_and(|value| value == 0)
+}
 
 fn run_bootstrap(
     sender: Sender<BackendEvent>,
@@ -1387,6 +2151,10 @@ fn run_bootstrap(
         }
     };
 
+    if let Ok(affinities) = runtime.block_on(fetch_tracking_affinities_from_service(&path)) {
+        let _ = sender.send(BackendEvent::AffinitySynced { affinities });
+    }
+
     let account_for_bootstrap = account_id.clone();
     let backend_for_bootstrap = backend_id.clone();
     let result = runtime.block_on(async move {
@@ -1441,6 +2209,995 @@ fn run_bootstrap(
             }
         }
     }
+}
+
+fn run_load_user_profile(
+    sender: Sender<BackendEvent>,
+    local_store: Arc<LocalStore>,
+    account_id: AccountId,
+    user_id: UserId,
+) {
+    let Some(username) = profile_username_from_user_id(&user_id) else {
+        return;
+    };
+    let Some(path) = socket_path() else {
+        send_internal(
+            &sender,
+            "kbui.internal.profile_load_socket_path_missing",
+            Value::from(user_id.0.clone()),
+        );
+        return;
+    };
+    let runtime = match Builder::new_current_thread().enable_all().build() {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            send_internal(
+                &sender,
+                "kbui.internal.profile_load_runtime_init_failed",
+                Value::from(error.to_string()),
+            );
+            return;
+        }
+    };
+
+    let result = runtime.block_on(async {
+        let transport = FramedMsgpackTransport::connect(&path).await?;
+        let mut client = KeybaseRpcClient::new(transport);
+
+        let user_card = client
+            .call(
+                KEYBASE_USER_CARD,
+                vec![Value::Map(vec![
+                    (Value::from("username"), Value::from(username.clone())),
+                    (Value::from("useSession"), Value::from(true)),
+                ])],
+            )
+            .await
+            .unwrap_or(Value::Nil);
+
+        let load_user = client
+            .call(
+                KEYBASE_LOAD_USER_BY_NAME,
+                vec![Value::Map(vec![
+                    (Value::from("sessionID"), Value::from(SESSION_ID)),
+                    (Value::from("username"), Value::from(username.clone())),
+                ])],
+            )
+            .await
+            .unwrap_or(Value::Nil);
+
+        let gui_id = format!(
+            "kbui-profile-{}-{}",
+            sanitize_username(&username),
+            now_unix_ms()
+        );
+        let identify3_callbacks = client
+            .call_collecting_callbacks(
+                KEYBASE_IDENTIFY3,
+                vec![Value::Map(vec![
+                    (Value::from("assertion"), Value::from(username.clone())),
+                    (Value::from("guiID"), Value::from(gui_id)),
+                    (Value::from("ignoreCache"), Value::from(false)),
+                ])],
+            )
+            .await
+            .map(|(_result, callbacks)| callbacks)
+            .unwrap_or_default();
+
+        let display_name = parse_user_display_name(&load_user, &username)
+            .or_else(|| parse_user_display_name(&user_card, &username))
+            .unwrap_or_else(|| username.clone());
+        let bio = find_value_for_keys(&user_card, &["bio"], 0)
+            .and_then(as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string);
+        let location = find_value_for_keys(&user_card, &["location"], 0)
+            .and_then(as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string);
+        let title = find_value_for_keys(&load_user, &["title", "headline"], 0)
+            .or_else(|| find_value_for_keys(&user_card, &["title", "headline"], 0))
+            .and_then(as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string);
+        let followers_count = find_value_for_keys(&user_card, &["unverifiedNumFollowers"], 0)
+            .and_then(value_to_u32_allow_zero);
+        let following_count = find_value_for_keys(&user_card, &["unverifiedNumFollowing"], 0)
+            .and_then(value_to_u32_allow_zero);
+        let team_showcase = parse_team_showcase_entries(&user_card);
+        let identity_proofs = parse_identify3_proof_callbacks(&identify3_callbacks);
+
+        let avatar_urls = fetch_user_avatar_urls(&mut client, std::slice::from_ref(&username))
+            .await
+            .unwrap_or_default();
+        let avatar_url = avatar_urls.get(&username).cloned();
+        let mut avatar_path: Option<String> = None;
+        let mut avatar_asset = validated_avatar_asset(avatar_url.clone());
+        if let Some(url) = avatar_url.clone()
+            && let Ok(path) = download_avatar_to_cache(&username, &url).await
+        {
+            let local_path = path.display().to_string();
+            avatar_path = Some(local_path.clone());
+            avatar_asset = Some(local_path);
+        }
+
+        let you_are_following = fetch_tracking_affinities_from_service(&path)
+            .await
+            .ok()
+            .map(|affinities| {
+                affinities.contains_key(&UserId::new(user_id.0.to_ascii_lowercase()))
+                    || affinities.contains_key(&user_id)
+            })
+            .unwrap_or(false);
+
+        let mut sections = Vec::new();
+        if !identity_proofs.is_empty() {
+            sections.push(ProfileSection::IdentityProofs(identity_proofs));
+        }
+        sections.push(ProfileSection::SocialGraph(SocialGraph {
+            followers_count,
+            following_count,
+            is_following_you: false,
+            you_are_following,
+            followers: None,
+            following: None,
+        }));
+        if !team_showcase.is_empty() {
+            sections.push(ProfileSection::TeamShowcase(team_showcase));
+        }
+
+        let affinity = if you_are_following {
+            Affinity::Positive
+        } else {
+            Affinity::None
+        };
+        let presence = Presence {
+            availability: Availability::Unknown,
+            status_text: None,
+        };
+        let profile = UserProfile {
+            user_id: user_id.clone(),
+            username: username.clone(),
+            display_name: display_name.clone(),
+            avatar_asset: avatar_asset.clone(),
+            presence,
+            affinity,
+            bio,
+            location,
+            title,
+            sections,
+        };
+
+        let updated_ms = now_unix_ms();
+        let _ = local_store.upsert_user_profile(
+            &user_id,
+            display_name.clone(),
+            avatar_url,
+            avatar_path,
+            updated_ms,
+        );
+        Ok::<(UserProfile, String, Option<String>, i64), io::Error>((
+            profile,
+            display_name,
+            avatar_asset,
+            updated_ms,
+        ))
+    });
+
+    match result {
+        Ok((profile, display_name, avatar_asset, updated_ms)) => {
+            let _ = sender.send(BackendEvent::UserProfileUpserted {
+                user_id: profile.user_id.clone(),
+                display_name,
+                avatar_asset: validated_avatar_asset(avatar_asset),
+                updated_ms,
+            });
+            let _ = sender.send(BackendEvent::UserProfileLoaded {
+                account_id,
+                profile,
+            });
+        }
+        Err(error) => {
+            send_internal(
+                &sender,
+                "kbui.internal.profile_load_failed",
+                Value::Map(vec![
+                    (Value::from("user_id"), Value::from(user_id.0)),
+                    (Value::from("error"), Value::from(error.to_string())),
+                ]),
+            );
+        }
+    }
+}
+
+fn run_load_social_graph_list(
+    sender: Sender<BackendEvent>,
+    local_store: Arc<LocalStore>,
+    user_id: UserId,
+    list_type: SocialGraphListType,
+) {
+    let Some(username) = profile_username_from_user_id(&user_id) else {
+        return;
+    };
+    let Some(path) = socket_path() else {
+        send_internal(
+            &sender,
+            "kbui.internal.social_graph_socket_path_missing",
+            Value::from(user_id.0.clone()),
+        );
+        return;
+    };
+    let runtime = match Builder::new_current_thread().enable_all().build() {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            send_internal(
+                &sender,
+                "kbui.internal.social_graph_runtime_init_failed",
+                Value::from(error.to_string()),
+            );
+            return;
+        }
+    };
+
+    let result = runtime.block_on(async {
+        let transport = FramedMsgpackTransport::connect(&path).await?;
+        let mut client = KeybaseRpcClient::new(transport);
+
+        let response = match list_type {
+            SocialGraphListType::Followers => {
+                client
+                    .call(
+                        KEYBASE_LIST_TRACKERS_UNVERIFIED,
+                        vec![Value::Map(vec![(
+                            Value::from("assertion"),
+                            Value::from(username.clone()),
+                        )])],
+                    )
+                    .await?
+            }
+            SocialGraphListType::Following => {
+                client
+                    .call(
+                        KEYBASE_LIST_TRACKING,
+                        vec![Value::Map(vec![
+                            (Value::from("assertion"), Value::from(username.clone())),
+                            (Value::from("filter"), Value::from("")),
+                        ])],
+                    )
+                    .await?
+            }
+        };
+
+        let summaries = parse_user_summary_set(&response);
+        let usernames = summaries
+            .iter()
+            .map(|(username, _)| username.clone())
+            .collect::<Vec<_>>();
+        if !usernames.is_empty() {
+            spawn_prefetch_user_profiles(&sender, &local_store, usernames);
+        }
+
+        let affinities = fetch_tracking_affinities_from_service(&path)
+            .await
+            .unwrap_or_default();
+        let entries = summaries
+            .into_iter()
+            .map(|(username, full_name)| {
+                let entry_user_id = UserId::new(username.to_ascii_lowercase());
+                let (cached_name, cached_avatar) =
+                    load_cached_profile_summary(&local_store, &entry_user_id, &username);
+                let display_name = full_name
+                    .filter(|value| !value.trim().is_empty())
+                    .filter(|value| !value.eq_ignore_ascii_case(&username))
+                    .or_else(|| {
+                        (!cached_name.trim().is_empty()
+                            && !cached_name.eq_ignore_ascii_case(&username))
+                        .then_some(cached_name)
+                    })
+                    .unwrap_or(username.clone());
+                let affinity = affinities
+                    .get(&entry_user_id)
+                    .copied()
+                    .unwrap_or(Affinity::None);
+                SocialGraphEntry {
+                    user_id: entry_user_id,
+                    display_name,
+                    avatar_asset: validated_avatar_asset(cached_avatar),
+                    affinity,
+                }
+            })
+            .collect::<Vec<_>>();
+        Ok::<Vec<SocialGraphEntry>, io::Error>(entries)
+    });
+
+    match result {
+        Ok(entries) => {
+            let _ = sender.send(BackendEvent::SocialGraphListLoaded {
+                user_id,
+                list_type,
+                entries,
+            });
+        }
+        Err(error) => {
+            send_internal(
+                &sender,
+                "kbui.internal.social_graph_load_failed",
+                Value::Map(vec![
+                    (Value::from("user_id"), Value::from(user_id.0)),
+                    (Value::from("error"), Value::from(error.to_string())),
+                ]),
+            );
+        }
+    }
+}
+
+fn run_refresh_profile_presence(
+    sender: Sender<BackendEvent>,
+    local_store: Arc<LocalStore>,
+    user_id: UserId,
+    conversation_id: Option<ConversationId>,
+) {
+    let candidate_conversation_ids =
+        candidate_profile_presence_conversations(local_store.as_ref(), conversation_id.clone(), 48);
+    if candidate_conversation_ids.is_empty() {
+        send_internal(
+            &sender,
+            "kbui.internal.refresh_participants_no_candidate_conversations",
+            Value::from(user_id.0.clone()),
+        );
+        return;
+    }
+    let Some(path) = socket_path() else {
+        send_internal(
+            &sender,
+            "kbui.internal.refresh_participants_socket_path_missing",
+            Value::from(user_id.0.clone()),
+        );
+        return;
+    };
+    let runtime = match Builder::new_current_thread().enable_all().build() {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            send_internal(
+                &sender,
+                "kbui.internal.refresh_participants_runtime_init_failed",
+                Value::from(error.to_string()),
+            );
+            return;
+        }
+    };
+
+    let result = runtime.block_on(async {
+        let transport = FramedMsgpackTransport::connect(&path).await?;
+        let mut client = KeybaseRpcClient::new(transport);
+        let mut by_user: HashMap<UserId, PresencePatch> = HashMap::new();
+
+        if let Some(conversation_id) = conversation_id.as_ref()
+            && let Some(raw_conversation_id) = provider_ref_to_conversation_id_bytes(
+                &ProviderConversationRef::new(conversation_id.0.clone()),
+            )
+        {
+            if let Ok((_result, callbacks)) = client
+                .call_collecting_callbacks(
+                    CHAT_REFRESH_PARTICIPANTS_LOCAL,
+                    vec![Value::Map(vec![(
+                        Value::from("convID"),
+                        Value::Binary(raw_conversation_id.clone()),
+                    )])],
+                )
+                .await
+            {
+                for patch in parse_presence_updates_from_rpc_notifications(&callbacks)
+                    .into_iter()
+                    .filter(|patch| patch.user_id.0.eq_ignore_ascii_case(&user_id.0))
+                {
+                    merge_presence_patch(&mut by_user, patch);
+                }
+            }
+            if let Ok(Some(patch)) = fetch_profile_presence_patch_from_last_active(
+                &mut client,
+                &raw_conversation_id,
+                &user_id,
+            )
+            .await
+            {
+                merge_presence_patch(&mut by_user, patch);
+            }
+        }
+
+        for candidate in &candidate_conversation_ids {
+            if conversation_id
+                .as_ref()
+                .map(|current| current.0.eq_ignore_ascii_case(&candidate.0))
+                .unwrap_or(false)
+            {
+                continue;
+            }
+            let Some(raw_conversation_id) = provider_ref_to_conversation_id_bytes(
+                &ProviderConversationRef::new(candidate.0.clone()),
+            ) else {
+                continue;
+            };
+            if let Ok(Some(patch)) = fetch_profile_presence_patch_from_last_active(
+                &mut client,
+                &raw_conversation_id,
+                &user_id,
+            )
+            .await
+            {
+                let is_active = matches!(&patch.presence.availability, Availability::Active);
+                merge_presence_patch(&mut by_user, patch);
+                if is_active {
+                    break;
+                }
+            }
+        }
+
+        Ok::<Vec<PresencePatch>, io::Error>(by_user.into_values().collect())
+    });
+
+    match result {
+        Ok(patches) => {
+            if !patches.is_empty() {
+                let _ = sender.send(BackendEvent::PresenceUpdated {
+                    account_id: AccountId::new(DEFAULT_ACCOUNT_ID),
+                    users: patches,
+                });
+            }
+        }
+        Err(error) => {
+            send_internal(
+                &sender,
+                "kbui.internal.refresh_participants_failed",
+                Value::Map(vec![
+                    (Value::from("user_id"), Value::from(user_id.0)),
+                    (Value::from("error"), Value::from(error.to_string())),
+                ]),
+            );
+        }
+    }
+}
+
+fn candidate_profile_presence_conversations(
+    local_store: &LocalStore,
+    preferred: Option<ConversationId>,
+    limit: usize,
+) -> Vec<ConversationId> {
+    let mut candidates = Vec::new();
+    let mut seen = HashSet::new();
+    if let Some(conversation_id) = preferred
+        && seen.insert(conversation_id.0.clone())
+    {
+        candidates.push(conversation_id);
+    }
+    if let Ok(cached) = local_store.load_cached_conversation_ids(limit) {
+        for conversation_id in cached {
+            if seen.insert(conversation_id.0.clone()) {
+                candidates.push(conversation_id);
+            }
+        }
+    }
+    candidates
+}
+
+async fn fetch_profile_presence_patch_from_last_active(
+    client: &mut KeybaseRpcClient,
+    raw_conversation_id: &[u8],
+    user_id: &UserId,
+) -> io::Result<Option<PresencePatch>> {
+    let thread_result = client
+        .call(
+            CHAT_GET_THREAD_LOCAL,
+            vec![Value::Map(vec![
+                (
+                    Value::from("conversationID"),
+                    Value::Binary(raw_conversation_id.to_vec()),
+                ),
+                (
+                    Value::from("reason"),
+                    Value::from(GET_THREAD_REASON_FOREGROUND),
+                ),
+                (Value::from("query"), Value::Nil),
+                (
+                    Value::from("pagination"),
+                    Value::Map(vec![(Value::from("num"), Value::from(1))]),
+                ),
+                (
+                    Value::from("identifyBehavior"),
+                    Value::from(IDENTIFY_BEHAVIOR_CHAT_GUI),
+                ),
+            ])],
+        )
+        .await?;
+    let tlf_name = find_value_for_keys(&thread_result, &["tlfName", "tlf_name"], 0)
+        .and_then(as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    if let Some(tlf_name) = tlf_name
+        && !tlf_name_mentions_user(&tlf_name, &user_id.0)
+    {
+        return Ok(None);
+    }
+    let Some(tlf_id) = find_value_for_keys(&thread_result, &["tlfid", "tlfID", "tlfId"], 0)
+        .and_then(value_to_tlf_id_hex)
+    else {
+        return Ok(None);
+    };
+    let status_result = client
+        .call(
+            CHAT_GET_LAST_ACTIVE_FOR_TLF_LOCAL,
+            vec![Value::Map(vec![(
+                Value::from("tlfID"),
+                Value::from(tlf_id),
+            )])],
+        )
+        .await?;
+    let Some(availability) = parse_last_active_status_for_user(&status_result, user_id)
+        .filter(|value| *value != Availability::Unknown)
+    else {
+        return Ok(None);
+    };
+    Ok(Some(PresencePatch {
+        user_id: UserId::new(user_id.0.clone()),
+        presence: Presence {
+            availability,
+            status_text: None,
+        },
+    }))
+}
+
+fn parse_last_active_status_for_user(value: &Value, user_id: &UserId) -> Option<Availability> {
+    let mut patches = Vec::new();
+    collect_presence_patches(value, &mut patches, 0);
+    if let Some(patch) = patches
+        .into_iter()
+        .find(|patch| patch.user_id.0.eq_ignore_ascii_case(&user_id.0))
+    {
+        return Some(patch.presence.availability);
+    }
+    parse_last_active_status_availability(value)
+        .or_else(|| parse_presence_availability_from_payload(value))
+}
+
+fn value_to_tlf_id_hex(value: &Value) -> Option<String> {
+    if let Some(bytes) = as_binary(value) {
+        return Some(hex_encode(bytes));
+    }
+    let text = as_str(value)?.trim();
+    if text.is_empty() {
+        return None;
+    }
+    if text.len() % 2 == 0 && text.chars().all(|ch| ch.is_ascii_hexdigit()) {
+        return Some(text.to_ascii_lowercase());
+    }
+    None
+}
+
+fn tlf_name_mentions_user(tlf_name: &str, user_id: &str) -> bool {
+    let Some(target) = canonical_username(user_id) else {
+        return false;
+    };
+    tlf_name
+        .split(',')
+        .filter_map(canonical_username)
+        .any(|member| member == target)
+}
+
+fn run_follow_toggle(sender: Sender<BackendEvent>, user_id: UserId, follow: bool) {
+    let Some(username) = profile_username_from_user_id(&user_id) else {
+        return;
+    };
+    let Some(path) = socket_path() else {
+        send_internal(
+            &sender,
+            "kbui.internal.follow_toggle_socket_path_missing",
+            Value::from(user_id.0.clone()),
+        );
+        return;
+    };
+    let runtime = match Builder::new_current_thread().enable_all().build() {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            send_internal(
+                &sender,
+                "kbui.internal.follow_toggle_runtime_init_failed",
+                Value::from(error.to_string()),
+            );
+            return;
+        }
+    };
+
+    let result = runtime.block_on(async {
+        let transport = FramedMsgpackTransport::connect(&path).await?;
+        let mut client = KeybaseRpcClient::new(transport);
+        let gui_id = format!(
+            "kbui-follow-{}-{}",
+            sanitize_username(&username),
+            now_unix_ms()
+        );
+        let _ = client
+            .call(
+                KEYBASE_IDENTIFY3,
+                vec![Value::Map(vec![
+                    (Value::from("assertion"), Value::from(username.clone())),
+                    (Value::from("guiID"), Value::from(gui_id.clone())),
+                    (Value::from("ignoreCache"), Value::from(false)),
+                ])],
+            )
+            .await;
+        client
+            .call(
+                KEYBASE_IDENTIFY3_FOLLOW_USER,
+                vec![Value::Map(vec![
+                    (Value::from("guiID"), Value::from(gui_id)),
+                    (Value::from("follow"), Value::from(follow)),
+                ])],
+            )
+            .await?;
+        Ok::<(), io::Error>(())
+    });
+
+    match result {
+        Ok(()) => {
+            let _ = sender.send(BackendEvent::FollowStatusChanged {
+                user_id,
+                you_are_following: follow,
+            });
+        }
+        Err(error) => {
+            send_internal(
+                &sender,
+                "kbui.internal.follow_toggle_failed",
+                Value::Map(vec![
+                    (Value::from("user_id"), Value::from(user_id.0.clone())),
+                    (Value::from("follow"), Value::from(follow)),
+                    (Value::from("error"), Value::from(error.to_string())),
+                ]),
+            );
+            let _ = sender.send(BackendEvent::FollowStatusChangeFailed {
+                user_id,
+                attempted_follow: follow,
+                error: error.to_string(),
+            });
+        }
+    }
+}
+
+fn profile_username_from_user_id(user_id: &UserId) -> Option<String> {
+    let raw = user_id.0.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    if let Some(team_name) = raw.strip_prefix("team:") {
+        let trimmed = team_name.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+        return Some(trimmed.to_string());
+    }
+    Some(raw.to_string())
+}
+
+fn value_to_u32_allow_zero(value: &Value) -> Option<u32> {
+    if let Some(raw) = as_i64(value) {
+        return u32::try_from(raw).ok();
+    }
+    as_str(value).and_then(|raw| raw.trim().parse::<u32>().ok())
+}
+
+fn parse_team_showcase_entries(value: &Value) -> Vec<TeamShowcaseEntry> {
+    find_value_for_keys(value, &["teamShowcase"], 0)
+        .and_then(as_array)
+        .map(|teams| {
+            teams
+                .iter()
+                .filter_map(|team| {
+                    let name = find_value_for_keys(team, &["fqName", "name"], 0)
+                        .and_then(as_str)
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty())?
+                        .to_string();
+                    let description = find_value_for_keys(team, &["description"], 0)
+                        .and_then(as_str)
+                        .map(str::trim)
+                        .unwrap_or("")
+                        .to_string();
+                    let is_open = find_value_for_keys(team, &["open"], 0)
+                        .and_then(value_to_bool)
+                        .unwrap_or(false);
+                    let members_count = find_value_for_keys(team, &["numMembers"], 0)
+                        .and_then(value_to_u32_allow_zero)
+                        .unwrap_or(0);
+                    Some(TeamShowcaseEntry {
+                        name,
+                        description,
+                        is_open,
+                        members_count,
+                    })
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default()
+}
+
+fn parse_identity_proofs(value: &Value) -> Vec<IdentityProof> {
+    let mut rows = Vec::new();
+    if let Some(proofs) =
+        find_value_for_keys(value, &["proofs", "assertions", "rows"], 0).and_then(as_array)
+    {
+        for proof in proofs {
+            if let Some(parsed) = parse_identity_proof_row(proof) {
+                rows.push(parsed);
+            }
+        }
+    }
+    let mut dedup = HashSet::new();
+    rows.into_iter()
+        .filter(|proof| {
+            dedup.insert(format!(
+                "{}:{}",
+                proof.service_name.to_ascii_lowercase(),
+                proof.service_username.to_ascii_lowercase()
+            ))
+        })
+        .collect()
+}
+
+fn parse_identity_proof_row(value: &Value) -> Option<IdentityProof> {
+    let service_name = map_get_any(value, &["key", "service", "serviceName"])
+        .or_else(|| find_value_for_keys(value, &["key", "service", "serviceName"], 0))
+        .and_then(as_str)
+        .map(str::trim)
+        .filter(|v| !v.is_empty())?
+        .to_string();
+    let service_username = map_get_any(
+        value,
+        &[
+            "value",
+            "username",
+            "serviceUsername",
+            "name",
+            "proofUsername",
+        ],
+    )
+    .or_else(|| {
+        find_value_for_keys(
+            value,
+            &[
+                "value",
+                "username",
+                "serviceUsername",
+                "name",
+                "proofUsername",
+            ],
+            0,
+        )
+    })
+    .and_then(as_str)
+    .map(str::trim)
+    .filter(|v| !v.is_empty())?
+    .to_string();
+    let state = map_get_any(value, &["proofResult", "proof_result"])
+        .and_then(|proof_result| map_get_any(proof_result, &["state", "s"]))
+        .map(parse_proof_state)
+        .or_else(|| {
+            map_get_any(value, &["state", "proofState"])
+                .or_else(|| find_value_for_keys(value, &["state", "proofState"], 0))
+                .map(parse_proof_state)
+        })
+        .unwrap_or(ProofState::Unknown);
+    let proof_url = map_get_any(value, &["proofURL", "proofUrl", "proof_url"])
+        .or_else(|| find_value_for_keys(value, &["proofURL", "proofUrl", "proof_url"], 0))
+        .and_then(as_str)
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(str::to_string);
+    let site_url = map_get_any(value, &["siteURL", "siteUrl", "site_url"])
+        .or_else(|| find_value_for_keys(value, &["siteURL", "siteUrl", "site_url"], 0))
+        .and_then(as_str)
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(str::to_string);
+    let icon_asset = parse_identity_proof_icon_asset(value);
+
+    Some(IdentityProof {
+        service_name,
+        service_username,
+        proof_url,
+        site_url,
+        icon_asset,
+        state,
+    })
+}
+
+fn parse_proof_state(value: &Value) -> ProofState {
+    if let Some(raw) = as_i64(value) {
+        return match raw {
+            2 => ProofState::Verified,
+            3 | 5 => ProofState::Broken,
+            1 | 4 => ProofState::Pending,
+            _ => ProofState::Unknown,
+        };
+    }
+    let Some(text) = as_str(value) else {
+        return ProofState::Unknown;
+    };
+    match text.trim().to_ascii_lowercase().as_str() {
+        "valid" | "verified" | "ok" => ProofState::Verified,
+        "error" | "broken" | "revoked" => ProofState::Broken,
+        "checking" | "warning" | "pending" => ProofState::Pending,
+        _ => ProofState::Unknown,
+    }
+}
+
+fn parse_identify3_proof_callbacks(callbacks: &[RpcNotification]) -> Vec<IdentityProof> {
+    let mut dedup: HashMap<String, IdentityProof> = HashMap::new();
+    for callback in callbacks {
+        if !callback.method.starts_with("keybase.1.identify3Ui.")
+            || (!callback.method.contains("identify3UpdateRow")
+                && !callback.method.contains("identify3Row"))
+        {
+            continue;
+        }
+        let row_payload =
+            extract_identify3_row_payload(&callback.params).unwrap_or(&callback.params);
+        if let Some(proof) = parse_identity_proof_row(row_payload) {
+            let dedup_key = format!(
+                "{}:{}",
+                proof.service_name.to_ascii_lowercase(),
+                proof.service_username.to_ascii_lowercase()
+            );
+            if let Some(existing) = dedup.get_mut(&dedup_key) {
+                merge_identity_proof_row(existing, proof);
+            } else {
+                dedup.insert(dedup_key, proof);
+            }
+        }
+    }
+    let mut rows = dedup.into_values().collect::<Vec<_>>();
+    rows.sort_by(|left, right| {
+        left.service_name
+            .cmp(&right.service_name)
+            .then(left.service_username.cmp(&right.service_username))
+    });
+    rows
+}
+
+fn merge_identity_proof_row(existing: &mut IdentityProof, incoming: IdentityProof) {
+    if proof_state_priority(&incoming.state) >= proof_state_priority(&existing.state) {
+        existing.state = incoming.state;
+    }
+    if existing.proof_url.is_none() && incoming.proof_url.is_some() {
+        existing.proof_url = incoming.proof_url;
+    }
+    if existing.site_url.is_none() && incoming.site_url.is_some() {
+        existing.site_url = incoming.site_url;
+    }
+    if existing.icon_asset.is_none() && incoming.icon_asset.is_some() {
+        existing.icon_asset = incoming.icon_asset;
+    }
+}
+
+fn proof_state_priority(state: &ProofState) -> u8 {
+    match state {
+        ProofState::Unknown => 0,
+        ProofState::Pending => 1,
+        ProofState::Verified | ProofState::Broken => 2,
+    }
+}
+
+fn extract_identify3_row_payload(params: &Value) -> Option<&Value> {
+    if let Some(row) = map_get_any(params, &["row"]) {
+        return Some(row);
+    }
+    let entries = as_array(params)?;
+    for entry in entries {
+        if let Some(row) = map_get_any(entry, &["row"]) {
+            return Some(row);
+        }
+    }
+    None
+}
+
+fn parse_identity_proof_icon_asset(value: &Value) -> Option<String> {
+    let site_icon = map_get_any(value, &["siteIcon", "siteIcons", "icon"])
+        .or_else(|| find_value_for_keys(value, &["siteIcon", "siteIcons", "icon"], 0))?;
+    match site_icon {
+        Value::Array(entries) => {
+            let mut first_url: Option<String> = None;
+            let mut smallest_width: Option<(i64, String)> = None;
+            for entry in entries {
+                let url = map_get_any(entry, &["url", "asset", "src"])
+                    .or_else(|| map_get_any(entry, &["path"]))
+                    .and_then(as_str)
+                    .map(str::trim)
+                    .filter(|url| !url.is_empty())
+                    .map(str::to_string);
+                let Some(url) = url else {
+                    continue;
+                };
+                let width = map_get_any(entry, &["width", "w", "size"]).and_then(as_i64);
+                if width == Some(16) {
+                    return Some(url);
+                }
+                if let Some(width) = width.filter(|value| *value > 0) {
+                    match &smallest_width {
+                        Some((current, _)) if *current <= width => {}
+                        _ => {
+                            smallest_width = Some((width, url.clone()));
+                        }
+                    }
+                }
+                if first_url.is_none() {
+                    first_url = Some(url);
+                }
+            }
+            smallest_width.map(|(_, url)| url).or(first_url)
+        }
+        _ => map_get_any(site_icon, &["url", "asset", "src", "path"])
+            .and_then(as_str)
+            .map(str::trim)
+            .filter(|url| !url.is_empty())
+            .map(str::to_string)
+            .or_else(|| {
+                as_str(site_icon)
+                    .map(str::trim)
+                    .filter(|url| !url.is_empty())
+                    .map(str::to_string)
+            }),
+    }
+}
+
+fn parse_user_summary_set(value: &Value) -> Vec<(String, Option<String>)> {
+    let users = find_value_for_keys(value, &["users"], 0)
+        .and_then(as_array)
+        .cloned()
+        .unwrap_or_default();
+    users
+        .into_iter()
+        .filter_map(|entry| {
+            let username = find_value_for_keys(&entry, &["username"], 0)
+                .and_then(as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())?
+                .to_ascii_lowercase();
+            let full_name = find_value_for_keys(&entry, &["fullName", "fullname", "full_name"], 0)
+                .and_then(as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string);
+            Some((username, full_name))
+        })
+        .collect()
+}
+
+fn load_cached_profile_summary(
+    local_store: &LocalStore,
+    user_id: &UserId,
+    fallback_username: &str,
+) -> (String, Option<String>) {
+    let Ok(profile) = local_store.get_user_profile(user_id) else {
+        return (fallback_username.to_string(), None);
+    };
+    let Some(profile) = profile else {
+        return (fallback_username.to_string(), None);
+    };
+    let display_name = profile
+        .display_name
+        .trim()
+        .is_empty()
+        .then_some(fallback_username.to_string())
+        .unwrap_or(profile.display_name);
+    let avatar = profile
+        .avatar_path
+        .clone()
+        .filter(|path| avatar_asset_path_usable(path))
+        .or_else(|| profile.avatar_url.clone());
+    (display_name, avatar)
 }
 
 fn start_background_cached_conversation_extension(
@@ -2026,7 +3783,7 @@ fn run_background_full_history_crawl(
                     }
                 };
 
-                persist_reaction_deltas(&local_store, &page.reaction_deltas);
+                persist_reaction_deltas(Some(&sender), &local_store, &page.reaction_deltas);
 
                 if page.messages.is_empty() && page.reaction_deltas.is_empty() {
                     let _ = local_store.upsert_crawl_checkpoint(&CrawlCheckpoint {
@@ -2076,7 +3833,7 @@ fn run_background_full_history_crawl(
                     updated_ms: now_unix_ms(),
                 });
 
-                if pages_crawled % CRAWL_PROGRESS_EMIT_EVERY_PAGES == 0 {
+                if pages_crawled.is_multiple_of(CRAWL_PROGRESS_EMIT_EVERY_PAGES) {
                     send_internal(
                         &sender,
                         "kbui.internal.crawl.conversation_progress",
@@ -2209,7 +3966,7 @@ fn run_background_thread_edge_migration(
         let _ = local_store.mark_thread_edge_conversation_migrated(&conversation_id);
         migrated_conversations = migrated_conversations.saturating_add(1);
         rewritten_edges_total = rewritten_edges_total.saturating_add(rewritten);
-        if migrated_conversations % 50 == 0 {
+        if migrated_conversations.is_multiple_of(50) {
             send_internal(
                 &sender,
                 "kbui.internal.thread_edge_migration.progress",
@@ -2248,7 +4005,10 @@ fn run_load_conversation(
     conversation_ref: ProviderConversationRef,
     local_store: Arc<LocalStore>,
     search_index: Arc<SearchIndex>,
+    queued_at: Instant,
 ) {
+    let queue_wait_ms = queued_at.elapsed().as_millis();
+    let load_started = Instant::now();
     let conversation_id = canonical_conversation_id_from_provider_ref(&conversation_ref);
     send_internal(
         &sender,
@@ -2265,6 +4025,7 @@ fn run_load_conversation(
         return;
     };
 
+    let runtime_init_started = Instant::now();
     let runtime = {
         let mut attempt = 1usize;
         loop {
@@ -2303,7 +4064,9 @@ fn run_load_conversation(
             }
         }
     };
+    let runtime_init_ms = runtime_init_started.elapsed().as_millis();
 
+    let service_fetch_started = Instant::now();
     let mut attempt = 1usize;
     let result = loop {
         let path_for_fetch = path.clone();
@@ -2347,19 +4110,40 @@ fn run_load_conversation(
 
     match result {
         Ok(loaded) => {
-            if let Some(pinned) = loaded.pinned_state {
+            let service_fetch_ms = service_fetch_started.elapsed().as_millis();
+            let LoadedConversation {
+                page,
+                pinned_state,
+                thread_fetch_ms,
+                pinned_fetch_ms,
+            } = loaded;
+
+            let pinned_emit_started = Instant::now();
+            if let Some(pinned) = pinned_state {
                 let _ = sender.send(BackendEvent::PinnedStateUpdated {
                     conversation_id: conversation_id.clone(),
                     pinned,
                 });
             }
-            persist_reaction_deltas(&local_store, &loaded.page.reaction_deltas);
-            for delete_event in reaction_op_delete_events(&loaded.page.reaction_deltas) {
+            let pinned_emit_ms = pinned_emit_started.elapsed().as_millis();
+            let ThreadPage {
+                mut messages,
+                reaction_deltas,
+                ..
+            } = page;
+            let reaction_delta_count = reaction_deltas.len();
+
+            let reaction_delta_started = Instant::now();
+            for delete_event in reaction_op_delete_events(&reaction_deltas) {
                 if sender.send(delete_event).is_err() {
                     break;
                 }
             }
-            let mut messages = loaded.page.messages;
+            let reaction_delta_ms = reaction_delta_started.elapsed().as_millis();
+
+            strip_reaction_delete_tombstones(&local_store, &conversation_id, &mut messages);
+            strip_reaction_delete_tombstones_from_deltas(&mut messages, &reaction_deltas);
+            let reaction_hydrate_started = Instant::now();
             let message_ids = messages
                 .iter()
                 .map(|message| message.id.clone())
@@ -2370,14 +4154,68 @@ fn run_load_conversation(
             for message in &mut messages {
                 message.reactions = domain_message_reactions(loaded_reactions.get(&message.id));
             }
+            let reaction_hydrate_ms = reaction_hydrate_started.elapsed().as_millis();
+            let attachment_hydration_candidates = messages
+                .iter()
+                .filter(|message| message_needs_image_attachment_hydration(message))
+                .map(|message| message.id.clone())
+                .collect::<Vec<_>>();
+            let attachment_hydration_candidate_count = attachment_hydration_candidates.len();
+
+            let ingest_started = Instant::now();
             let mut usernames = Vec::new();
+            let mut timeline_messages = Vec::with_capacity(messages.len());
             for mut message in messages {
                 usernames.push(message.author_id.0.clone());
-                ingest_message_record(Some(&sender), &local_store, &search_index, &mut message);
-                if sender.send(BackendEvent::MessageUpserted(message)).is_err() {
-                    break;
-                }
+                ingest_message_record_for_timeline_load(
+                    Some(&sender),
+                    &local_store,
+                    &search_index,
+                    &mut message,
+                );
+                timeline_messages.push(message);
             }
+            let ingest_ms = ingest_started.elapsed().as_millis();
+
+            let normalize_started = Instant::now();
+            normalize_message_records(&mut timeline_messages);
+            let older_cursor = timeline_messages
+                .first()
+                .map(|message| message.id.0.clone());
+            let newer_cursor = timeline_messages.last().map(|message| message.id.0.clone());
+            let timeline_message_count = timeline_messages.len();
+            let normalize_ms = normalize_started.elapsed().as_millis();
+
+            let timeline_emit_started = Instant::now();
+            if sender
+                .send(BackendEvent::TimelineReplaced {
+                    conversation_id: conversation_id.clone(),
+                    messages: timeline_messages,
+                    older_cursor,
+                    newer_cursor,
+                })
+                .is_err()
+            {
+                return;
+            }
+            let timeline_emit_ms = timeline_emit_started.elapsed().as_millis();
+            spawn_hydrate_timeline_attachments(
+                &sender,
+                &local_store,
+                &conversation_id,
+                &conversation_ref,
+                &path,
+                attachment_hydration_candidates,
+            );
+            spawn_persist_reaction_deltas_for_timeline_load(
+                &sender,
+                &local_store,
+                conversation_id.clone(),
+                reaction_deltas,
+                message_ids,
+            );
+
+            let post_sync_started = Instant::now();
             usernames.sort();
             usernames.dedup();
             if !usernames.is_empty() {
@@ -2389,28 +4227,204 @@ fn run_load_conversation(
                 .ok()
                 .flatten()
                 .is_some_and(|summary| summary.kind == ConversationKind::Channel);
+            let team_roles_sync_started = Instant::now();
             if should_sync_team_roles {
-                sync_conversation_team_roles(
+                spawn_sync_conversation_team_roles(
                     &sender,
                     &local_store,
-                    &conversation_id,
-                    &conversation_ref,
+                    conversation_id.clone(),
+                    conversation_ref.clone(),
                     false,
                 );
             }
+            let team_roles_sync_ms = team_roles_sync_started.elapsed().as_millis();
+            let post_sync_ms = post_sync_started.elapsed().as_millis();
             send_internal(
                 &sender,
                 "kbui.internal.load_conversation_loaded",
-                Value::from(conversation_id.0),
+                Value::from(conversation_id.0.clone()),
             );
+            let total_ms = load_started.elapsed().as_millis();
+            if load_conversation_perf_log_all_enabled()
+                || queue_wait_ms >= 150
+                || total_ms >= 250
+                || service_fetch_ms >= 150
+                || ingest_ms >= 100
+            {
+                warn!(
+                    target: "kbui.load_conversation.perf",
+                    conversation_id = %conversation_id.0,
+                    queue_wait_ms = queue_wait_ms as i64,
+                    total_ms = total_ms as i64,
+                    runtime_init_ms = runtime_init_ms as i64,
+                    service_fetch_ms = service_fetch_ms as i64,
+                    thread_fetch_ms = thread_fetch_ms as i64,
+                    pinned_fetch_ms = pinned_fetch_ms as i64,
+                    pinned_emit_ms = pinned_emit_ms as i64,
+                    reaction_delta_ms = reaction_delta_ms as i64,
+                    reaction_hydrate_ms = reaction_hydrate_ms as i64,
+                    ingest_ms = ingest_ms as i64,
+                    normalize_ms = normalize_ms as i64,
+                    timeline_emit_ms = timeline_emit_ms as i64,
+                    post_sync_ms = post_sync_ms as i64,
+                    team_roles_sync_ms = team_roles_sync_ms as i64,
+                    message_count = timeline_message_count as i64,
+                    reaction_delta_count = reaction_delta_count as i64,
+                    attachment_hydration_candidates = attachment_hydration_candidate_count as i64,
+                    "load_conversation_timing"
+                );
+            }
         }
         Err(error) => {
+            let total_ms = load_started.elapsed().as_millis();
+            let service_fetch_ms = service_fetch_started.elapsed().as_millis();
+            warn!(
+                target: "kbui.load_conversation.perf",
+                conversation_id = %conversation_id.0,
+                queue_wait_ms = queue_wait_ms as i64,
+                total_ms = total_ms as i64,
+                runtime_init_ms = runtime_init_ms as i64,
+                service_fetch_ms = service_fetch_ms as i64,
+                error = %error,
+                "load_conversation_failed"
+            );
             send_internal(
                 &sender,
                 "kbui.internal.load_conversation_failed",
                 Value::from(error.to_string()),
             );
         }
+    }
+}
+
+fn load_conversation_perf_log_all_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("KBUI_LOAD_CONVERSATION_PERF_LOG_ALL")
+            .ok()
+            .is_some_and(|raw| {
+                matches!(
+                    raw.trim().to_ascii_lowercase().as_str(),
+                    "1" | "true" | "yes" | "on"
+                )
+            })
+    })
+}
+
+fn spawn_hydrate_timeline_attachments(
+    sender: &Sender<BackendEvent>,
+    local_store: &Arc<LocalStore>,
+    conversation_id: &ConversationId,
+    conversation_ref: &ProviderConversationRef,
+    socket_path: &Path,
+    message_ids: Vec<MessageId>,
+) {
+    if message_ids.is_empty() {
+        return;
+    }
+    let Some(raw_conversation_id) = provider_ref_to_conversation_id_bytes(conversation_ref) else {
+        return;
+    };
+    let sender = sender.clone();
+    let local_store = Arc::clone(local_store);
+    let conversation_id = conversation_id.clone();
+    let socket_path = socket_path.to_path_buf();
+    let dedupe_key = format!("hydrate_attachments:{}", conversation_id.0);
+    let _ = task_runtime::spawn_task(TaskPriority::Low, Some(dedupe_key), move || {
+        run_hydrate_timeline_attachments(
+            sender,
+            local_store,
+            conversation_id,
+            raw_conversation_id,
+            socket_path,
+            message_ids,
+        );
+    });
+}
+
+fn run_hydrate_timeline_attachments(
+    sender: Sender<BackendEvent>,
+    local_store: Arc<LocalStore>,
+    conversation_id: ConversationId,
+    raw_conversation_id: Vec<u8>,
+    socket_path: PathBuf,
+    message_ids: Vec<MessageId>,
+) {
+    let candidate_count = message_ids.len();
+    let runtime = match Builder::new_current_thread().enable_all().build() {
+        Ok(runtime) => runtime,
+        Err(_) => return,
+    };
+    let mut messages = message_ids
+        .into_iter()
+        .filter_map(|message_id| {
+            local_store
+                .get_message(&conversation_id, &message_id)
+                .ok()
+                .flatten()
+        })
+        .filter(message_needs_image_attachment_hydration)
+        .collect::<Vec<_>>();
+    if messages.is_empty() {
+        return;
+    }
+    let scanned_message_count = messages.len();
+    let hydration_started = Instant::now();
+    let hydrate_result = runtime.block_on(async move {
+        let transport = FramedMsgpackTransport::connect(&socket_path).await?;
+        let mut client = KeybaseRpcClient::new(transport);
+        let updated_ids = hydrate_attachment_paths_for_messages(
+            &mut client,
+            &raw_conversation_id,
+            &mut messages,
+            ATTACHMENT_DOWNLOAD_LIMIT_PER_PAGE,
+        )
+        .await;
+        Ok::<_, io::Error>((messages, updated_ids))
+    });
+    let (messages, updated_ids) = match hydrate_result {
+        Ok(result) => result,
+        Err(error) => {
+            send_internal(
+                &sender,
+                "kbui.internal.load_conversation_attachment_hydration_failed",
+                Value::Map(vec![
+                    (
+                        Value::from("conversation_id"),
+                        Value::from(conversation_id.0.clone()),
+                    ),
+                    (Value::from("error"), Value::from(error.to_string())),
+                ]),
+            );
+            return;
+        }
+    };
+    if updated_ids.is_empty() {
+        return;
+    }
+    let updated_ids = updated_ids.into_iter().collect::<HashSet<_>>();
+    let mut updated_count = 0usize;
+    for message in messages {
+        if !updated_ids.contains(&message.id) {
+            continue;
+        }
+        let _ = local_store.persist_message(&message);
+        if sender.send(BackendEvent::MessageUpserted(message)).is_err() {
+            break;
+        }
+        updated_count = updated_count.saturating_add(1);
+    }
+    let elapsed_ms = hydration_started.elapsed().as_millis();
+    if load_conversation_perf_log_all_enabled() || elapsed_ms >= 250 {
+        warn!(
+            target: "kbui.load_conversation.perf",
+            conversation_id = %conversation_id.0,
+            elapsed_ms = elapsed_ms as i64,
+            candidate_count = candidate_count as i64,
+            scanned_message_count = scanned_message_count as i64,
+            updated_message_count = updated_count as i64,
+            "load_conversation_attachment_hydration"
+        );
     }
 }
 
@@ -2461,18 +4475,19 @@ fn run_load_older_messages(
         Ok(fetched) => {
             fetched_page_has_more =
                 page_may_have_more_older_messages(&fetched, LOAD_OLDER_PAGE_SIZE);
-            persist_reaction_deltas(&local_store, &fetched.reaction_deltas);
+            persist_reaction_deltas(Some(&sender), &local_store, &fetched.reaction_deltas);
             reaction_delete_events = reaction_op_delete_events(&fetched.reaction_deltas);
-            let message_ids = fetched
-                .messages
+            let mut fetched_messages = fetched.messages;
+            strip_reaction_delete_tombstones(&local_store, &conversation_id, &mut fetched_messages);
+            let message_ids = fetched_messages
                 .iter()
                 .map(|message| message.id.clone())
                 .collect::<Vec<_>>();
             let loaded_reactions = local_store
                 .load_message_reactions_for_messages(&conversation_id, &message_ids)
                 .unwrap_or_default();
-            let mut hydrated = Vec::with_capacity(fetched.messages.len());
-            for mut message in fetched.messages {
+            let mut hydrated = Vec::with_capacity(fetched_messages.len());
+            for mut message in fetched_messages {
                 message.reactions = domain_message_reactions(loaded_reactions.get(&message.id));
                 ingest_message_record(Some(&sender), &local_store, &search_index, &mut message);
                 hydrated.push(message);
@@ -2569,7 +4584,7 @@ fn run_backfill_thread_history(
             break;
         }
 
-        persist_reaction_deltas(&local_store, &page.reaction_deltas);
+        persist_reaction_deltas(Some(&sender), &local_store, &page.reaction_deltas);
         for delete_event in reaction_op_delete_events(&page.reaction_deltas) {
             let _ = sender.send(delete_event);
         }
@@ -2586,7 +4601,6 @@ fn run_backfill_thread_history(
         for mut message in page.messages {
             message.reactions = domain_message_reactions(loaded_reactions.get(&message.id));
             ingest_message_record(Some(&sender), &local_store, &search_index, &mut message);
-            let _ = sender.send(BackendEvent::MessageUpserted(message));
         }
 
         let Some(oldest_id) = oldest_id else {
@@ -2657,24 +4671,24 @@ fn run_backfill_thread_history(
             break;
         }
 
-        persist_reaction_deltas(&local_store, &page.reaction_deltas);
+        persist_reaction_deltas(Some(&sender), &local_store, &page.reaction_deltas);
         for delete_event in reaction_op_delete_events(&page.reaction_deltas) {
             let _ = sender.send(delete_event);
         }
 
-        let newest_id = page.messages.last().map(|message| message.id.clone());
-        let message_ids = page
-            .messages
+        let mut page_messages = page.messages;
+        strip_reaction_delete_tombstones(&local_store, &conversation_id, &mut page_messages);
+        let newest_id = page_messages.last().map(|message| message.id.clone());
+        let message_ids = page_messages
             .iter()
             .map(|message| message.id.clone())
             .collect::<Vec<_>>();
         let loaded_reactions = local_store
             .load_message_reactions_for_messages(&conversation_id, &message_ids)
             .unwrap_or_default();
-        for mut message in page.messages {
+        for mut message in page_messages {
             message.reactions = domain_message_reactions(loaded_reactions.get(&message.id));
             ingest_message_record(Some(&sender), &local_store, &search_index, &mut message);
-            let _ = sender.send(BackendEvent::MessageUpserted(message));
         }
 
         let Some(newest_id) = newest_id else {
@@ -3051,6 +5065,141 @@ fn spawn_sync_conversation_emojis(
     );
 }
 
+fn spawn_sync_message_emoji_sources(sender: &Sender<BackendEvent>, message: &MessageRecord) {
+    let mut queued = HashMap::<String, (EmojiSourceRef, String)>::new();
+    for fragment in &message.fragments {
+        let MessageFragment::Emoji {
+            alias,
+            source_ref: Some(source_ref),
+        } = fragment
+        else {
+            continue;
+        };
+        if source_ref.backend_id.0 != KEYBASE_BACKEND_ID {
+            continue;
+        }
+        let cache_key = source_ref.cache_key();
+        queued
+            .entry(cache_key)
+            .or_insert_with(|| (source_ref.clone(), alias.clone()));
+    }
+
+    for (_, (source_ref, alias)) in queued {
+        spawn_sync_emoji_source(sender, source_ref, alias);
+    }
+}
+
+fn spawn_sync_reaction_emoji_sources(
+    sender: &Sender<BackendEvent>,
+    deltas: &[MessageReactionDelta],
+) {
+    let mut queued = HashMap::<String, (EmojiSourceRef, String)>::new();
+    for delta in deltas {
+        let Some(source_ref) = delta.source_ref.clone() else {
+            continue;
+        };
+        if source_ref.backend_id.0 != KEYBASE_BACKEND_ID {
+            continue;
+        }
+        let alias = normalize_shortcode_alias(&delta.emoji).unwrap_or_else(|| delta.emoji.clone());
+        queued
+            .entry(source_ref.cache_key())
+            .or_insert_with(|| (source_ref, alias));
+    }
+    for (_, (source_ref, alias)) in queued {
+        spawn_sync_emoji_source(sender, source_ref, alias);
+    }
+}
+
+fn spawn_sync_emoji_source(
+    sender: &Sender<BackendEvent>,
+    source_ref: EmojiSourceRef,
+    alias: String,
+) {
+    let cache_key = source_ref.cache_key();
+    if !try_mark_throttled_in_flight(
+        &cache_key,
+        EMOJI_SOURCE_SYNC_COOLDOWN_MS,
+        &EMOJI_SOURCE_SYNC_IN_FLIGHT,
+        &EMOJI_SOURCE_SYNC_LAST_START_MS,
+    ) {
+        return;
+    }
+    let sender = sender.clone();
+    let _ = task_runtime::spawn_task(
+        TaskPriority::Low,
+        Some(format!("sync_emoji_source:{cache_key}")),
+        move || {
+            sync_message_emoji_source(&sender, &source_ref, &alias);
+            clear_marked_in_flight(&cache_key, &EMOJI_SOURCE_SYNC_IN_FLIGHT);
+        },
+    );
+}
+
+fn sync_message_emoji_source(
+    sender: &Sender<BackendEvent>,
+    source_ref: &EmojiSourceRef,
+    alias: &str,
+) {
+    let Some((raw_conversation_id, message_id)) = keybase_emoji_source_target(source_ref) else {
+        return;
+    };
+    let Some(socket) = socket_path() else {
+        return;
+    };
+    let runtime = match Builder::new_current_thread().enable_all().build() {
+        Ok(runtime) => runtime,
+        Err(_) => return,
+    };
+
+    let sender = sender.clone();
+    let source_ref = source_ref.clone();
+    let alias = alias.to_string();
+    runtime.block_on(async move {
+        let transport = match FramedMsgpackTransport::connect(&socket).await {
+            Ok(transport) => transport,
+            Err(_) => return,
+        };
+        let mut client = KeybaseRpcClient::new(transport);
+        let mut asset_path =
+            download_attachment_to_cache(&mut client, &raw_conversation_id, message_id, false)
+                .await;
+        if asset_path.is_none() {
+            asset_path =
+                download_attachment_to_cache(&mut client, &raw_conversation_id, message_id, true)
+                    .await;
+        }
+        let Some(asset_path) = asset_path else {
+            return;
+        };
+        let _ = sender.send(BackendEvent::EmojiSourceSynced {
+            source_ref,
+            alias,
+            unicode: None,
+            asset_path: Some(asset_path),
+            updated_ms: now_unix_ms(),
+        });
+    });
+}
+
+fn keybase_emoji_source_target(source_ref: &EmojiSourceRef) -> Option<(Vec<u8>, i64)> {
+    if source_ref.backend_id.0 != KEYBASE_BACKEND_ID {
+        return None;
+    }
+    let mut conv_hex = None::<&str>;
+    let mut message_id = None::<i64>;
+    for part in source_ref.ref_key.split(':') {
+        if let Some(value) = part.strip_prefix("conv=") {
+            conv_hex = Some(value);
+        }
+        if let Some(value) = part.strip_prefix("msg=") {
+            message_id = value.parse::<i64>().ok();
+        }
+    }
+    let conv_bytes = conv_hex.and_then(hex_decode)?;
+    Some((conv_bytes, message_id?))
+}
+
 fn should_retry_load_conversation_error(error: &io::Error) -> bool {
     if matches!(error.raw_os_error(), Some(24 | 23 | 35)) {
         return true;
@@ -3220,7 +5369,7 @@ fn run_reply_ancestor_backfill(
         }
         fetched_any = true;
 
-        persist_reaction_deltas(&local_store, &page.reaction_deltas);
+        persist_reaction_deltas(sender.as_ref(), &local_store, &page.reaction_deltas);
         if let Some(sender_ref) = sender.as_ref() {
             for delete_event in reaction_op_delete_events(&page.reaction_deltas) {
                 let _ = sender_ref.send(delete_event);
@@ -3297,9 +5446,16 @@ fn next_older_cursor(
 }
 
 fn compare_message_ids(left: &MessageId, right: &MessageId) -> std::cmp::Ordering {
-    match (left.0.parse::<u64>().ok(), right.0.parse::<u64>().ok()) {
-        (Some(left), Some(right)) => left.cmp(&right),
-        _ => left.0.cmp(&right.0),
+    let left_num = left.0.parse::<u64>().ok();
+    let right_num = right.0.parse::<u64>().ok();
+
+    match (left_num, right_num) {
+        (Some(left_num), Some(right_num)) => {
+            left_num.cmp(&right_num).then_with(|| left.0.cmp(&right.0))
+        }
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (None, None) => left.0.cmp(&right.0),
     }
 }
 
@@ -3327,11 +5483,29 @@ fn normalize_message_records(messages: &mut Vec<MessageRecord>) {
     }
     let mut latest_by_id = HashMap::with_capacity(messages.len());
     for message in std::mem::take(messages) {
-        latest_by_id.insert(message.id.clone(), message);
+        match latest_by_id.entry(message.id.clone()) {
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(message);
+            }
+            std::collections::hash_map::Entry::Occupied(mut entry) => {
+                if should_replace_duplicate_record(entry.get(), &message) {
+                    entry.insert(message);
+                }
+            }
+        }
     }
     let mut normalized = latest_by_id.into_values().collect::<Vec<_>>();
     normalized.sort_by(|left, right| compare_message_ids(&left.id, &right.id));
     *messages = normalized;
+}
+
+fn should_replace_duplicate_record(existing: &MessageRecord, incoming: &MessageRecord) -> bool {
+    match (&existing.edited, &incoming.edited) {
+        (None, Some(_)) => true,
+        (Some(_), None) => false,
+        (Some(a), Some(b)) => b.edited_at_ms.unwrap_or(0) > a.edited_at_ms.unwrap_or(0),
+        (None, None) => incoming.timestamp_ms.unwrap_or(0) > existing.timestamp_ms.unwrap_or(0),
+    }
 }
 
 fn enqueue_message_search_upsert(search_index: &Arc<SearchIndex>, message: &MessageRecord) {
@@ -3415,6 +5589,9 @@ fn ingest_message_record(
     search_index: &Arc<SearchIndex>,
     message: &mut MessageRecord,
 ) {
+    if let Some(sender) = sender {
+        spawn_sync_message_emoji_sources(sender, message);
+    }
     hydrate_thread_metadata(local_store, message);
     let _ = local_store.persist_message(message);
     maybe_schedule_reply_ancestor_backfill(
@@ -3442,6 +5619,24 @@ fn ingest_message_record(
         &message.conversation_id,
         &root_id,
     );
+}
+
+fn ingest_message_record_for_timeline_load(
+    sender: Option<&Sender<BackendEvent>>,
+    local_store: &Arc<LocalStore>,
+    search_index: &Arc<SearchIndex>,
+    message: &mut MessageRecord,
+) {
+    // Keep conversation-open latency low by deferring expensive reply-graph repair
+    // and descendant recount work to dedicated thread/repair paths.
+    if let Some(sender) = sender {
+        // Keep cross-team custom emojis visible on initial timeline load without
+        // paying the full ingest cost used for live message processing.
+        spawn_sync_message_emoji_sources(sender, message);
+    }
+    hydrate_thread_metadata(local_store, message);
+    let _ = local_store.persist_message(message);
+    enqueue_message_search_upsert(search_index, message);
 }
 
 fn resolve_thread_root_for_message(
@@ -3509,7 +5704,7 @@ fn warm_recent_conversation_messages_for_thread(
     let runtime = Builder::new_current_thread().enable_all().build()?;
     let conversation_id_for_fetch = conversation_id.clone();
     let raw_conversation_id_for_fetch = raw_conversation_id.to_vec();
-    let page = runtime.block_on(async move {
+    let mut page = runtime.block_on(async move {
         let transport = FramedMsgpackTransport::connect(socket_path).await?;
         let mut client = KeybaseRpcClient::new(transport);
         fetch_thread_messages_by_raw_id(
@@ -3520,7 +5715,8 @@ fn warm_recent_conversation_messages_for_thread(
         .await
     })?;
 
-    persist_reaction_deltas(local_store, &page.reaction_deltas);
+    persist_reaction_deltas(None, local_store, &page.reaction_deltas);
+    strip_reaction_delete_tombstones(local_store, conversation_id, &mut page.messages);
     let message_ids = page
         .messages
         .iter()
@@ -3540,6 +5736,8 @@ fn warm_recent_conversation_messages_for_thread(
 struct LoadedConversation {
     page: ThreadPage,
     pinned_state: Option<PinnedState>,
+    thread_fetch_ms: u128,
+    pinned_fetch_ms: u128,
 }
 
 async fn load_conversation_from_service(
@@ -3553,13 +5751,26 @@ async fn load_conversation_from_service(
 
     let transport = FramedMsgpackTransport::connect(socket).await?;
     let mut client = KeybaseRpcClient::new(transport);
-    let page =
-        fetch_thread_messages_by_raw_id(&mut client, conversation_id, &raw_conversation_id).await?;
+    let thread_fetch_started = Instant::now();
+    let page = fetch_thread_messages_by_raw_id_without_attachment_hydration(
+        &mut client,
+        conversation_id,
+        &raw_conversation_id,
+    )
+    .await?;
+    let thread_fetch_ms = thread_fetch_started.elapsed().as_millis();
+    let pinned_fetch_started = Instant::now();
     let pinned_state = fetch_inbox_for_conversation_id(&mut client, &raw_conversation_id)
         .await
         .ok()
         .and_then(|inbox| extract_pinned_state_for_conversation(&inbox, conversation_id));
-    Ok(LoadedConversation { page, pinned_state })
+    let pinned_fetch_ms = pinned_fetch_started.elapsed().as_millis();
+    Ok(LoadedConversation {
+        page,
+        pinned_state,
+        thread_fetch_ms,
+        pinned_fetch_ms,
+    })
 }
 
 fn bootstrap_payload_from_cache(
@@ -4530,7 +6741,7 @@ fn parse_user_emojis(value: &Value) -> Vec<CachedConversationEmoji> {
             for source_value in preferred_emoji_source_values(&emoji) {
                 if source_value.starts_with("http://") || source_value.starts_with("https://") {
                     source_url = source_url.or(Some(source_value));
-                } else if source_value.chars().any(|ch| !ch.is_ascii()) {
+                } else if !source_value.is_ascii() {
                     unicode = unicode.or(Some(source_value));
                 }
             }
@@ -4824,13 +7035,12 @@ fn percent_decode(value: &str) -> String {
     let mut out = String::with_capacity(value.len());
     let mut index = 0usize;
     while index < bytes.len() {
-        if bytes[index] == b'%' && index + 2 < bytes.len() {
-            if let (Some(hi), Some(lo)) = (from_hex(bytes[index + 1]), from_hex(bytes[index + 2])) {
+        if bytes[index] == b'%' && index + 2 < bytes.len()
+            && let (Some(hi), Some(lo)) = (from_hex(bytes[index + 1]), from_hex(bytes[index + 2])) {
                 out.push((hi << 4 | lo) as char);
                 index += 3;
                 continue;
             }
-        }
         out.push(bytes[index] as char);
         index += 1;
     }
@@ -4987,19 +7197,14 @@ fn maybe_handle_team_role_notify(
             continue;
         };
         for conversation_id in conversation_ids {
-            let sender = sender.clone();
-            let local_store = Arc::clone(local_store);
             let conversation_ref = ProviderConversationRef::new(conversation_id.0.clone());
-            let dedupe_key = format!("team_roles:{}", conversation_id.0);
-            let _ = task_runtime::spawn_task(TaskPriority::Low, Some(dedupe_key), move || {
-                sync_conversation_team_roles(
-                    &sender,
-                    &local_store,
-                    &conversation_id,
-                    &conversation_ref,
-                    true,
-                );
-            });
+            spawn_sync_conversation_team_roles(
+                sender,
+                local_store,
+                conversation_id,
+                conversation_ref,
+                true,
+            );
         }
     }
 }
@@ -5035,6 +7240,479 @@ fn collect_team_ids(value: &Value) -> Vec<String> {
     output
 }
 
+fn collect_usernames_from_notify(raw_params: &Value, keys: &[&str]) -> Vec<String> {
+    let mut usernames = Vec::new();
+    for key in keys {
+        if let Some(Value::Array(values)) = find_value_for_keys(raw_params, &[*key], 0) {
+            for value in values {
+                if let Some(name) = value.as_str()
+                    && let Some(normalized) = canonical_username(name) {
+                        usernames.push(normalized);
+                    }
+            }
+        }
+    }
+    usernames.sort();
+    usernames.dedup();
+    usernames
+}
+
+fn canonical_username(value: &str) -> Option<String> {
+    let normalized = value.trim().trim_start_matches('@').to_ascii_lowercase();
+    if normalized.is_empty() {
+        return None;
+    }
+    if normalized
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-')
+    {
+        Some(normalized)
+    } else {
+        None
+    }
+}
+
+fn collect_usernames_from_tracking_payload(value: &Value, output: &mut Vec<String>, depth: usize) {
+    if depth > 8 {
+        return;
+    }
+    match value {
+        Value::Array(values) => {
+            for inner in values {
+                if let Some(name) = inner.as_str().and_then(canonical_username) {
+                    output.push(name);
+                    continue;
+                }
+                collect_usernames_from_tracking_payload(inner, output, depth + 1);
+            }
+        }
+        Value::Map(entries) => {
+            for (key, inner) in entries {
+                if let Some(key_name) = key.as_str()
+                    && matches!(
+                        key_name,
+                        "username" | "name" | "assertion" | "user" | "them" | "followee"
+                    )
+                    && let Some(name) = inner.as_str().and_then(canonical_username)
+                {
+                    output.push(name);
+                }
+                collect_usernames_from_tracking_payload(inner, output, depth + 1);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn parse_tracking_followees(value: &Value) -> Vec<String> {
+    let mut usernames = Vec::new();
+    for key in ["followees", "tracking", "trackees", "users"] {
+        if let Some(found) = find_value_for_keys(value, &[key], 0) {
+            collect_usernames_from_tracking_payload(found, &mut usernames, 0);
+            if !usernames.is_empty() {
+                break;
+            }
+        }
+    }
+    if usernames.is_empty() {
+        collect_usernames_from_tracking_payload(value, &mut usernames, 0);
+    }
+    usernames.sort();
+    usernames.dedup();
+    usernames
+}
+
+async fn fetch_tracking_affinities_from_service(
+    path: &Path,
+) -> io::Result<HashMap<UserId, Affinity>> {
+    let transport = FramedMsgpackTransport::connect(path).await?;
+    let mut client = KeybaseRpcClient::new(transport);
+    let args = vec![Value::Map(vec![(
+        Value::from("sessionID"),
+        Value::from(SESSION_ID),
+    )])];
+    let methods = [
+        KEYBASE_LIST_TRACKING,
+        KEYBASE_LIST_TRACKING_JSON,
+        KEYBASE_LIST_TRACKING_FALLBACK,
+    ];
+    for method in methods {
+        if let Ok(response) = client.call(method, args.clone()).await {
+            let followees = parse_tracking_followees(&response);
+            return Ok(followees
+                .into_iter()
+                .map(|username| (UserId::new(username), Affinity::Positive))
+                .collect());
+        }
+    }
+    Err(io::Error::other("tracking list RPC unavailable"))
+}
+
+fn maybe_handle_presence_notify(event: &KeybaseNotifyEvent, sender: &Sender<BackendEvent>) {
+    let users = parse_presence_updates_from_notify(event);
+    if users.is_empty() {
+        return;
+    }
+    let _ = sender.send(BackendEvent::PresenceUpdated {
+        account_id: AccountId::new(DEFAULT_ACCOUNT_ID),
+        users,
+    });
+}
+
+fn parse_presence_updates_from_notify(event: &KeybaseNotifyEvent) -> Vec<PresencePatch> {
+    if event.method_name() != "chat.1.NotifyChat.ChatParticipantsInfo" {
+        return Vec::new();
+    }
+
+    let raw_params = match event {
+        KeybaseNotifyEvent::Known { raw_params, .. }
+        | KeybaseNotifyEvent::Unknown { raw_params, .. } => raw_params,
+    };
+
+    let mut by_user: HashMap<UserId, PresencePatch> = HashMap::new();
+    let mut extracted = Vec::new();
+    collect_presence_patches(raw_params, &mut extracted, 0);
+    for patch in extracted {
+        merge_presence_patch(&mut by_user, patch);
+    }
+
+    let mut patches = by_user.into_values().collect::<Vec<_>>();
+    patches.sort_by(|left, right| left.user_id.0.cmp(&right.user_id.0));
+    patches
+}
+
+fn parse_presence_updates_from_rpc_notifications(
+    notifications: &[RpcNotification],
+) -> Vec<PresencePatch> {
+    let mut by_user: HashMap<UserId, PresencePatch> = HashMap::new();
+    for notification in notifications {
+        if notification.method != "chat.1.NotifyChat.ChatParticipantsInfo" {
+            continue;
+        }
+        let event =
+            KeybaseNotifyEvent::from_method(&notification.method, notification.params.clone());
+        for patch in parse_presence_updates_from_notify(&event) {
+            merge_presence_patch(&mut by_user, patch);
+        }
+    }
+    let mut patches = by_user.into_values().collect::<Vec<_>>();
+    patches.sort_by(|left, right| left.user_id.0.cmp(&right.user_id.0));
+    patches
+}
+
+fn collect_presence_patches(value: &Value, output: &mut Vec<PresencePatch>, depth: usize) {
+    if depth > 8 {
+        return;
+    }
+    match value {
+        Value::Map(entries) => {
+            let username = map_get_any(value, &["username", "user", "name", "assertion"])
+                .or_else(|| {
+                    find_value_for_keys(value, &["username", "user", "name", "assertion"], 0)
+                })
+                .and_then(as_str)
+                .and_then(canonical_username);
+            let availability = parse_presence_availability_from_payload(value);
+            if let (Some(username), Some(availability)) = (username, availability) {
+                let status_text = map_get_any(
+                    value,
+                    &[
+                        "statusText",
+                        "status_text",
+                        "statusMessage",
+                        "status_message",
+                    ],
+                )
+                .or_else(|| {
+                    find_value_for_keys(
+                        value,
+                        &[
+                            "statusText",
+                            "status_text",
+                            "statusMessage",
+                            "status_message",
+                        ],
+                        0,
+                    )
+                })
+                .and_then(as_str)
+                .map(str::trim)
+                .filter(|text| !text.is_empty())
+                .map(str::to_string);
+                output.push(PresencePatch {
+                    user_id: UserId::new(username),
+                    presence: Presence {
+                        availability,
+                        status_text,
+                    },
+                });
+            }
+            for (key, inner) in entries {
+                if let Some(username) = username_from_presence_map_key(key)
+                    && let Some(availability) =
+                        parse_presence_availability_from_payload_shallow(inner)
+                {
+                    output.push(PresencePatch {
+                        user_id: UserId::new(username),
+                        presence: Presence {
+                            availability,
+                            status_text: None,
+                        },
+                    });
+                }
+                collect_presence_patches(inner, output, depth + 1);
+            }
+        }
+        Value::Array(values) => {
+            for inner in values {
+                collect_presence_patches(inner, output, depth + 1);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn parse_presence_availability_from_payload(value: &Value) -> Option<Availability> {
+    if let Some(last_active_status) =
+        map_get_any(value, &["lastActiveStatus", "last_active_status"])
+            .or_else(|| find_value_for_keys(value, &["lastActiveStatus", "last_active_status"], 0))
+            .and_then(parse_last_active_status_availability)
+    {
+        return Some(last_active_status);
+    }
+    map_get_any(
+        value,
+        &[
+            "availability",
+            "presence",
+            "online",
+            "isOnline",
+            "active",
+            "isActive",
+            "status",
+            "presenceState",
+            "presence_state",
+            "lastActiveStatus",
+            "last_active_status",
+        ],
+    )
+    .or_else(|| {
+        find_value_for_keys(
+            value,
+            &[
+                "availability",
+                "presence",
+                "online",
+                "isOnline",
+                "active",
+                "isActive",
+                "status",
+                "presenceState",
+                "presence_state",
+                "lastActiveStatus",
+                "last_active_status",
+            ],
+            0,
+        )
+    })
+    .and_then(|raw| {
+        parse_last_active_status_availability(raw).or_else(|| parse_presence_availability(raw))
+    })
+}
+
+fn parse_presence_availability_from_payload_shallow(value: &Value) -> Option<Availability> {
+    if let Some(last_active_status) =
+        map_get_any(value, &["lastActiveStatus", "last_active_status"])
+            .and_then(parse_last_active_status_availability)
+    {
+        return Some(last_active_status);
+    }
+    map_get_any(
+        value,
+        &[
+            "availability",
+            "presence",
+            "online",
+            "isOnline",
+            "active",
+            "isActive",
+            "status",
+            "presenceState",
+            "presence_state",
+            "lastActiveStatus",
+            "last_active_status",
+        ],
+    )
+    .or(match value {
+        Value::Boolean(_) | Value::Integer(_) | Value::String(_) => Some(value),
+        _ => None,
+    })
+    .and_then(|raw| {
+        parse_last_active_status_availability(raw).or_else(|| parse_presence_availability(raw))
+    })
+}
+
+fn parse_last_active_status_availability(value: &Value) -> Option<Availability> {
+    if let Some(raw) = as_i64(value) {
+        return match raw {
+            0 => Some(Availability::Offline),
+            1 => Some(Availability::Active),
+            2 => Some(Availability::Away),
+            _ => None,
+        };
+    }
+    let text = as_str(value)?.trim().to_ascii_lowercase();
+    match text.as_str() {
+        "none" | "none_0" => Some(Availability::Offline),
+        "active" | "active_1" => Some(Availability::Active),
+        "recently_active" | "recentlyactive" | "recently_active_2" => Some(Availability::Away),
+        _ => None,
+    }
+}
+
+fn username_from_presence_map_key(value: &Value) -> Option<String> {
+    let key = value.as_str()?;
+    let username = canonical_username(key)?;
+    if username.len() >= 32 && username.chars().all(|ch| ch.is_ascii_hexdigit()) {
+        return None;
+    }
+    if matches!(
+        username.as_str(),
+        "participants"
+            | "status"
+            | "lastactivestatus"
+            | "availability"
+            | "presence"
+            | "active"
+            | "isonline"
+            | "assertion"
+            | "username"
+            | "name"
+            | "user"
+            | "conv_id"
+            | "convid"
+            | "conversationid"
+    ) {
+        return None;
+    }
+    Some(username)
+}
+
+fn merge_presence_patch(by_user: &mut HashMap<UserId, PresencePatch>, patch: PresencePatch) {
+    let next_priority = presence_priority(&patch.presence.availability);
+    match by_user.get_mut(&patch.user_id) {
+        Some(existing) => {
+            let current_priority = presence_priority(&existing.presence.availability);
+            if next_priority > current_priority {
+                *existing = patch;
+                return;
+            }
+            if next_priority == current_priority
+                && existing.presence.status_text.is_none()
+                && patch.presence.status_text.is_some()
+            {
+                existing.presence.status_text = patch.presence.status_text;
+            }
+        }
+        None => {
+            by_user.insert(patch.user_id.clone(), patch);
+        }
+    }
+}
+
+fn parse_presence_availability(value: &Value) -> Option<Availability> {
+    if let Some(raw) = as_bool(value) {
+        return Some(if raw {
+            Availability::Active
+        } else {
+            Availability::Offline
+        });
+    }
+    if let Some(raw) = as_i64(value) {
+        return match raw {
+            0 => Some(Availability::Offline),
+            1 => Some(Availability::Away),
+            2..=4 => Some(Availability::Active),
+            5 => Some(Availability::DoNotDisturb),
+            _ => None,
+        };
+    }
+    let text = as_str(value)?.trim().to_ascii_lowercase();
+    match text.as_str() {
+        "active" | "active_1" | "available" | "present" | "online" | "foregroundactive"
+        | "backgroundactive" => Some(Availability::Active),
+        "away" | "idle" | "inactive" | "recently_active" | "recentlyactive"
+        | "recently_active_2" => Some(Availability::Away),
+        "dnd" | "busy" | "do_not_disturb" | "donotdisturb" => Some(Availability::DoNotDisturb),
+        "offline" | "none_0" => Some(Availability::Offline),
+        _ => None,
+    }
+}
+
+fn presence_priority(value: &Availability) -> u8 {
+    match value {
+        Availability::Active => 4,
+        Availability::DoNotDisturb => 3,
+        Availability::Away => 2,
+        Availability::Offline => 1,
+        Availability::Unknown => 0,
+    }
+}
+
+fn maybe_handle_tracking_notify(event: &KeybaseNotifyEvent, sender: &Sender<BackendEvent>) {
+    let raw_params = match event {
+        KeybaseNotifyEvent::Known { raw_params, .. }
+        | KeybaseNotifyEvent::Unknown { raw_params, .. } => raw_params,
+    };
+    match event.method_name() {
+        "keybase.1.NotifyTracking.trackingChanged" => {
+            let Some(username) = find_value_for_keys(raw_params, &["username"], 0)
+                .and_then(as_str)
+                .map(str::trim)
+                .filter(|name| !name.is_empty())
+                .map(str::to_ascii_lowercase)
+            else {
+                return;
+            };
+            let is_tracking = find_value_for_keys(raw_params, &["isTracking"], 0)
+                .and_then(as_bool)
+                .unwrap_or(false);
+            let affinity = if is_tracking {
+                Affinity::Positive
+            } else {
+                Affinity::None
+            };
+            let _ = sender.send(BackendEvent::AffinityChanged {
+                user_id: UserId::new(username),
+                affinity,
+            });
+        }
+        "keybase.1.NotifyTracking.trackingInfo" => {
+            let followees = collect_usernames_from_notify(raw_params, &["followees"]);
+            let affinities = followees
+                .into_iter()
+                .map(|username| (UserId::new(username), Affinity::Positive))
+                .collect::<HashMap<_, _>>();
+            let _ = sender.send(BackendEvent::AffinitySynced { affinities });
+        }
+        "keybase.1.NotifyUsers.identifyUpdate" => {
+            let broken_usernames = collect_usernames_from_notify(raw_params, &["brokenUsernames"]);
+            let ok_usernames = collect_usernames_from_notify(raw_params, &["okUsernames"]);
+            let mut by_user = HashMap::new();
+            for username in ok_usernames {
+                by_user.insert(UserId::new(username), Affinity::Positive);
+            }
+            for username in broken_usernames {
+                by_user.insert(UserId::new(username), Affinity::Broken);
+            }
+            for (user_id, affinity) in by_user {
+                let _ = sender.send(BackendEvent::AffinityChanged { user_id, affinity });
+            }
+        }
+        _ => {}
+    }
+}
+
 fn maybe_handle_profile_notify(
     event: &KeybaseNotifyEvent,
     sender: &Sender<BackendEvent>,
@@ -5046,21 +7724,8 @@ fn maybe_handle_profile_notify(
                 KeybaseNotifyEvent::Known { raw_params, .. }
                 | KeybaseNotifyEvent::Unknown { raw_params, .. } => raw_params,
             };
-            let mut usernames = Vec::new();
-            for key in ["okUsernames", "brokenUsernames"] {
-                if let Some(Value::Array(values)) = find_value_for_keys(raw_params, &[key], 0) {
-                    for value in values {
-                        if let Some(name) = value.as_str() {
-                            let name = name.trim();
-                            if !name.is_empty() {
-                                usernames.push(name.to_string());
-                            }
-                        }
-                    }
-                }
-            }
-            usernames.sort();
-            usernames.dedup();
+            let usernames =
+                collect_usernames_from_notify(raw_params, &["okUsernames", "brokenUsernames"]);
             if usernames.is_empty() {
                 return;
             }
@@ -5196,7 +7861,7 @@ fn message_plain_text(message: &MessageRecord) -> String {
             | MessageFragment::Code(text)
             | MessageFragment::Quote(text) => text.clone(),
             MessageFragment::InlineCode(text) => format!("`{text}`"),
-            MessageFragment::Emoji { alias } => format!(":{alias}:"),
+            MessageFragment::Emoji { alias, .. } => format!(":{alias}:"),
             MessageFragment::Mention(user_id) => format!("@{}", user_id.0),
             MessageFragment::ChannelMention { name } => format!("#{name}"),
             MessageFragment::BroadcastMention(BroadcastKind::Here) => "@here".to_string(),
@@ -5262,19 +7927,220 @@ fn strip_placeholder_messages(messages: Vec<MessageRecord>) -> (Vec<MessageRecor
     (filtered, removed_count)
 }
 
-fn persist_reaction_deltas(local_store: &LocalStore, deltas: &[MessageReactionDelta]) {
+fn strip_reaction_delete_tombstones(
+    local_store: &LocalStore,
+    conversation_id: &ConversationId,
+    messages: &mut Vec<MessageRecord>,
+) {
+    messages.retain(|message| {
+        if let Some(ChatEvent::MessageDeleted {
+            target_message_id: Some(target),
+        }) = &message.event
+            && local_store
+                .get_message_reaction_op(conversation_id, target)
+                .ok()
+                .flatten()
+                .is_some()
+            {
+                let _ = local_store.delete_message(conversation_id, &message.id);
+                return false;
+            }
+        true
+    });
+}
+
+fn strip_reaction_delete_tombstones_from_deltas(
+    messages: &mut Vec<MessageRecord>,
+    deltas: &[MessageReactionDelta],
+) {
+    let mut delete_ids = HashSet::new();
+    for delta in deltas {
+        if let Some(op_message_id) = delta.op_message_id.as_ref() {
+            delete_ids.insert(op_message_id.clone());
+        }
+    }
+    if delete_ids.is_empty() {
+        return;
+    }
+    messages.retain(|message| !delete_ids.contains(&message.id));
+}
+
+fn spawn_persist_reaction_deltas_for_timeline_load(
+    sender: &Sender<BackendEvent>,
+    local_store: &Arc<LocalStore>,
+    conversation_id: ConversationId,
+    deltas: Vec<MessageReactionDelta>,
+    message_ids: Vec<MessageId>,
+) {
+    if deltas.is_empty() || message_ids.is_empty() {
+        return;
+    }
+    let sender = sender.clone();
+    let local_store = Arc::clone(local_store);
+    let _ = task_runtime::spawn_task(TaskPriority::Low, None, move || {
+        run_persist_reaction_deltas_for_timeline_load(
+            sender,
+            local_store,
+            conversation_id,
+            deltas,
+            message_ids,
+        )
+    });
+}
+
+fn run_persist_reaction_deltas_for_timeline_load(
+    sender: Sender<BackendEvent>,
+    local_store: Arc<LocalStore>,
+    conversation_id: ConversationId,
+    deltas: Vec<MessageReactionDelta>,
+    message_ids: Vec<MessageId>,
+) {
+    let started = Instant::now();
+    persist_reaction_deltas(Some(&sender), &local_store, &deltas);
+    let Some(event) =
+        message_reaction_sync_event_for_message_ids(&local_store, &conversation_id, &message_ids)
+    else {
+        return;
+    };
+    let _ = sender.send(event);
+    let elapsed_ms = started.elapsed().as_millis();
+    if load_conversation_perf_log_all_enabled() || elapsed_ms >= 250 {
+        warn!(
+            target: "kbui.load_conversation.perf",
+            conversation_id = %conversation_id.0,
+            elapsed_ms = elapsed_ms as i64,
+            reaction_delta_count = deltas.len() as i64,
+            message_count = message_ids.len() as i64,
+            "load_conversation_reaction_delta_persist"
+        );
+    }
+}
+
+fn persist_reaction_deltas(
+    sender: Option<&Sender<BackendEvent>>,
+    local_store: &LocalStore,
+    deltas: &[MessageReactionDelta],
+) {
     for delta in deltas {
         let _ = local_store.upsert_message_reaction(
             &delta.conversation_id,
             &delta.target_message_id,
             &delta.emoji,
+            delta.source_ref.as_ref(),
             &delta.actor_id,
             delta.updated_ms,
         );
+        remember_reaction_op(delta);
         if let Some(op_message_id) = &delta.op_message_id {
+            let _ = local_store.upsert_message_reaction_op(
+                &delta.conversation_id,
+                op_message_id,
+                &delta.target_message_id,
+                &delta.emoji,
+                &delta.actor_id,
+                delta.updated_ms,
+            );
             let _ = local_store.delete_message(&delta.conversation_id, op_message_id);
         }
     }
+    if let Some(sender) = sender {
+        spawn_sync_reaction_emoji_sources(sender, deltas);
+    }
+}
+
+#[derive(Clone, Debug)]
+struct ReactionOpIndexEntry {
+    target_message_id: MessageId,
+    emoji: String,
+    actor_id: UserId,
+}
+
+fn reaction_op_index() -> &'static Mutex<HashMap<String, ReactionOpIndexEntry>> {
+    static INDEX: OnceLock<Mutex<HashMap<String, ReactionOpIndexEntry>>> = OnceLock::new();
+    INDEX.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn reaction_op_index_key(conversation_id: &ConversationId, op_message_id: &MessageId) -> String {
+    format!("{}:{}", conversation_id.0, op_message_id.0)
+}
+
+fn remember_reaction_op(delta: &MessageReactionDelta) {
+    let Some(op_message_id) = &delta.op_message_id else {
+        return;
+    };
+    let Ok(mut index) = reaction_op_index().lock() else {
+        return;
+    };
+    index.insert(
+        reaction_op_index_key(&delta.conversation_id, op_message_id),
+        ReactionOpIndexEntry {
+            target_message_id: delta.target_message_id.clone(),
+            emoji: delta.emoji.clone(),
+            actor_id: delta.actor_id.clone(),
+        },
+    );
+}
+
+fn take_reaction_op(
+    local_store: &LocalStore,
+    conversation_id: &ConversationId,
+    op_message_id: &MessageId,
+) -> Option<ReactionOpIndexEntry> {
+    let key = reaction_op_index_key(conversation_id, op_message_id);
+    let Ok(index) = reaction_op_index().lock() else {
+        let stored = local_store
+            .get_message_reaction_op(conversation_id, op_message_id)
+            .ok()
+            .flatten()?;
+        return Some(ReactionOpIndexEntry {
+            target_message_id: stored.0,
+            emoji: stored.1,
+            actor_id: stored.2,
+        });
+    };
+    if let Some(entry) = index.get(&key) {
+        return Some(entry.clone());
+    }
+    drop(index);
+    let stored = local_store
+        .get_message_reaction_op(conversation_id, op_message_id)
+        .ok()
+        .flatten()?;
+    let entry = ReactionOpIndexEntry {
+        target_message_id: stored.0,
+        emoji: stored.1,
+        actor_id: stored.2,
+    };
+    if let Ok(mut index) = reaction_op_index().lock() {
+        index.insert(key, entry.clone());
+    }
+    Some(entry)
+}
+
+fn reaction_removed_event_for_live_delete(
+    local_store: &LocalStore,
+    message: &MessageRecord,
+) -> Option<BackendEvent> {
+    let ChatEvent::MessageDeleted {
+        target_message_id: Some(target_message_id),
+    } = message.event.as_ref()?
+    else {
+        return None;
+    };
+    let removed = take_reaction_op(local_store, &message.conversation_id, target_message_id)?;
+    let _ = local_store.delete_message(&message.conversation_id, target_message_id);
+    let _ = local_store.delete_message_reaction(
+        &message.conversation_id,
+        &removed.target_message_id,
+        &removed.emoji,
+        &removed.actor_id,
+    );
+    Some(BackendEvent::MessageReactionRemoved {
+        conversation_id: message.conversation_id.clone(),
+        message_id: removed.target_message_id,
+        emoji: removed.emoji,
+        actor_id: removed.actor_id,
+    })
 }
 
 fn reaction_op_delete_events(deltas: &[MessageReactionDelta]) -> Vec<BackendEvent> {
@@ -5323,26 +8189,64 @@ fn message_reaction_sync_event(
     })
 }
 
+fn message_reaction_sync_event_for_message_ids(
+    local_store: &LocalStore,
+    conversation_id: &ConversationId,
+    message_ids: &[MessageId],
+) -> Option<BackendEvent> {
+    if message_ids.is_empty() {
+        return None;
+    }
+    let loaded = local_store
+        .load_message_reactions_for_messages(conversation_id, message_ids)
+        .ok()?;
+    let reactions_by_message = message_ids
+        .iter()
+        .cloned()
+        .map(|message_id| MessageReactionsForMessage {
+            message_id: message_id.clone(),
+            reactions: aggregate_message_reactions(loaded.get(&message_id)),
+        })
+        .collect::<Vec<_>>();
+    Some(BackendEvent::MessageReactionsSynced {
+        conversation_id: conversation_id.clone(),
+        reactions_by_message,
+    })
+}
+
 fn aggregate_message_reactions(
     records: Option<&Vec<CachedMessageReaction>>,
 ) -> Vec<MessageReactionEntry> {
-    let mut by_emoji: std::collections::HashMap<String, (std::collections::HashSet<UserId>, i64)> =
-        std::collections::HashMap::new();
+    let mut by_emoji: std::collections::HashMap<
+        String,
+        (
+            std::collections::HashSet<UserId>,
+            Option<EmojiSourceRef>,
+            i64,
+        ),
+    > = std::collections::HashMap::new();
     for record in records.into_iter().flatten() {
         let entry = by_emoji
             .entry(record.emoji.clone())
-            .or_insert_with(|| (std::collections::HashSet::new(), 0));
+            .or_insert_with(|| (std::collections::HashSet::new(), None, 0));
         entry.0.insert(UserId::new(record.actor_id.clone()));
-        entry.1 = entry.1.max(record.updated_ms);
+        if entry.1.is_none() {
+            entry.1 = record.source_ref.as_ref().map(|source_ref| EmojiSourceRef {
+                backend_id: BackendId::new(source_ref.backend_id.clone()),
+                ref_key: source_ref.ref_key.clone(),
+            });
+        }
+        entry.2 = entry.2.max(record.updated_ms);
     }
 
     let mut reactions = by_emoji
         .into_iter()
-        .map(|(emoji, (actor_ids, updated_ms))| {
+        .map(|(emoji, (actor_ids, source_ref, updated_ms))| {
             let mut actor_ids = actor_ids.into_iter().collect::<Vec<_>>();
             actor_ids.sort_by(|left, right| left.0.cmp(&right.0));
             MessageReactionEntry {
                 emoji,
+                source_ref,
                 actor_ids,
                 updated_ms,
             }
@@ -5357,6 +8261,7 @@ fn domain_message_reactions(records: Option<&Vec<CachedMessageReaction>>) -> Vec
         .into_iter()
         .map(|reaction| MessageReaction {
             emoji: reaction.emoji,
+            source_ref: reaction.source_ref,
             actor_ids: reaction.actor_ids,
         })
         .collect()
@@ -5382,6 +8287,27 @@ fn team_roles_event_from_cache(
         &role_index,
         cached_roles.updated_ms,
     ))
+}
+
+fn spawn_sync_conversation_team_roles(
+    sender: &Sender<BackendEvent>,
+    local_store: &Arc<LocalStore>,
+    conversation_id: ConversationId,
+    conversation_ref: ProviderConversationRef,
+    force_refresh: bool,
+) {
+    let sender = sender.clone();
+    let local_store = Arc::clone(local_store);
+    let dedupe_key = format!("team_roles:{}", conversation_id.0);
+    let _ = task_runtime::spawn_task(TaskPriority::Low, Some(dedupe_key), move || {
+        sync_conversation_team_roles(
+            &sender,
+            &local_store,
+            &conversation_id,
+            &conversation_ref,
+            force_refresh,
+        );
+    });
 }
 
 fn sync_conversation_team_roles(
@@ -5911,39 +8837,21 @@ fn parse_live_message_from_notify(event: &KeybaseNotifyEvent) -> Option<MessageR
     let incoming_message = extract_notify_incoming_message_root(raw_params);
     let preferred_root = extract_notify_incoming_valid_message(raw_params).unwrap_or(raw_params);
     let conversation_root = incoming_message.unwrap_or(raw_params);
-    let conversation_id = find_value_for_keys(
-        conversation_root,
-        &[
-            "convID",
-            "convId",
-            "conversationID",
-            "conversationId",
-            "conversation_id",
-        ],
-        0,
-    )
-    .or_else(|| {
-        find_value_for_keys(
-            preferred_root,
-            &[
-                "convID",
-                "convId",
-                "conversationID",
-                "conversationId",
-                "conversation_id",
-            ],
-            0,
-        )
-    })
-    .and_then(value_to_conversation_id_bytes)
-    .map(|bytes| ConversationId::new(format!("kb_conv:{}", hex_encode(&bytes))))?;
-    let message_id = find_value_for_keys(
-        preferred_root,
-        &["messageID", "messageId", "msgID", "msgId", "m"],
-        0,
-    )
-    .or_else(|| find_value_for_keys(raw_params, &["messageID", "messageId", "msgID", "msgId"], 0))
-    .and_then(as_i64)?;
+    let conv_keys = &[
+        "convID",
+        "convId",
+        "conversationID",
+        "conversationId",
+        "conversation_id",
+    ];
+    let conversation_bytes = find_conversation_id_bytes_for_keys(conversation_root, conv_keys, 0)
+        .or_else(|| find_conversation_id_bytes_for_keys(preferred_root, conv_keys, 0))
+        .or_else(|| find_conversation_id_bytes_for_keys(raw_params, conv_keys, 0))?;
+    let conversation_id =
+        ConversationId::new(format!("kb_conv:{}", hex_encode(&conversation_bytes)));
+    let message_id = extract_live_event_message_id(preferred_root)
+        .or_else(|| extract_live_event_message_id(raw_params))?;
+    let message_id_num = message_id.0.parse::<i64>().ok();
     let message_body = map_get_any(preferred_root, &["messageBody", "b"])
         .or_else(|| find_value_for_keys(preferred_root, &["messageBody", "content"], 0))
         .or_else(|| find_value_for_keys(raw_params, &["messageBody", "content"], 0));
@@ -5955,6 +8863,9 @@ fn parse_live_message_from_notify(event: &KeybaseNotifyEvent) -> Option<MessageR
         .map(extract_message_attachments)
         .unwrap_or_default();
     let message_type = message_body.and_then(message_type_from_message_body);
+    if is_unset_message_type_only(message_body) {
+        return None;
+    }
     if message_type == Some(MESSAGE_TYPE_REACTION) || message_type == Some(MESSAGE_TYPE_UNFURL) {
         return None;
     }
@@ -5998,12 +8909,35 @@ fn parse_live_message_from_notify(event: &KeybaseNotifyEvent) -> Option<MessageR
         .or_else(|| find_body_string(raw_params, 0).map(|text| text.trim().to_string()))
         .filter(|text| !text.is_empty());
     let body = body.unwrap_or_else(|| default_body_for_message(message_body, &attachments));
+    if event.is_none()
+        && attachments.is_empty()
+        && body.trim() == NON_TEXT_PLACEHOLDER_BODY
+        && let Some(message_id_num) = message_id_num
+    {
+        log_non_text_placeholder_once(&conversation_id, message_id_num, message_type, message_body);
+    }
+    if event.is_none()
+        && attachments.is_empty()
+        && link_previews.is_empty()
+        && body.trim() == NON_TEXT_PLACEHOLDER_BODY
+    {
+        return None;
+    }
     let decorated_body = extract_decorated_text_body(preferred_root)
         .or_else(|| extract_decorated_text_body(raw_params))
         .or_else(|| message_body.and_then(extract_decorated_text_body));
     let mention_metadata = parse_mention_metadata(preferred_root, message_body);
-    let fragments =
-        fragments_from_message_body(&body, decorated_body.as_deref(), Some(&mention_metadata));
+    let mut emoji_source_refs = parse_emoji_source_refs(preferred_root, message_body);
+    merge_emoji_source_refs(
+        &mut emoji_source_refs,
+        parse_emoji_source_refs(raw_params, message_body),
+    );
+    let fragments = fragments_from_message_body(
+        &body,
+        decorated_body.as_deref(),
+        Some(&mention_metadata),
+        emoji_source_refs,
+    );
     let author = map_get_any(preferred_root, &["senderUsername", "su"])
         .and_then(as_str)
         .map(str::to_string)
@@ -6023,12 +8957,12 @@ fn parse_live_message_from_notify(event: &KeybaseNotifyEvent) -> Option<MessageR
             (
                 target_id,
                 Some(EditMeta {
-                    edit_id: MessageId::new(message_id.to_string()),
+                    edit_id: message_id.clone(),
                     edited_at_ms: timestamp_ms,
                 }),
             )
         } else {
-            (MessageId::new(message_id.to_string()), None)
+            (message_id.clone(), None)
         }
     } else {
         let edited = if is_message_superseded(server_header_live, preferred_root)
@@ -6049,7 +8983,7 @@ fn parse_live_message_from_notify(event: &KeybaseNotifyEvent) -> Option<MessageR
                             .filter(|&id| id > 0)
                     })
                     .map(|id| MessageId::new(id.to_string()))
-                    .unwrap_or_else(|| MessageId::new(message_id.to_string()));
+                    .unwrap_or_else(|| message_id.clone());
             Some(EditMeta {
                 edit_id: superseded_by,
                 edited_at_ms: None,
@@ -6057,7 +8991,7 @@ fn parse_live_message_from_notify(event: &KeybaseNotifyEvent) -> Option<MessageR
         } else {
             None
         };
-        (MessageId::new(message_id.to_string()), edited)
+        (message_id.clone(), edited)
     };
 
     Some(MessageRecord {
@@ -6069,8 +9003,11 @@ fn parse_live_message_from_notify(event: &KeybaseNotifyEvent) -> Option<MessageR
         timestamp_ms,
         event,
         link_previews,
-        permalink: build_keybase_permalink(raw_params, message_id).unwrap_or_default(),
+        permalink: message_id_num
+            .and_then(|message_id_num| build_keybase_permalink(raw_params, message_id_num))
+            .unwrap_or_default(),
         fragments,
+        source_text: Some(body),
         attachments,
         reactions: Vec::new(),
         thread_reply_count,
@@ -6133,14 +9070,8 @@ fn parse_live_reaction_delta_from_notify(
                 .map(str::to_string)
         })
         .unwrap_or_else(|| "unknown".to_string());
-    let op_message_id = find_value_for_keys(
-        preferred_root,
-        &["messageID", "messageId", "msgID", "msgId", "m"],
-        0,
-    )
-    .or_else(|| find_value_for_keys(raw_params, &["messageID", "messageId", "msgID", "msgId"], 0))
-    .and_then(as_i64)
-    .map(|id| MessageId::new(id.to_string()));
+    let op_message_id = extract_live_event_message_id(preferred_root)
+        .or_else(|| extract_live_event_message_id(raw_params));
     parse_reaction_delta(
         &conversation_id,
         message_body,
@@ -6149,6 +9080,12 @@ fn parse_live_reaction_delta_from_notify(
             .or_else(|| extract_message_timestamp_ms(raw_params)),
         op_message_id,
     )
+}
+
+fn extract_live_event_message_id(value: &Value) -> Option<MessageId> {
+    find_value_for_keys(value, &["messageID", "messageId", "msgID", "msgId"], 0)
+        .or_else(|| find_value_for_keys(value, &["id"], 0))
+        .and_then(parse_message_id_from_value)
 }
 
 fn parse_live_reaction_map_deltas_from_notify(
@@ -6251,6 +9188,7 @@ fn parse_reaction_deltas_for_target(
                 target_message_id: target_message_id.clone(),
                 op_message_id,
                 emoji: emoji.to_string(),
+                source_ref: parse_reaction_source_ref(reaction_value, emoji),
                 actor_id: UserId::new(username.to_string()),
                 updated_ms,
             });
@@ -6261,6 +9199,7 @@ fn parse_reaction_deltas_for_target(
         left.emoji
             .cmp(&right.emoji)
             .then_with(|| left.actor_id.0.cmp(&right.actor_id.0))
+            .then_with(|| right.source_ref.is_some().cmp(&left.source_ref.is_some()))
     });
     deltas.dedup_by(|left, right| {
         left.emoji.eq_ignore_ascii_case(&right.emoji) && left.actor_id == right.actor_id
@@ -6286,15 +9225,69 @@ fn parse_reaction_delta(
     if emoji.is_empty() {
         return None;
     }
+    let source_ref = parse_reaction_source_ref(reaction, &emoji);
 
     Some(MessageReactionDelta {
         conversation_id: conversation_id.clone(),
         target_message_id: MessageId::new(target_message_id.to_string()),
         op_message_id,
         emoji,
+        source_ref,
         actor_id: UserId::new(author),
         updated_ms: timestamp_ms.unwrap_or_else(now_unix_ms),
     })
+}
+
+fn parse_reaction_source_ref(payload: &Value, emoji: &str) -> Option<EmojiSourceRef> {
+    let normalized_target = normalize_shortcode_alias(emoji);
+    let entries = map_get_any(payload, &["emojis", "emoji", "e"])?;
+    let Value::Map(emoji_entries) = entries else {
+        return None;
+    };
+
+    let mut fallback_source = None;
+    for (alias_key, entry) in emoji_entries {
+        let alias = as_str(alias_key)
+            .and_then(normalize_shortcode_alias)
+            .or_else(|| {
+                map_get_any(entry, &["alias", "a"])
+                    .and_then(as_str)
+                    .and_then(normalize_shortcode_alias)
+            });
+
+        let source = map_get_any(entry, &["source", "s"])
+            .and_then(parse_reaction_source_message_ref)
+            .or_else(|| parse_reaction_source_message_ref(entry));
+        if source.is_none() {
+            continue;
+        }
+
+        if fallback_source.is_none() {
+            fallback_source = source.clone();
+        }
+
+        if alias.is_some() && alias == normalized_target {
+            return source;
+        }
+    }
+    fallback_source
+}
+
+fn parse_reaction_source_message_ref(value: &Value) -> Option<EmojiSourceRef> {
+    if let Some(message) = map_get_any(value, &["message", "m"])
+        && let Some(source_ref) = emoji_source_ref_from_metadata_entry(message)
+    {
+        return Some(source_ref);
+    }
+    emoji_source_ref_from_metadata_entry(value)
+}
+
+fn normalize_shortcode_alias(value: &str) -> Option<String> {
+    let normalized = value.trim().trim_matches(':').trim();
+    if normalized.is_empty() {
+        return None;
+    }
+    Some(normalized.to_ascii_lowercase())
 }
 
 fn extract_reaction_payload(message_body: &Value) -> Option<&Value> {
@@ -6349,6 +9342,9 @@ fn message_type_from_message_body(message_body: &Value) -> Option<i64> {
     if let Some(message_type) =
         map_get_any(message_body, &["messageType", "mt", "t"]).and_then(as_i64)
     {
+        if message_type == 0 {
+            return None;
+        }
         return Some(message_type);
     }
     if let Some(message_type_name) = map_get_any(message_body, &["type"]).and_then(as_str)
@@ -6514,6 +9510,18 @@ fn find_sender_username(value: &Value) -> Option<String> {
         .map(str::to_string)
 }
 
+fn extract_outbox_id_from_notify(event: &KeybaseNotifyEvent) -> Option<String> {
+    if event.method_name() != "chat.1.NotifyChat.NewChatActivity" {
+        return None;
+    }
+    let raw_params = match event {
+        KeybaseNotifyEvent::Known { raw_params, .. }
+        | KeybaseNotifyEvent::Unknown { raw_params, .. } => raw_params,
+    };
+    find_value_for_keys(raw_params, &["outboxID", "outboxId", "outbox_id"], 0)
+        .and_then(outbox_id_to_string)
+}
+
 fn find_value_for_keys<'a>(value: &'a Value, keys: &[&str], depth: usize) -> Option<&'a Value> {
     if depth > 8 {
         return None;
@@ -6521,11 +9529,10 @@ fn find_value_for_keys<'a>(value: &'a Value, keys: &[&str], depth: usize) -> Opt
     match value {
         Value::Map(entries) => {
             for (key, inner) in entries {
-                if let Some(key_name) = key.as_str() {
-                    if keys.iter().any(|candidate| *candidate == key_name) {
+                if let Some(key_name) = key.as_str()
+                    && keys.contains(&key_name) {
                         return Some(inner);
                     }
-                }
             }
             for (_, inner) in entries {
                 if let Some(found) = find_value_for_keys(inner, keys, depth + 1) {
@@ -6541,6 +9548,37 @@ fn find_value_for_keys<'a>(value: &'a Value, keys: &[&str], depth: usize) -> Opt
     }
 }
 
+fn find_conversation_id_bytes_for_keys(value: &Value, keys: &[&str], depth: usize) -> Option<Vec<u8>> {
+    if depth > 8 {
+        return None;
+    }
+
+    match value {
+        Value::Map(entries) => {
+            // Prefer the first key match that actually decodes; do not return a non-decodable
+            // value, since some Keybase payloads reuse "conversationID" for nested objects.
+            for (key, inner) in entries {
+                if let Some(key_name) = key.as_str()
+                    && keys.contains(&key_name)
+                    && let Some(bytes) = value_to_conversation_id_bytes(inner)
+                {
+                    return Some(bytes);
+                }
+            }
+            for (_, inner) in entries {
+                if let Some(bytes) = find_conversation_id_bytes_for_keys(inner, keys, depth + 1) {
+                    return Some(bytes);
+                }
+            }
+            None
+        }
+        Value::Array(values) => values
+            .iter()
+            .find_map(|inner| find_conversation_id_bytes_for_keys(inner, keys, depth + 1)),
+        _ => None,
+    }
+}
+
 fn collect_i64_values_for_keys(value: &Value, keys: &[&str], depth: usize, output: &mut Vec<i64>) {
     if depth > 8 {
         return;
@@ -6549,7 +9587,7 @@ fn collect_i64_values_for_keys(value: &Value, keys: &[&str], depth: usize, outpu
         Value::Map(entries) => {
             for (key, inner) in entries {
                 if let Some(key_name) = key.as_str()
-                    && keys.iter().any(|candidate| *candidate == key_name)
+                    && keys.contains(&key_name)
                     && let Some(raw) = as_i64(inner)
                 {
                     output.push(raw);
@@ -7069,6 +10107,174 @@ async fn fetch_inbox_for_conversation_id(
         .await
 }
 
+async fn call_user_search(client: &mut KeybaseRpcClient, query: &str) -> io::Result<Value> {
+    client
+        .call(
+            KEYBASE_USER_SEARCH,
+            vec![Value::Map(vec![
+                (Value::from("query"), Value::from(query.to_string())),
+                (Value::from("service"), Value::from("keybase")),
+                (Value::from("maxResults"), Value::from(32)),
+                (Value::from("includeContacts"), Value::from(false)),
+                (Value::from("includeServicesSummary"), Value::from(false)),
+            ])],
+        )
+        .await
+}
+
+async fn call_new_conversation_local(
+    client: &mut KeybaseRpcClient,
+    participants: &[String],
+) -> io::Result<Value> {
+    let mut deduped = Vec::new();
+    let mut seen = HashSet::new();
+    for participant in participants {
+        let normalized = participant.trim().to_ascii_lowercase();
+        if normalized.is_empty() || !seen.insert(normalized.clone()) {
+            continue;
+        }
+        deduped.push(normalized);
+    }
+    if deduped.is_empty() {
+        return Err(io::Error::other(
+            "missing participants for new conversation",
+        ));
+    }
+    client
+        .call(
+            CHAT_NEW_CONVERSATION_LOCAL,
+            vec![Value::Map(vec![
+                (Value::from("tlfName"), Value::from(deduped.join(","))),
+                (Value::from("topicType"), Value::from(TOPIC_TYPE_CHAT)),
+                (
+                    Value::from("tlfVisibility"),
+                    Value::from(TLF_VISIBILITY_PRIVATE),
+                ),
+                (Value::from("topicName"), Value::Nil),
+                (
+                    Value::from("membersType"),
+                    Value::from(IMPTEAM_MEMBERS_TYPE),
+                ),
+                (
+                    Value::from("identifyBehavior"),
+                    Value::from(IDENTIFY_BEHAVIOR_CHAT_GUI),
+                ),
+            ])],
+        )
+        .await
+}
+
+fn parse_user_search_results(response: &Value) -> Vec<UserSummary> {
+    let entries = if let Some(entries) = as_array(response) {
+        entries.clone()
+    } else {
+        find_value_for_keys(response, &["results", "users"], 0)
+            .and_then(as_array)
+            .cloned()
+            .unwrap_or_default()
+    };
+    let mut seen = HashSet::new();
+    let mut output = Vec::new();
+    for entry in entries {
+        let username = find_value_for_keys(
+            &entry,
+            &["keybaseUsername", "username", "name", "assertion"],
+            0,
+        )
+        .and_then(as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_ascii_lowercase)
+        .and_then(|value| {
+            let normalized = value.trim();
+            if normalized.is_empty() {
+                None
+            } else if normalized.contains('@') {
+                normalized
+                    .split('@')
+                    .next()
+                    .map(|base| base.to_ascii_lowercase())
+            } else {
+                Some(normalized.to_string())
+            }
+        });
+        let Some(username) = username else {
+            continue;
+        };
+        if !seen.insert(username.clone()) {
+            continue;
+        }
+        let display_name = find_value_for_keys(
+            &entry,
+            &[
+                "prettyName",
+                "fullName",
+                "fullname",
+                "displayName",
+                "display_name",
+            ],
+            0,
+        )
+        .and_then(as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| username.clone());
+        let avatar_asset =
+            find_value_for_keys(&entry, &["pictureUrl", "avatarUrl", "avatar_url", "pic"], 0)
+                .and_then(as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string);
+        output.push(UserSummary {
+            id: UserId::new(username.clone()),
+            display_name,
+            title: username,
+            avatar_asset,
+            presence: Presence {
+                availability: Availability::Unknown,
+                status_text: None,
+            },
+            affinity: Affinity::None,
+        });
+    }
+    output
+}
+
+fn extract_new_conversation_raw_id(response: &Value) -> Option<Vec<u8>> {
+    for key in ["conv", "conversation", "uiConv", "uiConversation"] {
+        let Some(container) = map_get(response, key) else {
+            continue;
+        };
+        if let Some(bytes) = find_value_for_keys(
+            container,
+            &["id", "convID", "convId", "conversationID", "conversationId"],
+            0,
+        )
+        .and_then(|value| {
+            value_to_conversation_id_bytes(value)
+                .or_else(|| conversation_id_bytes_from_base64_string(value))
+        }) {
+            return Some(bytes);
+        }
+    }
+    find_value_for_keys(
+        response,
+        &["convID", "convId", "conversationID", "conversationId"],
+        0,
+    )
+    .and_then(|value| {
+        value_to_conversation_id_bytes(value)
+            .or_else(|| conversation_id_bytes_from_base64_string(value))
+    })
+    .or_else(|| {
+        find_value_for_keys(response, &["id"], 0).and_then(|value| {
+            value_to_conversation_id_bytes(value)
+                .or_else(|| conversation_id_bytes_from_base64_string(value))
+        })
+    })
+}
+
 async fn call_mark_as_read_local(
     client: &mut KeybaseRpcClient,
     conversation_id: &[u8],
@@ -7095,6 +10301,194 @@ async fn call_mark_as_read_local(
         .await
 }
 
+async fn call_post_text_nonblock(
+    client: &mut KeybaseRpcClient,
+    conversation_id: &[u8],
+    tlf_name: &str,
+    tlf_public: bool,
+    body: &str,
+    client_prev: i64,
+    reply_to: Option<i64>,
+) -> io::Result<Value> {
+    client
+        .call(
+            CHAT_POST_TEXT_NONBLOCK,
+            vec![Value::Map(vec![
+                (Value::from("sessionID"), Value::from(SESSION_ID)),
+                (
+                    Value::from("conversationID"),
+                    Value::Binary(conversation_id.to_vec()),
+                ),
+                (Value::from("tlfName"), Value::from(tlf_name.to_string())),
+                (Value::from("tlfPublic"), Value::from(tlf_public)),
+                (Value::from("body"), Value::from(body.to_string())),
+                (Value::from("clientPrev"), Value::from(client_prev)),
+                (
+                    Value::from("replyTo"),
+                    reply_to.map(Value::from).unwrap_or(Value::Nil),
+                ),
+                (Value::from("outboxID"), Value::Nil),
+                (
+                    Value::from("identifyBehavior"),
+                    Value::from(IDENTIFY_BEHAVIOR_CHAT_GUI),
+                ),
+                (Value::from("ephemeralLifetime"), Value::Nil),
+            ])],
+        )
+        .await
+}
+
+async fn call_post_file_attachment_nonblock(
+    client: &mut KeybaseRpcClient,
+    conversation_id: &[u8],
+    tlf_name: &str,
+    tlf_public: bool,
+    local_path: &str,
+    _filename: &str,
+    caption: &str,
+    client_prev: i64,
+) -> io::Result<Value> {
+    let local_path = local_path.trim();
+    if local_path.is_empty() {
+        return Err(io::Error::other("missing local attachment path"));
+    }
+    let caption = caption.trim();
+    let title = caption.to_string();
+    let visibility = if tlf_public {
+        TLF_VISIBILITY_PUBLIC
+    } else {
+        TLF_VISIBILITY_PRIVATE
+    };
+    let arg = Value::Map(vec![
+        (
+            Value::from("conversationID"),
+            Value::Binary(conversation_id.to_vec()),
+        ),
+        (Value::from("tlfName"), Value::from(tlf_name.to_string())),
+        (Value::from("visibility"), Value::from(visibility)),
+        (Value::from("filename"), Value::from(local_path.to_string())),
+        (Value::from("title"), Value::from(title)),
+        (Value::from("metadata"), Value::Binary(Vec::new())),
+        (
+            Value::from("identifyBehavior"),
+            Value::from(IDENTIFY_BEHAVIOR_CHAT_GUI),
+        ),
+        (Value::from("callerPreview"), Value::Nil),
+        (Value::from("outboxID"), Value::Nil),
+        (Value::from("ephemeralLifetime"), Value::Nil),
+    ]);
+    client
+        .call(
+            CHAT_POST_FILE_ATTACHMENT_LOCAL_NONBLOCK,
+            vec![Value::Map(vec![
+                (Value::from("sessionID"), Value::from(SESSION_ID)),
+                (Value::from("arg"), arg),
+                (Value::from("clientPrev"), Value::from(client_prev)),
+            ])],
+        )
+        .await
+}
+
+async fn call_post_edit_nonblock(
+    client: &mut KeybaseRpcClient,
+    conversation_id: &[u8],
+    tlf_name: &str,
+    tlf_public: bool,
+    target_message_id: i64,
+    body: &str,
+    client_prev: i64,
+) -> io::Result<Value> {
+    client
+        .call(
+            CHAT_POST_EDIT_NONBLOCK,
+            vec![Value::Map(vec![
+                (
+                    Value::from("conversationID"),
+                    Value::Binary(conversation_id.to_vec()),
+                ),
+                (Value::from("tlfName"), Value::from(tlf_name.to_string())),
+                (Value::from("tlfPublic"), Value::from(tlf_public)),
+                (
+                    Value::from("target"),
+                    Value::Map(vec![(
+                        Value::from("messageID"),
+                        Value::from(target_message_id),
+                    )]),
+                ),
+                (Value::from("body"), Value::from(body.to_string())),
+                (Value::from("outboxID"), Value::Nil),
+                (Value::from("clientPrev"), Value::from(client_prev)),
+                (
+                    Value::from("identifyBehavior"),
+                    Value::from(IDENTIFY_BEHAVIOR_CHAT_GUI),
+                ),
+            ])],
+        )
+        .await
+}
+
+async fn call_post_delete_nonblock(
+    client: &mut KeybaseRpcClient,
+    conversation_id: &[u8],
+    tlf_name: &str,
+    tlf_public: bool,
+    target_message_id: i64,
+    client_prev: i64,
+) -> io::Result<Value> {
+    client
+        .call(
+            CHAT_POST_DELETE_NONBLOCK,
+            vec![Value::Map(vec![
+                (
+                    Value::from("conversationID"),
+                    Value::Binary(conversation_id.to_vec()),
+                ),
+                (Value::from("tlfName"), Value::from(tlf_name.to_string())),
+                (Value::from("tlfPublic"), Value::from(tlf_public)),
+                (Value::from("supersedes"), Value::from(target_message_id)),
+                (Value::from("outboxID"), Value::Nil),
+                (Value::from("clientPrev"), Value::from(client_prev)),
+                (
+                    Value::from("identifyBehavior"),
+                    Value::from(IDENTIFY_BEHAVIOR_CHAT_GUI),
+                ),
+            ])],
+        )
+        .await
+}
+
+async fn call_post_reaction_nonblock(
+    client: &mut KeybaseRpcClient,
+    conversation_id: &[u8],
+    tlf_name: &str,
+    tlf_public: bool,
+    supersedes: i64,
+    body: &str,
+    client_prev: i64,
+) -> io::Result<Value> {
+    client
+        .call(
+            CHAT_POST_REACTION_NONBLOCK,
+            vec![Value::Map(vec![
+                (
+                    Value::from("conversationID"),
+                    Value::Binary(conversation_id.to_vec()),
+                ),
+                (Value::from("tlfName"), Value::from(tlf_name.to_string())),
+                (Value::from("tlfPublic"), Value::from(tlf_public)),
+                (Value::from("supersedes"), Value::from(supersedes)),
+                (Value::from("body"), Value::from(body.to_string())),
+                (Value::from("outboxID"), Value::Nil),
+                (Value::from("clientPrev"), Value::from(client_prev)),
+                (
+                    Value::from("identifyBehavior"),
+                    Value::from(IDENTIFY_BEHAVIOR_CHAT_GUI),
+                ),
+            ])],
+        )
+        .await
+}
+
 async fn call_pin_message_local(
     client: &mut KeybaseRpcClient,
     conversation_id: &[u8],
@@ -7112,6 +10506,11 @@ async fn call_pin_message_local(
             ])],
         )
         .await
+}
+
+fn extract_outbox_id_from_post_response(response: &Value) -> Option<String> {
+    find_value_for_keys(response, &["outboxID", "outboxId", "outbox_id"], 0)
+        .and_then(outbox_id_to_string)
 }
 
 async fn call_unpin_message_local(
@@ -7212,6 +10611,7 @@ struct MessageReactionDelta {
     target_message_id: MessageId,
     op_message_id: Option<MessageId>,
     emoji: String,
+    source_ref: Option<EmojiSourceRef>,
     actor_id: UserId,
     updated_ms: i64,
 }
@@ -7238,6 +10638,25 @@ async fn fetch_thread_page(
     raw_conversation_id: &[u8],
     next_cursor: Option<&[u8]>,
     page_size: usize,
+) -> io::Result<ThreadPage> {
+    fetch_thread_page_with_attachment_hydration(
+        client,
+        conversation_id,
+        raw_conversation_id,
+        next_cursor,
+        page_size,
+        true,
+    )
+    .await
+}
+
+async fn fetch_thread_page_with_attachment_hydration(
+    client: &mut KeybaseRpcClient,
+    conversation_id: &ConversationId,
+    raw_conversation_id: &[u8],
+    next_cursor: Option<&[u8]>,
+    page_size: usize,
+    hydrate_attachments: bool,
 ) -> io::Result<ThreadPage> {
     let mut pagination_entries = vec![(
         Value::from("num"),
@@ -7269,7 +10688,9 @@ async fn fetch_thread_page(
         )
         .await?;
     let mut page = parse_thread_page(&result, conversation_id);
-    hydrate_thread_attachment_paths(client, raw_conversation_id, &mut page).await;
+    if hydrate_attachments {
+        hydrate_thread_attachment_paths(client, raw_conversation_id, &mut page).await;
+    }
     Ok(page)
 }
 
@@ -7284,6 +10705,23 @@ async fn fetch_thread_messages_by_raw_id(
         raw_conversation_id,
         None,
         CONVERSATION_OPEN_LIVE_FETCH_PAGE_SIZE,
+    )
+    .await?;
+    Ok(page)
+}
+
+async fn fetch_thread_messages_by_raw_id_without_attachment_hydration(
+    client: &mut KeybaseRpcClient,
+    conversation_id: &ConversationId,
+    raw_conversation_id: &[u8],
+) -> io::Result<ThreadPage> {
+    let page = fetch_thread_page_with_attachment_hydration(
+        client,
+        conversation_id,
+        raw_conversation_id,
+        None,
+        CONVERSATION_OPEN_LIVE_FETCH_PAGE_SIZE,
+        false,
     )
     .await?;
     Ok(page)
@@ -7394,17 +10832,48 @@ async fn hydrate_thread_attachment_paths(
     raw_conversation_id: &[u8],
     page: &mut ThreadPage,
 ) {
+    let _ = hydrate_attachment_paths_for_messages(
+        client,
+        raw_conversation_id,
+        &mut page.messages,
+        ATTACHMENT_DOWNLOAD_LIMIT_PER_PAGE,
+    )
+    .await;
+}
+
+fn message_needs_image_attachment_hydration(message: &MessageRecord) -> bool {
+    message.attachments.iter().any(|attachment| {
+        attachment.kind == AttachmentKind::Image
+            && (attachment.source.is_none() || attachment.preview.is_none())
+    })
+}
+
+fn image_attachment_hydration_flags(message: &MessageRecord) -> (bool, bool) {
+    let needs_source_hydration = message
+        .attachments
+        .iter()
+        .any(|attachment| attachment.kind == AttachmentKind::Image && attachment.source.is_none());
+    let needs_preview_hydration = message
+        .attachments
+        .iter()
+        .any(|attachment| attachment.kind == AttachmentKind::Image && attachment.preview.is_none());
+    (needs_source_hydration, needs_preview_hydration)
+}
+
+async fn hydrate_attachment_paths_for_messages(
+    client: &mut KeybaseRpcClient,
+    raw_conversation_id: &[u8],
+    messages: &mut [MessageRecord],
+    message_limit: usize,
+) -> Vec<MessageId> {
     let mut hydrated = 0usize;
-    for message in &mut page.messages {
-        if hydrated >= ATTACHMENT_DOWNLOAD_LIMIT_PER_PAGE {
+    let mut updated_ids = Vec::new();
+    for message in messages {
+        if hydrated >= message_limit {
             break;
         }
-        let needs_source_hydration = message.attachments.iter().any(|attachment| {
-            attachment.kind == AttachmentKind::Image && attachment.source.is_none()
-        });
-        let needs_preview_hydration = message.attachments.iter().any(|attachment| {
-            attachment.kind == AttachmentKind::Image && attachment.preview.is_none()
-        });
+        let (needs_source_hydration, needs_preview_hydration) =
+            image_attachment_hydration_flags(message);
         if !needs_source_hydration && !needs_preview_hydration {
             continue;
         }
@@ -7421,11 +10890,12 @@ async fn hydrate_thread_attachment_paths(
         } else {
             None
         };
-
         if full_file_path.is_none() && preview_file_path.is_none() {
             continue;
         }
-        hydrated += 1;
+
+        let mut attachment_updated = false;
+        hydrated = hydrated.saturating_add(1);
         for attachment in &mut message.attachments {
             if attachment.kind != AttachmentKind::Image {
                 continue;
@@ -7440,6 +10910,7 @@ async fn hydrate_thread_attachment_paths(
                     width: attachment.width,
                     height: attachment.height,
                 });
+                attachment_updated = true;
             }
             if attachment.source.is_none() {
                 let Some(file_path) = full_file_path.clone().or_else(|| preview_file_path.clone())
@@ -7447,9 +10918,14 @@ async fn hydrate_thread_attachment_paths(
                     continue;
                 };
                 attachment.source = Some(AttachmentSource::LocalPath(file_path));
+                attachment_updated = true;
             }
         }
+        if attachment_updated {
+            updated_ids.push(message.id.clone());
+        }
     }
+    updated_ids
 }
 
 async fn download_attachment_to_cache(
@@ -7676,22 +11152,22 @@ fn conversation_unread_count(conversation: &Value, reader_info: &Value) -> u32 {
 
     // Prefer maxVisibleMsgID when present (InboxUIItem from notifications).
     // This is pre-computed by the Keybase server and already filters out
-    // non-visible message types.
+    // non-visible message types. Skip when 0 (default/unset).
     if let (Some(max_visible), Some(read_msg)) = (
         map_get_any(conversation, &["maxVisibleMsgID"]).and_then(as_i64),
         read_msg,
-    ) {
-        return if max_visible > read_msg { 1 } else { 0 };
-    }
+    )
+        && max_visible > 0 {
+            return if max_visible > read_msg { 1 } else { 0 };
+        }
 
     // Use maxMsgSummaries (ConversationLocal from inbox) to check only TEXT
     // and ATTACHMENT messages. Returns Some(true/false) when the field exists,
     // None when it doesn't (so we can fall through to other heuristics).
-    if let Some(read_msg) = read_msg {
-        if let Some(has_unread) = has_unread_visible_content(conversation, read_msg) {
+    if let Some(read_msg) = read_msg
+        && let Some(has_unread) = has_unread_visible_content(conversation, read_msg) {
             return if has_unread { 1 } else { 0 };
         }
-    }
 
     if let Some(unread_total) = map_get_any(
         conversation,
@@ -7712,7 +11188,9 @@ fn conversation_unread_count(conversation: &Value, reader_info: &Value) -> u32 {
         .and_then(as_i64)
         .or_else(|| map_get_any(conversation, &["maxMsgID", "maxMsgid"]).and_then(as_i64));
     if let (Some(max_msg), Some(read_msg)) = (max_msg, read_msg) {
-        return max_msg.saturating_sub(read_msg) as u32;
+        // maxMsgid includes non-visible types (deletes, reactions, edits),
+        // so we can only infer "some unread exists", not a reliable count.
+        return if max_msg > read_msg { 1 } else { 0 };
     }
 
     map_get_any(conversation, &["unread", "u"])
@@ -7811,6 +11289,24 @@ fn parse_thread_page(value: &Value, conversation_id: &ConversationId) -> ThreadP
                 ));
             page.messages.push(message);
         }
+    }
+
+    let reaction_op_ids: HashSet<String> = page
+        .reaction_deltas
+        .iter()
+        .filter_map(|delta| delta.op_message_id.as_ref().map(|id| id.0.clone()))
+        .collect();
+    if !reaction_op_ids.is_empty() {
+        page.messages.retain(|message| {
+            if let Some(ChatEvent::MessageDeleted {
+                target_message_id: Some(target),
+            }) = &message.event
+            {
+                !reaction_op_ids.contains(&target.0)
+            } else {
+                true
+            }
+        });
     }
 
     page.messages
@@ -7918,6 +11414,9 @@ fn parse_thread_message(
     let thread_reply_count = extract_reply_children_count(server_header);
     let message_type =
         message_type.or_else(|| message_body.and_then(message_type_from_message_body));
+    if is_unset_message_type_only(message_body) {
+        return None;
+    }
     if message_type == Some(MESSAGE_TYPE_REACTION) || message_type == Some(MESSAGE_TYPE_UNFURL) {
         return None;
     }
@@ -7958,11 +11457,19 @@ fn parse_thread_message(
         .or_else(|| find_body_string(valid, 0).map(|text| text.trim().to_string()))
         .filter(|text| !text.is_empty());
     let body = body.unwrap_or_else(|| default_body_for_message(message_body, &attachments));
+    if event.is_none() && attachments.is_empty() && body.trim() == NON_TEXT_PLACEHOLDER_BODY {
+        log_non_text_placeholder_once(conversation_id, message_id, message_type, message_body);
+    }
     let decorated_body = extract_decorated_text_body(valid)
         .or_else(|| message_body.and_then(extract_decorated_text_body));
     let mention_metadata = parse_mention_metadata(valid, message_body);
-    let fragments =
-        fragments_from_message_body(&body, decorated_body.as_deref(), Some(&mention_metadata));
+    let emoji_source_refs = parse_emoji_source_refs(valid, message_body);
+    let fragments = fragments_from_message_body(
+        &body,
+        decorated_body.as_deref(),
+        Some(&mention_metadata),
+        emoji_source_refs,
+    );
     let author = map_get_any(valid, &["senderUsername", "su"])
         .and_then(as_str)
         .unwrap_or("unknown");
@@ -8009,6 +11516,7 @@ fn parse_thread_message(
         link_previews,
         permalink: build_keybase_permalink(valid, message_id).unwrap_or_default(),
         fragments,
+        source_text: Some(body),
         attachments,
         reactions: Vec::new(),
         thread_reply_count,
@@ -8133,6 +11641,177 @@ impl MentionParseMetadata {
     }
 }
 
+fn parse_emoji_source_refs(
+    root: &Value,
+    message_body: Option<&Value>,
+) -> HashMap<String, VecDeque<EmojiSourceRef>> {
+    let mut refs = HashMap::<String, VecDeque<EmojiSourceRef>>::new();
+    let mut seen = HashSet::<String>::new();
+
+    ingest_emoji_source_entries(
+        map_get_any(root, &["text", "t"]).and_then(|text| map_get_any(text, &["emojis", "e"])),
+        &mut refs,
+        &mut seen,
+    );
+    ingest_emoji_source_entries(map_get_any(root, &["emojis", "e"]), &mut refs, &mut seen);
+    ingest_emoji_source_entries(
+        find_value_for_keys(root, &["emojis", "e"], 0),
+        &mut refs,
+        &mut seen,
+    );
+
+    ingest_emoji_source_entries(
+        message_body
+            .and_then(|body| map_get_any(body, &["text", "t"]))
+            .and_then(|text| map_get_any(text, &["emojis", "e"])),
+        &mut refs,
+        &mut seen,
+    );
+    ingest_emoji_source_entries(
+        message_body.and_then(|body| map_get_any(body, &["emojis", "e"])),
+        &mut refs,
+        &mut seen,
+    );
+    ingest_emoji_source_entries(
+        message_body
+            .and_then(|body| map_get_any(body, &["body", "b"]))
+            .and_then(|payload| map_get_any(payload, &["text", "t"]))
+            .and_then(|text| map_get_any(text, &["emojis", "e"])),
+        &mut refs,
+        &mut seen,
+    );
+    ingest_emoji_source_entries(
+        message_body
+            .and_then(|body| map_get_any(body, &["body", "b"]))
+            .and_then(|payload| map_get_any(payload, &["emojis", "e"])),
+        &mut refs,
+        &mut seen,
+    );
+    ingest_emoji_source_entries(
+        message_body
+            .and_then(|body| find_value_for_keys(body, &["text", "t"], 0))
+            .and_then(|text| map_get_any(text, &["emojis", "e"])),
+        &mut refs,
+        &mut seen,
+    );
+    ingest_emoji_source_entries(
+        message_body.and_then(|body| find_value_for_keys(body, &["emojis", "e"], 0)),
+        &mut refs,
+        &mut seen,
+    );
+
+    refs
+}
+
+fn ingest_emoji_source_entries(
+    emoji_entries: Option<&Value>,
+    refs: &mut HashMap<String, VecDeque<EmojiSourceRef>>,
+    seen: &mut HashSet<String>,
+) {
+    let Some(emojis) = emoji_entries.and_then(as_array) else {
+        return;
+    };
+    for emoji in emojis {
+        let alias = map_get_any(emoji, &["alias", "a"])
+            .and_then(as_str)
+            .map(str::trim)
+            .unwrap_or("");
+        if alias.is_empty() {
+            continue;
+        }
+        let Some(source_ref) = emoji_source_ref_from_metadata_entry(emoji) else {
+            continue;
+        };
+        let key = alias.to_ascii_lowercase();
+        let dedupe_key = format!("{key}:{}", source_ref.ref_key);
+        if !seen.insert(dedupe_key) {
+            continue;
+        }
+        refs.entry(key).or_default().push_back(source_ref);
+    }
+}
+
+fn merge_emoji_source_refs(
+    into: &mut HashMap<String, VecDeque<EmojiSourceRef>>,
+    additional: HashMap<String, VecDeque<EmojiSourceRef>>,
+) {
+    let mut seen = HashSet::<String>::new();
+    for queue in into.values() {
+        for source_ref in queue {
+            seen.insert(source_ref.cache_key());
+        }
+    }
+    for (alias, mut queue) in additional {
+        let entry = into.entry(alias).or_default();
+        while let Some(source_ref) = queue.pop_front() {
+            if seen.insert(source_ref.cache_key()) {
+                entry.push_back(source_ref);
+            }
+        }
+    }
+}
+
+fn emoji_source_ref_from_metadata_entry(entry: &Value) -> Option<EmojiSourceRef> {
+    let conv_value = find_value_for_keys(
+        entry,
+        &["convID", "convId", "conversationID", "conversationId"],
+        0,
+    )?;
+    let raw_conversation_id = value_to_conversation_id_bytes(conv_value)
+        .or_else(|| conversation_id_bytes_from_base64_string(conv_value))?;
+    let message_id = find_value_for_keys(entry, &["messageID", "messageId", "msgID", "msgId"], 0)
+        .and_then(value_to_i64_identifier)?;
+    Some(EmojiSourceRef {
+        backend_id: BackendId::new(KEYBASE_BACKEND_ID),
+        ref_key: format!(
+            "emoji:conv={}:msg={message_id}",
+            hex_encode(&raw_conversation_id)
+        ),
+    })
+}
+
+fn conversation_id_bytes_from_base64_string(value: &Value) -> Option<Vec<u8>> {
+    let encoded = as_str(value)?.trim();
+    if encoded.is_empty() {
+        return None;
+    }
+    BASE64_STANDARD.decode(encoded).ok()
+}
+
+fn value_to_i64_identifier(value: &Value) -> Option<i64> {
+    as_i64(value).or_else(|| {
+        as_str(value).and_then(|raw| {
+            let trimmed = raw.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                trimmed.parse::<i64>().ok()
+            }
+        })
+    })
+}
+
+fn attach_emoji_source_refs(
+    fragments: &mut [MessageFragment],
+    emoji_source_refs: &mut HashMap<String, VecDeque<EmojiSourceRef>>,
+) {
+    for fragment in fragments {
+        let MessageFragment::Emoji { alias, source_ref } = fragment else {
+            continue;
+        };
+        if source_ref.is_some() {
+            continue;
+        }
+        let key = alias.to_ascii_lowercase();
+        let Some(queue) = emoji_source_refs.get_mut(&key) else {
+            continue;
+        };
+        if let Some(resolved) = queue.pop_front().or_else(|| queue.front().cloned()) {
+            *source_ref = Some(resolved);
+        }
+    }
+}
+
 fn parse_mention_metadata(root: &Value, message_body: Option<&Value>) -> MentionParseMetadata {
     let mut metadata = MentionParseMetadata::default();
     let at_mentions_value = find_value_for_keys(root, &["atMentionUsernames", "atMentions"], 0)
@@ -8231,6 +11910,7 @@ fn fragments_from_message_body(
     body: &str,
     decorated_body: Option<&str>,
     metadata: Option<&MentionParseMetadata>,
+    mut emoji_source_refs: HashMap<String, VecDeque<EmojiSourceRef>>,
 ) -> Vec<MessageFragment> {
     let trimmed_body = body.trim();
     if let Some(decorated) = decorated_body
@@ -8239,11 +11919,15 @@ fn fragments_from_message_body(
     {
         // For attachment captions (and other cases where the canonical text is decorated),
         // prefer the decorated body even if it only parses as plain text.
-        return parse_decorated_body(decorated);
+        let mut parsed = parse_decorated_body(decorated);
+        attach_emoji_source_refs(&mut parsed, &mut emoji_source_refs);
+        return parsed;
     }
     if let Some(decorated) = decorated_body {
         let parsed = parse_decorated_body(decorated);
         if fragments_include_structured_spans(&parsed) {
+            let mut parsed = parsed;
+            attach_emoji_source_refs(&mut parsed, &mut emoji_source_refs);
             return parsed;
         }
     }
@@ -8253,10 +11937,14 @@ fn fragments_from_message_body(
     if let Some(metadata) = metadata {
         let parsed = parse_metadata_mentions_from_text(body, metadata);
         if metadata.has_hints() || fragments_include_structured_spans(&parsed) {
+            let mut parsed = parsed;
+            attach_emoji_source_refs(&mut parsed, &mut emoji_source_refs);
             return parsed;
         }
     }
-    parse_plain_mentions_from_text(body)
+    let mut parsed = parse_plain_mentions_from_text(body);
+    attach_emoji_source_refs(&mut parsed, &mut emoji_source_refs);
+    parsed
 }
 
 fn fragments_include_structured_spans(fragments: &[MessageFragment]) -> bool {
@@ -8310,6 +11998,7 @@ fn parse_plain_mentions_from_text(body: &str) -> Vec<MessageFragment> {
             push_text_fragment(&mut fragments, &body[plain_start..index]);
             fragments.push(MessageFragment::Emoji {
                 alias: emoji_alias.to_string(),
+                source_ref: None,
             });
             index = span_end;
             plain_start = span_end;
@@ -8402,6 +12091,7 @@ fn parse_metadata_mentions_from_text(
             push_text_fragment(&mut fragments, &body[plain_start..index]);
             fragments.push(MessageFragment::Emoji {
                 alias: emoji_alias.to_string(),
+                source_ref: None,
             });
             index = span_end;
             plain_start = span_end;
@@ -8439,7 +12129,20 @@ fn parse_code_fragment_at(body: &str, backtick_index: usize) -> Option<(MessageF
         if end <= start {
             return None;
         }
-        return Some((MessageFragment::Code(body[start..end].to_string()), end + 3));
+        let content_start = if body[start..end].starts_with('\n') {
+            start + 1
+        } else {
+            start
+        };
+        let content_end = if end > content_start && body[..end].ends_with('\n') {
+            end - 1
+        } else {
+            end
+        };
+        return Some((
+            MessageFragment::Code(body[content_start..content_end].to_string()),
+            end + 3,
+        ));
     }
 
     let start = backtick_index + 1;
@@ -8457,10 +12160,10 @@ fn parse_code_fragment_at(body: &str, backtick_index: usize) -> Option<(MessageF
     ))
 }
 
-fn parse_plain_emoji_shortcode_at<'a>(
-    body: &'a str,
+fn parse_plain_emoji_shortcode_at(
+    body: &str,
     colon_index: usize,
-) -> Option<(&'a str, usize)> {
+) -> Option<(&str, usize)> {
     let start = colon_index + 1;
     if start >= body.len() {
         return None;
@@ -8514,7 +12217,7 @@ fn mention_prefix_is_valid(body: &str, at_index: usize) -> bool {
         .unwrap_or(true)
 }
 
-fn parse_plain_mention_at<'a>(body: &'a str, at_index: usize) -> Option<(&'a str, usize)> {
+fn parse_plain_mention_at(body: &str, at_index: usize) -> Option<(&str, usize)> {
     let start = at_index + 1;
     if start >= body.len() {
         return None;
@@ -8546,10 +12249,10 @@ fn is_plain_mention_char(ch: char) -> bool {
     ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '#' | '-')
 }
 
-fn parse_plain_channel_mention_at<'a>(
-    body: &'a str,
+fn parse_plain_channel_mention_at(
+    body: &str,
     hash_index: usize,
-) -> Option<(&'a str, usize)> {
+) -> Option<(&str, usize)> {
     let start = hash_index + 1;
     if start >= body.len() {
         return None;
@@ -8865,6 +12568,7 @@ fn push_decoration_fragment(
             };
             fragments.push(MessageFragment::Emoji {
                 alias: alias.to_string(),
+                source_ref: None,
             });
             true
         }
@@ -8924,6 +12628,11 @@ fn push_text_fragment(fragments: &mut Vec<MessageFragment>, text: &str) {
 
                 push_plain_text_fragment(fragments, &text[marker_start..marker_start + 1]);
                 inner_cursor = marker_start + 1;
+            }
+
+            if inner_cursor > line_end {
+                cursor = inner_cursor;
+                continue;
             }
         }
 
@@ -9413,14 +13122,13 @@ fn attachment_source_from_asset(asset: &Value) -> Option<AttachmentSource> {
         return Some(source);
     }
 
-    if let Some(location) = map_get_any(asset, &["location", "l"]) {
-        if let Some(source) = attachment_source_from_value(
+    if let Some(location) = map_get_any(asset, &["location", "l"])
+        && let Some(source) = attachment_source_from_value(
             location,
             &["url", "u", "file", "path", "localPath", "local_path"],
         ) {
             return Some(source);
         }
-    }
 
     None
 }
@@ -9630,11 +13338,9 @@ fn extract_edit_target_message_id(message_body: &Value) -> Option<MessageId> {
 fn is_message_superseded(server_header: &Value, root: &Value) -> bool {
     if let Some(id) =
         map_get_any(server_header, &["supersededBy", "superseded_by", "sb"]).and_then(as_i64)
-    {
-        if id > 0 {
+        && id > 0 {
             return true;
         }
-    }
     if let Some(flag) = map_get_any(root, &["superseded"]).and_then(as_bool) {
         return flag;
     }
@@ -10242,11 +13948,10 @@ fn extract_link_previews_from_message_body(message_body: &Value) -> Vec<LinkPrev
         return previews;
     };
 
-    if let Some(result) = map_get_any(payload, &["unfurl", "u"]) {
-        if let Some(preview) = extract_link_preview_from_result(result) {
+    if let Some(result) = map_get_any(payload, &["unfurl", "u"])
+        && let Some(preview) = extract_link_preview_from_result(result) {
             previews.push(preview);
         }
-    }
     if let Some(preview) = extract_link_preview_from_result(payload) {
         previews.push(preview);
     }
@@ -10665,11 +14370,10 @@ fn value_to_f32(value: &Value) -> Option<f32> {
     if let Some(raw) = as_i64(value) {
         return Some(raw as f32);
     }
-    if let Some(raw) = value.as_f64() {
-        if raw.is_finite() {
+    if let Some(raw) = value.as_f64()
+        && raw.is_finite() {
             return Some(raw as f32);
         }
-    }
     as_str(value)
         .and_then(|raw| raw.trim().parse::<f32>().ok())
         .filter(|candidate| candidate.is_finite())
@@ -10716,11 +14420,10 @@ fn find_body_string(value: &Value, depth: usize) -> Option<String> {
     match value {
         Value::Map(entries) => {
             for (key, inner) in entries {
-                if matches!(key.as_str(), Some("body" | "b")) {
-                    if let Some(text) = as_str(inner) {
+                if matches!(key.as_str(), Some("body" | "b"))
+                    && let Some(text) = as_str(inner) {
                         return Some(text.to_string());
                     }
-                }
                 if let Some(found) = find_body_string(inner, depth + 1) {
                     return Some(found);
                 }
@@ -10823,6 +14526,20 @@ fn as_binary(value: &Value) -> Option<&Vec<u8>> {
     }
 }
 
+fn outbox_id_to_string(value: &Value) -> Option<String> {
+    if let Some(bytes) = as_binary(value) {
+        return Some(hex_encode(bytes));
+    }
+    let text = as_str(value)?.trim();
+    if text.is_empty() {
+        return None;
+    }
+    if text.len() % 2 == 0 && text.chars().all(|ch| ch.is_ascii_hexdigit()) {
+        return Some(text.to_ascii_lowercase());
+    }
+    Some(text.to_string())
+}
+
 fn value_to_conversation_id_bytes(value: &Value) -> Option<Vec<u8>> {
     if let Some(bytes) = as_binary(value) {
         return Some(bytes.clone());
@@ -10858,7 +14575,7 @@ fn team_id_to_bytes(team_id: &str) -> Option<Vec<u8>> {
     if let Some(hex) = trimmed.strip_prefix("kb_team:") {
         return hex_decode(hex);
     }
-    if trimmed.len() % 2 == 0 && trimmed.chars().all(|ch| ch.is_ascii_hexdigit()) {
+    if trimmed.len().is_multiple_of(2) && trimmed.chars().all(|ch| ch.is_ascii_hexdigit()) {
         return hex_decode(trimmed);
     }
     None
@@ -10874,7 +14591,7 @@ fn provider_ref_to_conversation_id_bytes(
     if let Some(hex) = conversation_ref.0.strip_prefix("kb_conv:") {
         return hex_decode(hex);
     }
-    if conversation_ref.0.len() % 2 == 0
+    if conversation_ref.0.len().is_multiple_of(2)
         && conversation_ref.0.chars().all(|ch| ch.is_ascii_hexdigit())
     {
         return hex_decode(&conversation_ref.0);
@@ -10911,7 +14628,7 @@ fn canonical_conversation_id_from_provider_ref(
     if conversation_ref.0.starts_with("kb_conv:") {
         return ConversationId::new(conversation_ref.0.clone());
     }
-    if conversation_ref.0.len() % 2 == 0
+    if conversation_ref.0.len().is_multiple_of(2)
         && conversation_ref
             .0
             .chars()
@@ -10948,7 +14665,7 @@ fn hex_encode(bytes: &[u8]) -> String {
 }
 
 fn hex_decode(hex: &str) -> Option<Vec<u8>> {
-    if hex.len() % 2 != 0 {
+    if !hex.len().is_multiple_of(2) {
         return None;
     }
     let mut output = Vec::with_capacity(hex.len() / 2);
@@ -10980,6 +14697,14 @@ fn emit_task_runtime_stats(sender: &Sender<BackendEvent>, reason: &str) {
         Value::Map(vec![
             (Value::from("reason"), Value::from(reason.to_string())),
             (
+                Value::from("interactive_pending"),
+                Value::from(stats.interactive_pending as i64),
+            ),
+            (
+                Value::from("interactive_running"),
+                Value::from(stats.interactive_running as i64),
+            ),
+            (
                 Value::from("high_pending"),
                 Value::from(stats.high_pending as i64),
             ),
@@ -10999,13 +14724,50 @@ fn emit_task_runtime_stats(sender: &Sender<BackendEvent>, reason: &str) {
     );
 }
 
+fn internal_payload_preview(payload: &Value) -> Option<String> {
+    match payload {
+        Value::Nil => None,
+        Value::Map(entries) => {
+            let mut parts = Vec::new();
+            for (key, value) in entries.iter().take(16) {
+                let key = match key {
+                    Value::String(value) => value.as_str().unwrap_or("").trim(),
+                    _ => "",
+                };
+                if key.is_empty() {
+                    continue;
+                }
+                let value_text = match value {
+                    Value::Integer(value) => value.to_string(),
+                    Value::String(value) => value.as_str().unwrap_or("").trim().to_string(),
+                    Value::Boolean(value) => value.to_string(),
+                    Value::F32(value) => value.to_string(),
+                    Value::F64(value) => value.to_string(),
+                    Value::Array(values) => format!("array({})", values.len()),
+                    Value::Map(values) => format!("map({})", values.len()),
+                    Value::Binary(bytes) => format!("binary({})", bytes.len()),
+                    Value::Nil => "nil".to_string(),
+                    _ => "value".to_string(),
+                };
+                parts.push(format!("{key}={value_text}"));
+            }
+            if parts.is_empty() {
+                Some("map".to_string())
+            } else {
+                Some(parts.join(" "))
+            }
+        }
+        Value::Array(values) => Some(format!("array(len={})", values.len())),
+        Value::Binary(bytes) => Some(format!("binary(len={})", bytes.len())),
+        Value::String(value) => Some(value.as_str().unwrap_or("").to_string()),
+        _ => Some("value".to_string()),
+    }
+}
+
 fn send_internal(sender: &Sender<BackendEvent>, method: &str, payload: Value) {
     let _ = sender.send(BackendEvent::KeybaseNotifyStub {
         method: method.to_string(),
-        payload_preview: {
-            let text = format!("{payload:?}");
-            if text == "Nil" { None } else { Some(text) }
-        },
+        payload_preview: internal_payload_preview(&payload),
     });
 }
 
@@ -11035,12 +14797,176 @@ mod tests {
             link_previews: Vec::new(),
             permalink: String::new(),
             fragments: Vec::new(),
+            source_text: None,
             attachments: Vec::new(),
             reactions: Vec::new(),
             thread_reply_count: 0,
             send_state: MessageSendState::Sent,
             edited: None,
         }
+    }
+
+    #[test]
+    fn parse_identify3_proof_callbacks_prefers_row_payload_fields() {
+        let callbacks = vec![RpcNotification {
+            method: "keybase.1.identify3Ui.identify3UpdateRow".to_string(),
+            params: Value::Array(vec![Value::Map(vec![(
+                Value::from("row"),
+                Value::Map(vec![
+                    (Value::from("key"), Value::from("pgp")),
+                    (Value::from("value"), Value::from("CMMARSLENDER")),
+                    (
+                        Value::from("proofURL"),
+                        Value::from("https://keybase.io/cmmarslender/sigchain#proof"),
+                    ),
+                    (
+                        Value::from("proofResult"),
+                        Value::Map(vec![(Value::from("state"), Value::from(2))]),
+                    ),
+                    (
+                        Value::from("siteIcon"),
+                        Value::Array(vec![
+                            Value::Map(vec![
+                                (Value::from("width"), Value::from(32)),
+                                (Value::from("url"), Value::from("https://cdn/p.webp")),
+                            ]),
+                            Value::Map(vec![
+                                (Value::from("width"), Value::from(16)),
+                                (Value::from("url"), Value::from("https://cdn/p-16.webp")),
+                            ]),
+                        ]),
+                    ),
+                ]),
+            )])]),
+        }];
+
+        let proofs = parse_identify3_proof_callbacks(&callbacks);
+        assert_eq!(proofs.len(), 1);
+        assert_eq!(proofs[0].service_name, "pgp");
+        assert_eq!(proofs[0].service_username, "CMMARSLENDER");
+        assert_eq!(
+            proofs[0].proof_url.as_deref(),
+            Some("https://keybase.io/cmmarslender/sigchain#proof")
+        );
+        assert_eq!(
+            proofs[0].icon_asset.as_deref(),
+            Some("https://cdn/p-16.webp")
+        );
+        assert_eq!(proofs[0].state, ProofState::Verified);
+    }
+
+    #[test]
+    fn parse_identify3_proof_callbacks_promotes_pending_rows_to_verified() {
+        let callbacks = vec![
+            RpcNotification {
+                method: "keybase.1.identify3Ui.identify3UpdateRow".to_string(),
+                params: Value::Array(vec![Value::Map(vec![(
+                    Value::from("row"),
+                    Value::Map(vec![
+                        (Value::from("key"), Value::from("dns")),
+                        (Value::from("value"), Value::from("example.com")),
+                        (Value::from("state"), Value::from(1)),
+                    ]),
+                )])]),
+            },
+            RpcNotification {
+                method: "keybase.1.identify3Ui.identify3UpdateRow".to_string(),
+                params: Value::Array(vec![Value::Map(vec![(
+                    Value::from("row"),
+                    Value::Map(vec![
+                        (Value::from("key"), Value::from("dns")),
+                        (Value::from("value"), Value::from("example.com")),
+                        (Value::from("state"), Value::from(2)),
+                        (
+                            Value::from("siteIcon"),
+                            Value::Array(vec![Value::Map(vec![
+                                (Value::from("width"), Value::from(16)),
+                                (Value::from("path"), Value::from("https://cdn/dns-16.png")),
+                            ])]),
+                        ),
+                    ]),
+                )])]),
+            },
+        ];
+
+        let proofs = parse_identify3_proof_callbacks(&callbacks);
+        assert_eq!(proofs.len(), 1);
+        assert_eq!(proofs[0].state, ProofState::Verified);
+        assert_eq!(
+            proofs[0].icon_asset.as_deref(),
+            Some("https://cdn/dns-16.png")
+        );
+    }
+
+    #[test]
+    fn parse_presence_updates_from_notify_reads_participant_status() {
+        let event = KeybaseNotifyEvent::Unknown {
+            method: "chat.1.NotifyChat.ChatParticipantsInfo".to_string(),
+            raw_params: Value::Array(vec![Value::Map(vec![(
+                Value::from("participants"),
+                Value::Map(vec![(
+                    Value::from("00003570c1fa47b06cf1ae045a9199388130854bcc009e41da07018784b933da"),
+                    Value::Array(vec![Value::Map(vec![
+                        (Value::from("assertion"), Value::from("cmmarslender")),
+                        (Value::from("lastActiveStatus"), Value::from("ACTIVE_1")),
+                    ])]),
+                )]),
+            )])]),
+        };
+
+        let patches = parse_presence_updates_from_notify(&event);
+        assert_eq!(patches.len(), 1);
+        assert_eq!(patches[0].user_id.0, "cmmarslender");
+        assert_eq!(patches[0].presence.availability, Availability::Active);
+    }
+
+    #[test]
+    fn parse_last_active_status_maps_active_recently_and_none() {
+        assert_eq!(
+            parse_last_active_status_availability(&Value::from(1)),
+            Some(Availability::Active)
+        );
+        assert_eq!(
+            parse_last_active_status_availability(&Value::from(2)),
+            Some(Availability::Away)
+        );
+        assert_eq!(
+            parse_last_active_status_availability(&Value::from(0)),
+            Some(Availability::Offline)
+        );
+    }
+
+    #[test]
+    fn parse_last_active_status_for_user_reads_username_keyed_maps() {
+        let direct = Value::Map(vec![
+            (Value::from("cameroncooper"), Value::from(0)),
+            (Value::from("cmmarslender"), Value::from("ACTIVE_1")),
+        ]);
+        assert_eq!(
+            parse_last_active_status_for_user(&direct, &UserId::new("cmmarslender")),
+            Some(Availability::Active)
+        );
+
+        let nested = Value::Map(vec![(
+            Value::from("participants"),
+            Value::Map(vec![(
+                Value::from("cmmarslender"),
+                Value::Map(vec![(Value::from("lastActiveStatus"), Value::from(2))]),
+            )]),
+        )]);
+        assert_eq!(
+            parse_last_active_status_for_user(&nested, &UserId::new("cmmarslender")),
+            Some(Availability::Away)
+        );
+    }
+
+    #[test]
+    fn tlf_name_mentions_user_matches_dm_member_list() {
+        assert!(tlf_name_mentions_user(
+            "cameroncooper,cmmarslender",
+            "cmmarslender"
+        ));
+        assert!(!tlf_name_mentions_user("chia_network", "cmmarslender"));
     }
 
     #[test]
@@ -11897,6 +15823,187 @@ mod tests {
         );
         assert_eq!(delta.emoji, ":100:");
         assert_eq!(delta.actor_id.0, "bholmes22");
+        assert!(delta.source_ref.is_none());
+    }
+
+    #[test]
+    fn parse_live_reaction_delta_extracts_cross_team_source_ref() {
+        let event = KeybaseNotifyEvent::Unknown {
+            method: "chat.1.NotifyChat.NewChatActivity".to_string(),
+            raw_params: Value::Map(vec![
+                (
+                    Value::from("convID"),
+                    Value::Binary(vec![
+                        0x00, 0x00, 0xd2, 0xea, 0x99, 0xbb, 0x8a, 0x1f, 0x0c, 0x4c, 0xe0, 0xba,
+                        0x34, 0x98, 0xc5, 0x73,
+                    ]),
+                ),
+                (Value::from("messageID"), Value::from(695)),
+                (Value::from("senderUsername"), Value::from("cmmarslender")),
+                (
+                    Value::from("content"),
+                    Value::Map(vec![
+                        (Value::from("type"), Value::from("reaction")),
+                        (
+                            Value::from("reaction"),
+                            Value::Map(vec![
+                                (Value::from("m"), Value::from(694)),
+                                (Value::from("b"), Value::from(":upvote:")),
+                                (
+                                    Value::from("e"),
+                                    Value::Map(vec![(
+                                        Value::from("upvote"),
+                                        Value::Map(vec![
+                                            (Value::from("alias"), Value::from("upvote")),
+                                            (Value::from("isCrossTeam"), Value::from(true)),
+                                            (
+                                                Value::from("source"),
+                                                Value::Map(vec![(
+                                                    Value::from("message"),
+                                                    Value::Map(vec![
+                                                        (
+                                                            Value::from("convID"),
+                                                            Value::from(
+                                                                "AADuOtIhzuifak2Ao6FnbYUYzuIn4ScHpnVjdCsiCiA=",
+                                                            ),
+                                                        ),
+                                                        (Value::from("msgID"), Value::from(26)),
+                                                    ]),
+                                                )]),
+                                            ),
+                                        ]),
+                                    )]),
+                                ),
+                            ]),
+                        ),
+                    ]),
+                ),
+            ]),
+        };
+
+        let delta = parse_live_reaction_delta_from_notify(&event).expect("reaction delta");
+        let source_ref = delta.source_ref.expect("source ref");
+        assert_eq!(source_ref.backend_id.0, KEYBASE_BACKEND_ID);
+        assert_eq!(
+            source_ref.ref_key,
+            "emoji:conv=0000ee3ad221cee89f6a4d80a3a1676d8518cee227e12707a67563742b220a20:msg=26"
+        );
+    }
+
+    #[test]
+    fn parse_live_reaction_delta_uses_message_id_field_as_op_id() {
+        let event = KeybaseNotifyEvent::Unknown {
+            method: "chat.1.NotifyChat.NewChatActivity".to_string(),
+            raw_params: Value::Map(vec![
+                (Value::from("type"), Value::from("chat")),
+                (
+                    Value::from("msg"),
+                    Value::Map(vec![
+                        (Value::from("id"), Value::from(48)),
+                        (
+                            Value::from("conversation_id"),
+                            Value::from(
+                                "0000616d72fdbc60800756697c93ac0642e32391073a9635520e2166c3821a96",
+                            ),
+                        ),
+                        (
+                            Value::from("sender"),
+                            Value::Map(vec![(
+                                Value::from("username"),
+                                Value::from("cameroncooper"),
+                            )]),
+                        ),
+                        (
+                            Value::from("content"),
+                            Value::Map(vec![
+                                (Value::from("type"), Value::from("reaction")),
+                                (
+                                    Value::from("reaction"),
+                                    Value::Map(vec![
+                                        (Value::from("m"), Value::from(47)),
+                                        (Value::from("b"), Value::from("👍")),
+                                    ]),
+                                ),
+                            ]),
+                        ),
+                    ]),
+                ),
+            ]),
+        };
+
+        let delta = parse_live_reaction_delta_from_notify(&event).expect("reaction delta");
+        assert_eq!(delta.target_message_id.0, "47");
+        assert_eq!(
+            delta.op_message_id.as_ref().map(|id| id.0.as_str()),
+            Some("48")
+        );
+        assert_eq!(delta.emoji, "👍");
+        assert_eq!(delta.actor_id.0, "cameroncooper");
+    }
+
+    #[test]
+    fn reaction_removed_event_for_live_delete_uses_persisted_reaction_op_mapping() {
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "kbui-reaction-delete-map-{}-{}",
+            std::process::id(),
+            now_unix_ms()
+        ));
+        let local_store = LocalStore::open_at(path.clone()).expect("open local store");
+        let conversation_id = ConversationId::new("kb_conv:test");
+        let op_message_id = MessageId::new("300");
+        let target_message_id = MessageId::new("200");
+
+        local_store
+            .upsert_message_reaction_op(
+                &conversation_id,
+                &op_message_id,
+                &target_message_id,
+                ":heart:",
+                &UserId::new("alice"),
+                1,
+            )
+            .expect("persist reaction op mapping");
+
+        let mut delete_message = make_test_message("301");
+        delete_message.conversation_id = conversation_id.clone();
+        delete_message.event = Some(ChatEvent::MessageDeleted {
+            target_message_id: Some(op_message_id.clone()),
+        });
+
+        let event = reaction_removed_event_for_live_delete(&local_store, &delete_message)
+            .expect("reaction delete should map to reaction removal");
+        match event {
+            BackendEvent::MessageReactionRemoved {
+                conversation_id: removed_conversation_id,
+                message_id,
+                emoji,
+                actor_id,
+            } => {
+                assert_eq!(removed_conversation_id, conversation_id);
+                assert_eq!(message_id, target_message_id);
+                assert_eq!(emoji, ":heart:");
+                assert_eq!(actor_id, UserId::new("alice"));
+            }
+            other => panic!("unexpected backend event: {other:?}"),
+        }
+
+        let duplicate = reaction_removed_event_for_live_delete(&local_store, &delete_message)
+            .expect("duplicate delete notification should still map to reaction removal");
+        assert!(
+            matches!(duplicate, BackendEvent::MessageReactionRemoved { .. }),
+            "duplicate live delete should not fall through to message tombstone rendering"
+        );
+
+        let still_present = local_store
+            .get_message_reaction_op(&conversation_id, &op_message_id)
+            .expect("load persisted mapping after reaction removal");
+        assert!(
+            still_present.is_some(),
+            "mapping should remain to classify duplicate local/remote delete notifications"
+        );
+
+        let _ = std::fs::remove_dir_all(path);
     }
 
     #[test]
@@ -12360,6 +16467,155 @@ mod tests {
     }
 
     #[test]
+    fn parse_thread_message_attaches_emoji_source_ref_from_text_metadata() {
+        let valid = Value::Map(vec![
+            (
+                Value::from("serverHeader"),
+                Value::Map(vec![(Value::from("messageID"), Value::from(904))]),
+            ),
+            (Value::from("senderUsername"), Value::from("alice")),
+            (
+                Value::from("messageBody"),
+                Value::Map(vec![(
+                    Value::from("text"),
+                    Value::Map(vec![
+                        (Value::from("body"), Value::from("hello :nice: world")),
+                        (
+                            Value::from("emojis"),
+                            Value::Array(vec![Value::Map(vec![
+                                (Value::from("alias"), Value::from("nice")),
+                                (Value::from("isCrossTeam"), Value::from(true)),
+                                (
+                                    Value::from("convID"),
+                                    Value::from("00112233445566778899aabbccddeeff"),
+                                ),
+                                (Value::from("messageID"), Value::from(54646)),
+                            ])]),
+                        ),
+                    ]),
+                )]),
+            ),
+        ]);
+
+        let message = parse_thread_message(&valid, &ConversationId::new("kb_conv:test"), None)
+            .expect("expected parsed thread message");
+        let source_ref = message
+            .fragments
+            .iter()
+            .find_map(|fragment| match fragment {
+                MessageFragment::Emoji {
+                    alias,
+                    source_ref: Some(source_ref),
+                } if alias == "nice" => Some(source_ref.clone()),
+                _ => None,
+            })
+            .expect("expected emoji source ref");
+
+        assert_eq!(source_ref.backend_id.0, KEYBASE_BACKEND_ID);
+        assert_eq!(
+            source_ref.ref_key,
+            "emoji:conv=00112233445566778899aabbccddeeff:msg=54646"
+        );
+    }
+
+    #[test]
+    fn parse_thread_message_attaches_emoji_source_ref_from_flattened_emojis_metadata() {
+        let valid = Value::Map(vec![
+            (
+                Value::from("serverHeader"),
+                Value::Map(vec![(Value::from("messageID"), Value::from(905))]),
+            ),
+            (Value::from("senderUsername"), Value::from("alice")),
+            (
+                Value::from("messageBody"),
+                Value::Map(vec![
+                    (Value::from("body"), Value::from("hello :nice: world")),
+                    (
+                        Value::from("emojis"),
+                        Value::Array(vec![Value::Map(vec![
+                            (Value::from("alias"), Value::from("nice")),
+                            (
+                                Value::from("convID"),
+                                Value::from("00112233445566778899aabbccddeeff"),
+                            ),
+                            (Value::from("messageID"), Value::from(14)),
+                        ])]),
+                    ),
+                ]),
+            ),
+        ]);
+
+        let message = parse_thread_message(&valid, &ConversationId::new("kb_conv:test"), None)
+            .expect("expected parsed thread message");
+        let source_ref = message
+            .fragments
+            .iter()
+            .find_map(|fragment| match fragment {
+                MessageFragment::Emoji {
+                    alias,
+                    source_ref: Some(source_ref),
+                } if alias == "nice" => Some(source_ref.clone()),
+                _ => None,
+            })
+            .expect("expected emoji source ref");
+
+        assert_eq!(
+            source_ref.ref_key,
+            "emoji:conv=00112233445566778899aabbccddeeff:msg=14"
+        );
+    }
+
+    #[test]
+    fn parse_thread_message_accepts_base64_emoji_conv_id_metadata() {
+        let valid = Value::Map(vec![
+            (
+                Value::from("serverHeader"),
+                Value::Map(vec![(Value::from("messageID"), Value::from(906))]),
+            ),
+            (Value::from("senderUsername"), Value::from("alice")),
+            (
+                Value::from("messageBody"),
+                Value::Map(vec![(
+                    Value::from("text"),
+                    Value::Map(vec![
+                        (Value::from("body"), Value::from("hello :nice: world")),
+                        (
+                            Value::from("emojis"),
+                            Value::Array(vec![Value::Map(vec![
+                                (Value::from("alias"), Value::from("nice")),
+                                (
+                                    Value::from("convID"),
+                                    Value::from("AACLV/fMGdHk6fzfHZsRKYZIQa7G1WT6A934JyOkc0I="),
+                                ),
+                                (Value::from("messageID"), Value::from(14)),
+                            ])]),
+                        ),
+                    ]),
+                )]),
+            ),
+        ]);
+
+        let message = parse_thread_message(&valid, &ConversationId::new("kb_conv:test"), None)
+            .expect("expected parsed thread message");
+        let source_ref = message
+            .fragments
+            .iter()
+            .find_map(|fragment| match fragment {
+                MessageFragment::Emoji {
+                    alias,
+                    source_ref: Some(source_ref),
+                } if alias == "nice" => Some(source_ref.clone()),
+                _ => None,
+            })
+            .expect("expected emoji source ref");
+
+        assert_eq!(
+            source_ref.ref_key,
+            "emoji:conv=00008b57f7cc19d1e4e9fcdf1d9b1129864841aec6d564fa03ddf82723a47342:msg=14"
+        );
+    }
+
+    #[test]
     fn parse_thread_message_respects_channel_mention_gating_from_metadata() {
         let valid = Value::Map(vec![
             (
@@ -12591,12 +16847,12 @@ mod tests {
         let fragments = parse_plain_mentions_from_text("Use `:lol:` literally and :troll:");
         assert!(fragments.iter().any(|fragment| matches!(
             fragment,
-            MessageFragment::Emoji { alias } if alias == "troll"
+            MessageFragment::Emoji { alias, .. } if alias == "troll"
         )));
         assert!(
             !fragments.iter().any(|fragment| matches!(
                 fragment,
-                MessageFragment::Emoji { alias } if alias == "lol"
+                MessageFragment::Emoji { alias, .. } if alias == "lol"
             )),
             "emoji shortcode inside inline code should remain plain text"
         );
@@ -12620,12 +16876,12 @@ mod tests {
         )));
         assert!(fragments.iter().any(|fragment| matches!(
             fragment,
-            MessageFragment::Emoji { alias } if alias == "troll"
+            MessageFragment::Emoji { alias, .. } if alias == "troll"
         )));
         assert!(
             !fragments.iter().any(|fragment| matches!(
                 fragment,
-                MessageFragment::Emoji { alias } if alias == "lol"
+                MessageFragment::Emoji { alias, .. } if alias == "lol"
             )),
             "emoji shortcode inside inline code should remain plain text"
         );
@@ -12640,18 +16896,18 @@ mod tests {
         let fragments = parse_plain_mentions_from_text("Use ```\n:lol:\n``` literally and :troll:");
         assert!(fragments.iter().any(|fragment| matches!(
             fragment,
-            MessageFragment::Code(code) if code == "\n:lol:\n"
+            MessageFragment::Code(code) if code == ":lol:"
         )));
         assert!(
             !fragments.iter().any(|fragment| matches!(
                 fragment,
-                MessageFragment::Emoji { alias } if alias == "lol"
+                MessageFragment::Emoji { alias, .. } if alias == "lol"
             )),
             "emoji shortcode inside fenced code block should remain code text"
         );
         assert!(fragments.iter().any(|fragment| matches!(
             fragment,
-            MessageFragment::Emoji { alias } if alias == "troll"
+            MessageFragment::Emoji { alias, .. } if alias == "troll"
         )));
     }
 
@@ -12669,18 +16925,18 @@ mod tests {
         )));
         assert!(fragments.iter().any(|fragment| matches!(
             fragment,
-            MessageFragment::Code(code) if code == "\n:lol:\n"
+            MessageFragment::Code(code) if code == ":lol:"
         )));
         assert!(
             !fragments.iter().any(|fragment| matches!(
                 fragment,
-                MessageFragment::Emoji { alias } if alias == "lol"
+                MessageFragment::Emoji { alias, .. } if alias == "lol"
             )),
             "emoji shortcode inside fenced code block should remain code text"
         );
         assert!(fragments.iter().any(|fragment| matches!(
             fragment,
-            MessageFragment::Emoji { alias } if alias == "troll"
+            MessageFragment::Emoji { alias, .. } if alias == "troll"
         )));
     }
 
@@ -12824,7 +17080,7 @@ mod tests {
         assert!(
             fragments.iter().any(|fragment| matches!(
                 fragment,
-                MessageFragment::Emoji { alias } if alias == "troll"
+                MessageFragment::Emoji { alias, .. } if alias == "troll"
             )),
             "emoji shortcodes on non-quoted lines should still be parsed: {fragments:?}"
         );
@@ -12835,7 +17091,7 @@ mod tests {
         let fragments = parse_plain_mentions_from_text("hello :troll#2: world");
         assert!(fragments.iter().any(|fragment| matches!(
             fragment,
-            MessageFragment::Emoji { alias } if alias == "troll#2"
+            MessageFragment::Emoji { alias, .. } if alias == "troll#2"
         )));
     }
 
@@ -12846,7 +17102,7 @@ mod tests {
         let fragments = parse_metadata_mentions_from_text("hello :troll#2: world", &metadata);
         assert!(fragments.iter().any(|fragment| matches!(
             fragment,
-            MessageFragment::Emoji { alias } if alias == "troll#2"
+            MessageFragment::Emoji { alias, .. } if alias == "troll#2"
         )));
     }
 
@@ -12929,7 +17185,7 @@ mod tests {
         assert_eq!(parsed.conversation_id.0, "kb_conv:abcd");
         assert_eq!(parsed.read_upto.0, "99");
         let snapshot = parsed.snapshot.expect("snapshot");
-        assert_eq!(snapshot.unread_count, 6);
+        assert_eq!(snapshot.unread_count, 1);
         assert_eq!(snapshot.mention_count, 2);
         assert_eq!(
             snapshot.read_upto.as_ref().map(|id| id.0.as_str()),
@@ -12975,7 +17231,7 @@ mod tests {
 
         let parsed = parse_inbox_conversations(&payload, Some("alice"));
         assert_eq!(parsed.len(), 1);
-        assert_eq!(parsed[0].summary.unread_count, 40);
+        assert_eq!(parsed[0].summary.unread_count, 1);
     }
 
     #[test]

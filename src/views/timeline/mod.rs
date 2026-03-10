@@ -1,5 +1,6 @@
 use crate::{
     domain::{
+        affinity::Affinity,
         attachment::AttachmentKind,
         ids::UserId,
         message::{BroadcastKind, LinkPreview, MessageFragment, MessageSendState},
@@ -11,14 +12,15 @@ use crate::{
     util::formatting::message_timestamp_label,
     views::{
         CUSTOM_EMOJI_EMOJI_ONLY_SIZE_PX, CUSTOM_EMOJI_INLINE_SIZE_PX,
-        CUSTOM_EMOJI_REACTION_SIZE_PX, accent, accent_soft, activity_icon,
+        CUSTOM_EMOJI_REACTION_SIZE_PX, accent, accent_soft, activity_icon, affinity_broken,
+        affinity_positive,
         app_window::{AppWindow, video_preview_cache_key},
         arrow_left_icon, arrow_right_icon, attachment_display_label, attachment_image_source,
         attachment_lightbox_source,
         avatar::{Avatar, default_avatar_background},
-        badge, crown_icon, danger, danger_soft, emoji_icon, glass_surface_dark, hash_icon,
+        badge, close_icon, crown_icon, danger, glass_surface_dark, hash_icon,
         inline_markdown::{InlineMarkdownConfig, apply_inline_markdown, remap_source_byte_range},
-        mention, mention_soft, more_icon, panel_alt_bg, pin_icon, plus_icon,
+        link_icon, mention_soft, panel_alt_bg, panel_bg, pin_icon, plus_icon,
         selectable_text::{
             InlineAttachment, LinkRange, SelectableText, StyledRange, resolve_selectable_text,
             resolve_selectable_text_inline, resolve_selectable_text_with_attachments,
@@ -29,9 +31,10 @@ use crate::{
 };
 use gpui::prelude::FluentBuilder;
 use gpui::{
-    AnyElement, Context, Entity, FontWeight, ImageSource, InteractiveElement, IntoElement,
-    ListState, ObjectFit, ParentElement, RenderImage, SharedString, StatefulInteractiveElement,
-    Styled, StyledImage, div, img, list, px, rgb,
+    AnyElement, Bounds, Context, Entity, FontWeight, ImageSource, InteractiveElement, IntoElement,
+    LayoutId, ListState, ObjectFit, ParentElement, Pixels, RenderImage, SharedString,
+    StatefulInteractiveElement, Styled, StyledImage, Window, deferred, div, img, list, px,
+    relative, rgb,
 };
 use std::{
     borrow::Cow,
@@ -39,10 +42,90 @@ use std::{
     sync::{Arc, OnceLock},
 };
 
+#[derive(Clone)]
+struct HoveredMessageBoundsReporter {
+    owner: gpui::WeakEntity<AppWindow>,
+    message_id: crate::domain::ids::MessageId,
+    is_thread: bool,
+}
+
+impl gpui::IntoElement for HoveredMessageBoundsReporter {
+    type Element = Self;
+
+    fn into_element(self) -> Self::Element {
+        self
+    }
+}
+
+impl gpui::Element for HoveredMessageBoundsReporter {
+    type RequestLayoutState = ();
+    type PrepaintState = ();
+
+    fn id(&self) -> Option<gpui::ElementId> {
+        None
+    }
+
+    fn source_location(&self) -> Option<&'static core::panic::Location<'static>> {
+        None
+    }
+
+    fn request_layout(
+        &mut self,
+        _id: Option<&gpui::GlobalElementId>,
+        _inspector_id: Option<&gpui::InspectorElementId>,
+        window: &mut Window,
+        cx: &mut gpui::App,
+    ) -> (LayoutId, Self::RequestLayoutState) {
+        let mut style = gpui::Style::default();
+        style.size.width = relative(1.).into();
+        style.size.height = relative(1.).into();
+        (window.request_layout(style, std::iter::empty(), cx), ())
+    }
+
+    fn prepaint(
+        &mut self,
+        _id: Option<&gpui::GlobalElementId>,
+        _inspector_id: Option<&gpui::InspectorElementId>,
+        bounds: Bounds<Pixels>,
+        _request_layout: &mut Self::RequestLayoutState,
+        _window: &mut Window,
+        cx: &mut gpui::App,
+    ) -> Self::PrepaintState {
+        let owner = self.owner.clone();
+        let message_id = self.message_id.clone();
+        let is_thread = self.is_thread;
+        let left: f32 = bounds.origin.x.into();
+        let width: f32 = bounds.size.width.into();
+        let _ = owner.update(cx, |this, cx| {
+            this.record_hovered_message_layout(message_id, is_thread, left, width, cx);
+        });
+    }
+
+    fn paint(
+        &mut self,
+        _id: Option<&gpui::GlobalElementId>,
+        _inspector_id: Option<&gpui::InspectorElementId>,
+        _bounds: Bounds<Pixels>,
+        _request_layout: &mut Self::RequestLayoutState,
+        _prepaint: &mut Self::PrepaintState,
+        _window: &mut Window,
+        _cx: &mut gpui::App,
+    ) {
+    }
+}
+
 #[derive(Default)]
 pub struct TimelineList;
 
 const ROW_RENDER_CACHE_MAX_ENTRIES: usize = 512;
+
+const QUICK_REACT_EMOJI: &[(&str, &str)] = &[
+    ("+1", "\u{1F44D}"),
+    ("heart", "\u{2764}\u{FE0F}"),
+    ("joy", "\u{1F602}"),
+    ("tada", "\u{1F389}"),
+    ("eyes", "\u{1F440}"),
+];
 
 #[derive(Default)]
 pub(crate) struct TimelineRowRenderCache {
@@ -81,7 +164,7 @@ impl TimelineRowRenderCache {
         let needs_rebuild = self
             .entries
             .get(&row_index)
-            .map_or(true, |entry| entry.row_ptr != row_ptr);
+            .is_none_or(|entry| entry.row_ptr != row_ptr);
 
         if needs_rebuild {
             self.entries.insert(
@@ -157,7 +240,6 @@ impl TimelineList {
             .flex_1()
             .min_h(px(0.))
             .id("timeline-scroll")
-            .px_4()
             .py_2()
             .flex()
             .flex_col()
@@ -190,6 +272,7 @@ impl TimelineList {
             row,
             None,
             true,
+            false,
             None,
             video_render_cache,
             selectable_texts,
@@ -209,6 +292,7 @@ impl TimelineList {
             row,
             None,
             false,
+            true,
             None,
             video_render_cache,
             selectable_texts,
@@ -234,6 +318,7 @@ impl TimelineList {
                 row,
                 Some(message_memo),
                 true,
+                false,
                 find_query,
                 video_render_cache,
                 selectable_texts,
@@ -247,6 +332,7 @@ impl TimelineList {
             row,
             None,
             true,
+            false,
             find_query,
             video_render_cache,
             selectable_texts,
@@ -259,6 +345,7 @@ impl TimelineList {
         row: &TimelineRow,
         message_memo: Option<&MessageRenderMemo>,
         show_thread_reply_badge: bool,
+        is_thread: bool,
         find_query: Option<&str>,
         video_render_cache: &HashMap<String, Arc<RenderImage>>,
         selectable_texts: &mut HashMap<String, Entity<SelectableText>>,
@@ -266,6 +353,7 @@ impl TimelineList {
     ) -> AnyElement {
         let row_element = match row {
             TimelineRow::DateDivider(label) => div()
+                .px_4()
                 .py_2()
                 .flex()
                 .items_center()
@@ -273,6 +361,7 @@ impl TimelineList {
                 .child(badge(label.clone(), panel_alt_bg(), text_secondary()))
                 .into_any_element(),
             TimelineRow::UnreadDivider(label) => div()
+                .px_4()
                 .py_1()
                 .flex()
                 .items_center()
@@ -297,7 +386,7 @@ impl TimelineList {
                     .items_center()
                     .gap_2()
                     .py_1()
-                    .pl(px(16.))
+                    .px_4()
                     .child(icon)
                     .child(
                         div()
@@ -322,13 +411,6 @@ impl TimelineList {
                     )
                     .into_any_element()
             }
-            TimelineRow::TypingIndicator(label) => div()
-                .pl(px(48.))
-                .py_0p5()
-                .text_xs()
-                .text_color(rgb(text_secondary()))
-                .child(label.clone())
-                .into_any_element(),
             TimelineRow::LoadingIndicator(label) => div()
                 .w_full()
                 .min_w(px(0.))
@@ -336,22 +418,38 @@ impl TimelineList {
                 .items_center()
                 .gap_2()
                 .py_1()
-                .pl(px(16.))
+                .px_4()
                 .text_xs()
                 .text_color(rgb(text_secondary()))
                 .child(activity_icon(accent()))
                 .child(label.clone())
                 .into_any_element(),
-            TimelineRow::Message(message_row) => Self::render_message_row(
-                timeline,
-                message_row,
-                message_memo,
-                show_thread_reply_badge,
-                find_query,
-                video_render_cache,
-                selectable_texts,
-                cx,
-            ),
+            TimelineRow::Message(message_row) => {
+                let is_last_message = timeline
+                    .rows
+                    .iter()
+                    .rev()
+                    .find_map(|r| {
+                        if let TimelineRow::Message(m) = r {
+                            Some(&m.message.id)
+                        } else {
+                            None
+                        }
+                    })
+                    .is_some_and(|last_id| last_id == &message_row.message.id);
+                Self::render_message_row(
+                    timeline,
+                    message_row,
+                    message_memo,
+                    show_thread_reply_badge,
+                    is_thread,
+                    is_last_message,
+                    find_query,
+                    video_render_cache,
+                    selectable_texts,
+                    cx,
+                )
+            }
         };
 
         div()
@@ -366,12 +464,31 @@ impl TimelineList {
         row: &MessageRow,
         message_memo: Option<&MessageRenderMemo>,
         show_thread_reply_badge: bool,
+        is_thread: bool,
+        is_last_message: bool,
         find_query: Option<&str>,
         video_render_cache: &HashMap<String, Arc<RenderImage>>,
         selectable_texts: &mut HashMap<String, Entity<SelectableText>>,
         cx: &mut Context<AppWindow>,
     ) -> AnyElement {
         let timestamp = message_timestamp_label(row.message.timestamp_ms);
+        let author_user_id = row.author.id.clone();
+        let is_hovered = timeline
+            .hovered_message_id
+            .as_ref()
+            .is_some_and(|id| id == &row.message.id)
+            && timeline.hovered_message_is_thread == Some(is_thread);
+        let hover_anchor_x = is_hovered
+            .then_some(timeline.hovered_message_anchor_x)
+            .flatten();
+        let hover_window_left = is_hovered
+            .then_some(timeline.hovered_message_window_left)
+            .flatten();
+        let hover_window_width = is_hovered
+            .then_some(timeline.hovered_message_window_width)
+            .flatten();
+        let is_thread_reply_stub = !is_thread && row.message.reply_to.is_some();
+        let show_header = row.show_header || is_thread_reply_stub || is_thread;
         let normalized_author_id = UserId::new(row.author.id.0.to_ascii_lowercase());
         let author_role = timeline
             .author_role_index
@@ -385,12 +502,29 @@ impl TimelineList {
             });
         let mut content = div().flex_1().min_w(px(0.)).flex().flex_col().gap_0p5();
 
-        if row.show_header {
+        if show_header {
+            let is_you = timeline
+                .current_user_id
+                .as_ref()
+                .is_some_and(|current_user_id| {
+                    current_user_id.0.eq_ignore_ascii_case(&row.author.id.0)
+                });
             let mut header_children = vec![
                 div()
+                    .id(SharedString::from(format!(
+                        "timeline-author-name-{}",
+                        row.message.id.0
+                    )))
+                    .on_click(cx.listener({
+                        let author_user_id = author_user_id.clone();
+                        move |this, _, _, cx| {
+                            this.open_user_profile_card(author_user_id.clone(), cx);
+                        }
+                    }))
+                    .cursor(gpui::CursorStyle::PointingHand)
                     .text_sm()
                     .font_weight(FontWeight::SEMIBOLD)
-                    .text_color(rgb(text_primary()))
+                    .text_color(rgb(Self::author_name_color(row.author.affinity, is_you)))
                     .child(row.author.display_name.clone())
                     .into_any_element(),
             ];
@@ -413,57 +547,195 @@ impl TimelineList {
             );
         }
 
-        content = content.child(Self::render_message(
-            &row.message,
-            timeline.highlighted_message_id.as_ref() == Some(&row.message.id),
-            find_query,
-            &timeline.emoji_index,
-            &timeline.reaction_index,
-            show_thread_reply_badge,
-            row.message.edited.is_some(),
-            video_render_cache,
-            message_memo,
-            selectable_texts,
-            cx,
-        ));
+        if !is_thread
+            && let Some(reply_to_id) = &row.message.reply_to {
+                let thread_target = row
+                    .message
+                    .thread_root_id
+                    .clone()
+                    .unwrap_or_else(|| reply_to_id.clone());
 
-        if row.show_header {
+                let reply_indicator = div()
+                    .id(SharedString::from(format!(
+                        "reply-indicator-{}",
+                        row.message.id.0
+                    )))
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.open_thread(thread_target.clone(), window, cx);
+                    }))
+                    .cursor(gpui::CursorStyle::PointingHand)
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .child(thread_icon(text_secondary()));
+
+                content = content.child(
+                    reply_indicator.child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(text_secondary()))
+                            .child("Replied in thread"),
+                    ),
+                );
+            }
+
+        let is_highlighted = timeline.highlighted_message_id.as_ref() == Some(&row.message.id)
+            || timeline.editing_message_id.as_ref() == Some(&row.message.id);
+        if is_thread_reply_stub {
+            content = content.child(Self::render_send_state(
+                &row.message.id,
+                &row.message.send_state,
+                cx,
+            ));
+        } else {
+            content = content.child(Self::render_message(
+                &row.message,
+                is_hovered,
+                is_highlighted,
+                find_query,
+                &timeline.affinity_index,
+                timeline.current_user_id.as_ref(),
+                &timeline.emoji_index,
+                &timeline.emoji_source_index,
+                &timeline.reaction_index,
+                show_thread_reply_badge,
+                is_thread,
+                is_last_message,
+                hover_anchor_x,
+                hover_window_left,
+                hover_window_width,
+                row.message.edited.is_some(),
+                video_render_cache,
+                message_memo,
+                selectable_texts,
+                cx,
+            ));
+        }
+
+        let hover_msg_id = row.message.id.clone();
+        let row_wrapper = if show_header {
+            let hover_msg_id_for_anchor = row.message.id.clone();
             div()
+                .id(SharedString::from(format!(
+                    "timeline-row-{}",
+                    row.message.id.0
+                )))
+                .on_mouse_move(
+                    cx.listener(move |this, event: &gpui::MouseMoveEvent, _, cx| {
+                        let cursor_x: f32 = event.position.x.into();
+                        this.clear_reaction_hover_tooltip(cx);
+                        this.set_hovered_message_with_cursor_anchor(
+                            hover_msg_id_for_anchor.clone(),
+                            cursor_x,
+                            is_thread,
+                            cx,
+                        );
+                        cx.stop_propagation();
+                    }),
+                )
                 .w_full()
                 .min_w(px(0.))
+                .px_4()
                 .flex()
                 .gap_3()
                 .items_start()
                 .pt_0p5()
-                .child(div().flex_shrink_0().child(Avatar::render(
-                    &row.author.display_name,
-                    row.author.avatar_asset.as_deref(),
-                    32.,
-                    default_avatar_background(&row.author.display_name),
-                    text_primary(),
-                )))
+                .when(is_hovered && !is_highlighted, |d| {
+                    d.bg(tint(panel_alt_bg(), 0.25))
+                })
+                .child(
+                    div()
+                        .id(SharedString::from(format!(
+                            "timeline-author-avatar-{}",
+                            row.message.id.0
+                        )))
+                        .cursor(gpui::CursorStyle::PointingHand)
+                        .on_click(cx.listener({
+                            let author_user_id = author_user_id.clone();
+                            move |this, _, _, cx| {
+                                this.open_user_profile_card(author_user_id.clone(), cx);
+                            }
+                        }))
+                        .flex_shrink_0()
+                        .child(Avatar::render(
+                            &row.author.display_name,
+                            row.author.avatar_asset.as_deref(),
+                            32.,
+                            default_avatar_background(&row.author.display_name),
+                            text_primary(),
+                        )),
+                )
                 .child(content)
-                .into_any_element()
         } else {
+            let hover_msg_id_for_anchor = hover_msg_id;
             div()
+                .id(SharedString::from(format!(
+                    "timeline-row-{}",
+                    row.message.id.0
+                )))
+                .on_mouse_move(
+                    cx.listener(move |this, event: &gpui::MouseMoveEvent, _, cx| {
+                        let cursor_x: f32 = event.position.x.into();
+                        this.clear_reaction_hover_tooltip(cx);
+                        this.set_hovered_message_with_cursor_anchor(
+                            hover_msg_id_for_anchor.clone(),
+                            cursor_x,
+                            is_thread,
+                            cx,
+                        );
+                        cx.stop_propagation();
+                    }),
+                )
                 .w_full()
                 .min_w(px(0.))
+                .px_4()
                 .flex()
                 .gap_3()
                 .items_start()
+                .when(is_hovered && !is_highlighted, |d| {
+                    d.bg(tint(panel_alt_bg(), 0.25))
+                })
                 .child(div().w(px(32.)).flex_shrink_0())
                 .child(content)
-                .into_any_element()
+        };
+        row_wrapper.into_any_element()
+    }
+
+    fn author_name_color(affinity: Affinity, is_you: bool) -> u32 {
+        if is_you {
+            return text_primary();
         }
+        match affinity {
+            Affinity::None => text_primary(),
+            Affinity::Positive => affinity_positive(),
+            Affinity::Broken => affinity_broken(),
+        }
+    }
+
+    fn mention_colors_for_user(
+        affinity_index: &HashMap<UserId, Affinity>,
+        current_user_id: Option<&UserId>,
+        user_id: &UserId,
+    ) -> (u32, u32) {
+        super::mention_colors_for_user(affinity_index, current_user_id, user_id)
     }
 
     fn render_message(
         message: &crate::domain::message::MessageRecord,
+        is_hovered: bool,
         highlighted: bool,
         find_query: Option<&str>,
+        affinity_index: &HashMap<UserId, Affinity>,
+        current_user_id: Option<&UserId>,
         emoji_index: &HashMap<String, InlineEmojiRender>,
+        emoji_source_index: &HashMap<String, InlineEmojiRender>,
         reaction_index: &HashMap<crate::domain::ids::MessageId, Vec<MessageReactionRender>>,
         show_thread_reply_badge: bool,
+        _is_thread: bool,
+        is_last_message: bool,
+        hover_anchor_x: Option<f32>,
+        hover_window_left: Option<f32>,
+        hover_window_width: Option<f32>,
         show_edited_badge: bool,
         video_render_cache: &HashMap<String, Arc<RenderImage>>,
         message_memo: Option<&MessageRenderMemo>,
@@ -475,18 +747,12 @@ impl TimelineList {
                 .attachments
                 .iter()
                 .all(|attachment| attachment.kind == AttachmentKind::Image);
-        let message_id = message.id.clone();
-        let message_id_for_thread = message.id.clone();
-        let message_id_for_more = message.id.clone();
-
-        let group_name = SharedString::from(format!("msg-{}", message.id.0));
 
         div()
             .id(SharedString::from(format!(
                 "timeline-message-{}",
                 message.id.0
             )))
-            .group(group_name.clone())
             .w_full()
             .min_w(px(0.))
             .flex()
@@ -498,13 +764,28 @@ impl TimelineList {
             .pb_0p5()
             .relative()
             .child({
+                let message_id_for_bounds = message.id.clone();
+                let owner = cx.weak_entity();
+                div()
+                    .absolute()
+                    .inset_0()
+                    .child(HoveredMessageBoundsReporter {
+                        owner,
+                        message_id: message_id_for_bounds,
+                        is_thread: _is_thread,
+                    })
+            })
+            .child({
                 if image_attachment_message {
                     div().into_any_element()
                 } else {
                     Self::render_message_fragments(
                         message,
                         find_query,
+                        affinity_index,
+                        current_user_id,
                         emoji_index,
+                        emoji_source_index,
                         message_memo,
                         selectable_texts,
                         cx,
@@ -532,6 +813,11 @@ impl TimelineList {
                                 if attachment.kind == AttachmentKind::Image
                                     && let Some(media_source) = attachment_image_source(attachment)
                                 {
+                                    let (max_width, max_height) = if show_thread_reply_badge {
+                                        (360.0, 300.0)
+                                    } else {
+                                        (280.0, 240.0)
+                                    };
                                     let preview_width = attachment
                                         .preview
                                         .as_ref()
@@ -545,11 +831,13 @@ impl TimelineList {
                                     let (media_width, media_height) = Self::media_frame_size(
                                         preview_width,
                                         preview_height,
-                                        360.0,
-                                        300.0,
+                                        max_width,
+                                        max_height,
                                     );
                                     let lightbox_source = attachment_lightbox_source(attachment);
                                     let caption_text = Self::message_caption_text(message);
+                                    let lightbox_width = preview_width;
+                                    let lightbox_height = preview_height;
                                     return div()
                                         .id(SharedString::from(format!(
                                             "timeline-attachment-image-{}-{index}",
@@ -565,6 +853,8 @@ impl TimelineList {
                                                     this.open_image_lightbox(
                                                         lightbox_source.clone(),
                                                         caption_text.clone(),
+                                                        lightbox_width,
+                                                        lightbox_height,
                                                         cx,
                                                     );
                                                 }),
@@ -611,7 +901,10 @@ impl TimelineList {
                     container.child(Self::render_message_fragments(
                         message,
                         find_query,
+                        affinity_index,
+                        current_user_id,
                         emoji_index,
+                        emoji_source_index,
                         message_memo,
                         selectable_texts,
                         cx,
@@ -628,11 +921,12 @@ impl TimelineList {
                         .child("(edited)"),
                 )
             })
-            .when(
-                reaction_index
+            .child({
+                let has_reactions = reaction_index
                     .get(&message.id)
-                    .is_some_and(|reactions| !reactions.is_empty()),
-                |container| {
+                    .is_some_and(|reactions| !reactions.is_empty());
+
+                let reaction_chips: Vec<AnyElement> = if has_reactions {
                     let reactions: Cow<'_, [MessageReactionRender]> =
                         if let Some(memo) = message_memo {
                             Cow::Borrowed(&memo.sorted_reactions)
@@ -642,122 +936,320 @@ impl TimelineList {
                             reactions.sort_by(|left, right| left.emoji.cmp(&right.emoji));
                             Cow::Owned(reactions)
                         };
-                    container.child(
-                        div().flex().flex_wrap().gap_1().pt_1().children(
-                            reactions.iter().cloned().enumerate().map(
-                                |(reaction_index, reaction)| {
-                                    let alias =
-                                        reaction.emoji.trim_matches(':').to_ascii_lowercase();
-                                    let resolved = emoji_index.get(&alias);
-                                    let reaction_group = SharedString::from(format!(
-                                        "reaction-hover-{}-{}-{}",
-                                        message.id.0,
-                                        reaction_index,
-                                        normalize_emoji_alias(&reaction.emoji)
-                                    ));
-                                    let hover_text = reaction_hover_text(&reaction);
+                    reactions
+                        .iter()
+                        .cloned()
+                        .enumerate()
+                        .map(|(reaction_index, reaction)| {
+                            let message_id = message.id.clone();
+                            let reaction_emoji = reaction.emoji.clone();
+                            let alias = reaction.emoji.trim_matches(':').to_ascii_lowercase();
+                            let resolved = Self::resolved_emoji_render(
+                                &alias,
+                                reaction.source_ref.as_ref(),
+                                emoji_index,
+                                emoji_source_index,
+                            );
+                            let reaction_chip_id = SharedString::from(format!(
+                                "reaction-chip-{}-{}-{}",
+                                message.id.0,
+                                reaction_index,
+                                normalize_emoji_alias(&reaction.emoji)
+                            ));
+                            let hover_text = reaction_hover_text(&reaction);
 
-                                    let emoji_element: AnyElement = if let Some(render) = resolved {
-                                        if let Some(unicode) = &render.unicode {
-                                            div()
-                                                .text_sm()
-                                                .child(unicode.clone())
-                                                .into_any_element()
-                                        } else if let Some(asset_path) = &render.asset_path {
-                                            div()
-                                                .w(px(CUSTOM_EMOJI_REACTION_SIZE_PX))
-                                                .h(px(CUSTOM_EMOJI_REACTION_SIZE_PX))
-                                                .flex_shrink_0()
-                                                .rounded_sm()
-                                                .overflow_hidden()
-                                                .child(
-                                                    img(ImageSource::from(std::path::PathBuf::from(
-                                                        crate::views::normalize_local_source_path(
-                                                            asset_path,
-                                                        ),
-                                                    )))
-                                                        .w(px(CUSTOM_EMOJI_REACTION_SIZE_PX))
-                                                        .h(px(CUSTOM_EMOJI_REACTION_SIZE_PX))
-                                                        .object_fit(ObjectFit::Contain)
-                                                        .with_fallback({
-                                                            let alias = reaction.emoji.clone();
-                                                            move || {
-                                                                div()
-                                                                    .text_xs()
-                                                                    .child(alias.clone())
-                                                                    .into_any_element()
-                                                            }
-                                                        }),
-                                                )
-                                                .into_any_element()
-                                        } else {
-                                            div()
-                                                .text_xs()
-                                                .child(reaction.emoji.clone())
-                                                .into_any_element()
-                                        }
-                                    } else if let Some(standard) = standard_emoji_for_alias(&alias)
-                                    {
-                                        div()
-                                            .text_sm()
-                                            .child(standard.to_string())
-                                            .into_any_element()
-                                    } else {
-                                        div()
-                                            .text_xs()
-                                            .child(reaction.emoji.clone())
-                                            .into_any_element()
-                                    };
-
-                                    let chip = div()
-                                        .px_1p5()
-                                        .py_0p5()
-                                        .rounded_full()
-                                        .border_1()
-                                        .border_color(shell_border())
-                                        .flex()
-                                        .items_center()
-                                        .gap_1()
-                                        .child(emoji_element)
+                            let emoji_element: AnyElement = if let Some(render) = resolved {
+                                if let Some(unicode) = &render.unicode {
+                                    div().text_sm().child(unicode.clone()).into_any_element()
+                                } else if let Some(asset_path) = &render.asset_path {
+                                    div()
+                                        .w(px(CUSTOM_EMOJI_REACTION_SIZE_PX))
+                                        .h(px(CUSTOM_EMOJI_REACTION_SIZE_PX))
+                                        .flex_shrink_0()
+                                        .rounded_sm()
+                                        .overflow_hidden()
                                         .child(
-                                            div()
-                                                .text_xs()
-                                                .text_color(rgb(text_secondary()))
-                                                .child(format!("{}", reaction.count)),
+                                            img(ImageSource::from(std::path::PathBuf::from(
+                                                crate::views::normalize_local_source_path(
+                                                    asset_path,
+                                                ),
+                                            )))
+                                            .w(px(CUSTOM_EMOJI_REACTION_SIZE_PX))
+                                            .h(px(CUSTOM_EMOJI_REACTION_SIZE_PX))
+                                            .object_fit(ObjectFit::Contain)
+                                            .with_fallback({
+                                                let alias = reaction.emoji.clone();
+                                                move || {
+                                                    div()
+                                                        .text_xs()
+                                                        .child(alias.clone())
+                                                        .into_any_element()
+                                                }
+                                            }),
+                                        )
+                                        .into_any_element()
+                                } else {
+                                    div()
+                                        .text_xs()
+                                        .child(reaction.emoji.clone())
+                                        .into_any_element()
+                                }
+                            } else if let Some(standard) = standard_emoji_for_alias(&alias) {
+                                div()
+                                    .text_sm()
+                                    .child(standard.to_string())
+                                    .into_any_element()
+                            } else {
+                                div()
+                                    .text_xs()
+                                    .child(reaction.emoji.clone())
+                                    .into_any_element()
+                            };
+
+                            let chip = div()
+                                .px_1p5()
+                                .py_0p5()
+                                .rounded_full()
+                                .border_1()
+                                .border_color(if reaction.reacted_by_me {
+                                    tint(accent(), 1.0)
+                                } else {
+                                    shell_border()
+                                })
+                                .when(reaction.reacted_by_me, |chip| {
+                                    chip.bg(tint(accent_soft(), 0.35))
+                                })
+                                .flex()
+                                .items_center()
+                                .gap_1()
+                                .child(emoji_element)
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(rgb(text_secondary()))
+                                        .child(format!("{}", reaction.count)),
+                                );
+                            let chip_with_hover = div()
+                                .id(reaction_chip_id)
+                                .cursor(gpui::CursorStyle::PointingHand)
+                                .on_mouse_move(cx.listener({
+                                    let message_id = message_id.clone();
+                                    let hover_text = hover_text.clone();
+                                    move |this, event: &gpui::MouseMoveEvent, _, cx| {
+                                        let cursor_x: f32 = event.position.x.into();
+                                        let cursor_y: f32 = event.position.y.into();
+                                        this.set_hovered_message_with_cursor_anchor(
+                                            message_id.clone(),
+                                            cursor_x,
+                                            _is_thread,
+                                            cx,
                                         );
-                                    let chip_with_hover = div()
-                                        .relative()
-                                        .group(reaction_group.clone())
-                                        .child(chip)
-                                        .when(hover_text.is_some(), |container| {
-                                            let hover_text = hover_text.clone().unwrap_or_default();
-                                            let hover_width = reaction_hover_width_px(&hover_text);
-                                            container.child(
-                                                div()
-                                                    .absolute()
-                                                    .left_0()
-                                                    .top(px(-30.))
-                                                    .opacity(0.)
-                                                    .group_hover(reaction_group, |s| s.opacity(1.))
-                                                    .w(px(hover_width))
-                                                    .rounded_md()
-                                                    .bg(glass_surface_dark())
-                                                    .border_1()
-                                                    .border_color(shell_border())
-                                                    .px_2()
-                                                    .py_1()
-                                                    .text_xs()
-                                                    .text_color(rgb(text_primary()))
-                                                    .child(hover_text),
-                                            )
-                                        });
-                                    chip_with_hover.into_any_element()
-                                },
-                            ),
-                        ),
+                                        if let Some(hover_text) = hover_text.as_ref() {
+                                            this.show_reaction_hover_tooltip(
+                                                hover_text.clone(),
+                                                cursor_x,
+                                                cursor_y,
+                                                cx,
+                                            );
+                                        } else {
+                                            this.clear_reaction_hover_tooltip(cx);
+                                        }
+                                        cx.stop_propagation();
+                                    }
+                                }))
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.quick_react(
+                                        message_id.clone(),
+                                        reaction_emoji.clone(),
+                                        cx,
+                                    );
+                                }))
+                                .child(chip);
+                            chip_with_hover.into_any_element()
+                        })
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+
+                if has_reactions {
+                    div()
+                        .flex()
+                        .flex_wrap()
+                        .items_center()
+                        .gap_1()
+                        .pt_1()
+                        .children(reaction_chips)
+                        .into_any_element()
+                } else {
+                    div().into_any_element()
+                }
+            })
+            .child({
+                let quick_react_buttons: Vec<AnyElement> = QUICK_REACT_EMOJI
+                    .iter()
+                    .map(|(alias, unicode)| {
+                        let msg_id = message.id.clone();
+                        let unicode_str = unicode.to_string();
+                        div()
+                            .id(SharedString::from(format!(
+                                "quick-react-{alias}-{}",
+                                message.id.0
+                            )))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.quick_react(msg_id.clone(), unicode_str.clone(), cx);
+                            }))
+                            .w(px(26.))
+                            .h(px(26.))
+                            .rounded_md()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .hover(|s| s.bg(subtle_surface()))
+                            .cursor(gpui::CursorStyle::PointingHand)
+                            .text_sm()
+                            .child(unicode.to_string())
+                            .into_any_element()
+                    })
+                    .collect();
+
+                let message_id_for_picker = message.id.clone();
+                let message_id_for_thread_btn = message.id.clone();
+                let message_id_for_copy_link_btn = message.id.clone();
+                let message_id_for_delete_btn = message.id.clone();
+                let message_id_for_hover = message.id.clone();
+                let is_own_message = current_user_id
+                    .is_some_and(|id| id.0.eq_ignore_ascii_case(&message.author_id.0));
+                let has_reactions = reaction_index
+                    .get(&message.id)
+                    .is_some_and(|reactions| !reactions.is_empty());
+                let has_thread_badge = show_thread_reply_badge && message.thread_reply_count > 0;
+                let has_blocking_inline_actions = has_reactions || has_thread_badge;
+
+                const TOOLBAR_W: f32 = 260.0;
+                const BLOCKING_LEFT: f32 = 260.0;
+
+                let inline_toolbar = div()
+                    .flex()
+                    .items_center()
+                    .rounded_md()
+                    .bg(rgb(panel_bg()))
+                    .border_1()
+                    .border_color(shell_border())
+                    .px_0p5()
+                    .py_0p5()
+                    .gap_0p5()
+                    .children(quick_react_buttons)
+                    .child(Self::toolbar_icon_button(
+                        "message-react-more",
+                        &message.id.0,
+                        plus_icon(text_secondary()),
+                        cx.listener(move |this, _, _, cx| {
+                            this.react_to_message(message_id_for_picker.clone(), cx);
+                        }),
+                    ))
+                    .child(
+                        div()
+                            .w(px(1.))
+                            .h(px(16.))
+                            .bg(shell_border())
+                            .flex_shrink_0(),
                     )
-                },
-            )
+                    .child(Self::toolbar_icon_button(
+                        "message-thread",
+                        &message.id.0,
+                        thread_icon(text_secondary()),
+                        cx.listener(move |this, _, window, cx| {
+                            this.open_thread(message_id_for_thread_btn.clone(), window, cx);
+                        }),
+                    ))
+                    .child(Self::toolbar_icon_button(
+                        "message-copy-link",
+                        &message.id.0,
+                        link_icon(text_secondary()),
+                        cx.listener(move |this, _, _, cx| {
+                            this.copy_message_link(message_id_for_copy_link_btn.clone(), cx);
+                        }),
+                    ))
+                    .when(is_own_message, |toolbar| {
+                        toolbar.child(Self::toolbar_icon_button(
+                            "message-delete",
+                            &message.id.0,
+                            close_icon(danger()),
+                            cx.listener(move |this, _, _, cx| {
+                                this.delete_message(message_id_for_delete_btn.clone(), cx);
+                            }),
+                        ))
+                    });
+
+                let cursor_left = if has_blocking_inline_actions {
+                    None
+                } else {
+                    hover_anchor_x
+                        .zip(hover_window_left)
+                        .zip(hover_window_width)
+                        .map(|((anchor_x, window_left), window_width)| {
+                            let local_x = anchor_x - window_left;
+                            let mut left = local_x - (TOOLBAR_W * 0.5);
+                            if window_width.is_finite() && window_width > 0.0 {
+                                let max_left = (window_width - TOOLBAR_W).max(0.0);
+                                if left < 0.0 {
+                                    left = 0.0;
+                                } else if left > max_left {
+                                    left = max_left;
+                                }
+                            } else if left < 0.0 {
+                                left = 0.0;
+                            }
+                            left
+                        })
+                };
+
+                let blocking_left = hover_window_width
+                    .filter(|w| w.is_finite() && *w > 0.0)
+                    .map(|window_width| {
+                        let max_left = (window_width - TOOLBAR_W).max(0.0);
+                        BLOCKING_LEFT.min(max_left)
+                    })
+                    .unwrap_or(BLOCKING_LEFT);
+
+                let toolbar_wrapper = div()
+                    .absolute()
+                    // If the row already has clickable inline actions (reactions or thread badge),
+                    // keep the picker at a fixed left offset so we don't cover them.
+                    .when(has_blocking_inline_actions, |d| d.left(px(blocking_left)))
+                    // Otherwise, place it near the cursor when we have enough geometry.
+                    .when_some(cursor_left, |d, left| d.left(px(left)))
+                    // If we don't yet have enough geometry, keep it hidden (avoids visible "jump").
+                    .when(!has_blocking_inline_actions && cursor_left.is_none(), |d| {
+                        d.right_0().opacity(0.)
+                    })
+                    .block_mouse_except_scroll()
+                    .on_mouse_move(
+                        cx.listener(move |this, event: &gpui::MouseMoveEvent, _, cx| {
+                            this.clear_reaction_hover_tooltip(cx);
+                            let cursor_x: f32 = event.position.x.into();
+                            this.set_hovered_message_with_cursor_anchor(
+                                message_id_for_hover.clone(),
+                                cursor_x,
+                                _is_thread,
+                                cx,
+                            );
+                            cx.stop_propagation();
+                        }),
+                    )
+                    .when(!is_hovered, |d| d.opacity(0.))
+                    .child(inline_toolbar);
+                if is_last_message {
+                    deferred(toolbar_wrapper.top(px(-14.)))
+                        .priority(10)
+                        .into_any_element()
+                } else {
+                    deferred(toolbar_wrapper.bottom(px(-14.)))
+                        .priority(10)
+                        .into_any_element()
+                }
+            })
             .when(
                 show_thread_reply_badge && message.thread_reply_count > 0,
                 |container| {
@@ -771,65 +1263,22 @@ impl TimelineList {
                             .on_click(cx.listener(move |this, _, window, cx| {
                                 this.open_thread(thread_root_id.clone(), window, cx);
                             }))
+                            .cursor(gpui::CursorStyle::PointingHand)
                             .text_xs()
                             .text_color(rgb(accent()))
-                            .child(format!(
-                                "{} {}",
-                                message.thread_reply_count,
-                                if message.thread_reply_count == 1 {
-                                    "reply"
-                                } else {
-                                    "replies"
-                                }
-                            )),
+                            .flex()
+                            .items_center()
+                            .gap_1()
+                            .child(thread_icon(accent()))
+                            .child("View thread"),
                     )
                 },
             )
-            .child(Self::render_send_state(&message.send_state))
-            .child(
-                div()
-                    .absolute()
-                    .right_0()
-                    .top(px(-4.))
-                    .opacity(0.)
-                    .group_hover(group_name, |s| s.opacity(1.))
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .rounded_md()
-                            .bg(glass_surface_dark())
-                            .border_1()
-                            .border_color(shell_border())
-                            .px_0p5()
-                            .py_0p5()
-                            .gap_0p5()
-                            .child(Self::toolbar_icon_button(
-                                "message-react",
-                                &message.id.0,
-                                emoji_icon(text_secondary()),
-                                cx.listener(move |this, _, _, cx| {
-                                    this.react_to_message(message_id.clone(), cx);
-                                }),
-                            ))
-                            .child(Self::toolbar_icon_button(
-                                "message-thread",
-                                &message.id.0,
-                                thread_icon(text_secondary()),
-                                cx.listener(move |this, _, window, cx| {
-                                    this.open_thread(message_id_for_thread.clone(), window, cx);
-                                }),
-                            ))
-                            .child(Self::toolbar_icon_button(
-                                "message-more",
-                                &message.id.0,
-                                more_icon(text_secondary()),
-                                cx.listener(move |this, _, _, cx| {
-                                    this.open_message_context_menu(message_id_for_more.clone(), cx);
-                                }),
-                            )),
-                    ),
-            )
+            .child(Self::render_send_state(
+                &message.id,
+                &message.send_state,
+                cx,
+            ))
             .into_any_element()
     }
 
@@ -842,7 +1291,7 @@ impl TimelineList {
                 | MessageFragment::Code(text)
                 | MessageFragment::Quote(text) => text.clone(),
                 MessageFragment::InlineCode(text) => format!("`{text}`"),
-                MessageFragment::Emoji { alias } => format!(":{alias}:"),
+                MessageFragment::Emoji { alias, .. } => format!(":{alias}:"),
                 MessageFragment::Mention(user_id) => format!("@{}", user_id.0),
                 MessageFragment::ChannelMention { name } => format!("#{name}"),
                 MessageFragment::BroadcastMention(BroadcastKind::Here) => "@here".to_string(),
@@ -858,7 +1307,10 @@ impl TimelineList {
     fn render_message_fragments(
         message: &crate::domain::message::MessageRecord,
         find_query: Option<&str>,
+        affinity_index: &HashMap<UserId, Affinity>,
+        current_user_id: Option<&UserId>,
         emoji_index: &HashMap<String, InlineEmojiRender>,
+        emoji_source_index: &HashMap<String, InlineEmojiRender>,
         message_memo: Option<&MessageRenderMemo>,
         selectable_texts: &mut HashMap<String, Entity<SelectableText>>,
         cx: &mut Context<AppWindow>,
@@ -885,7 +1337,10 @@ impl TimelineList {
                 format!("timeline-{}-inline", message.id.0),
                 &message.fragments,
                 message_memo,
+                affinity_index,
+                current_user_id,
                 emoji_index,
+                emoji_source_index,
                 emoji_only,
                 find_query,
                 selectable_texts,
@@ -921,7 +1376,10 @@ impl TimelineList {
                     key,
                     &inline_group,
                     None,
+                    affinity_index,
+                    current_user_id,
                     emoji_index,
+                    emoji_source_index,
                     emoji_only,
                     find_query,
                     selectable_texts,
@@ -939,7 +1397,10 @@ impl TimelineList {
                 index,
                 fragment,
                 false,
+                affinity_index,
+                current_user_id,
                 emoji_index,
+                emoji_source_index,
                 emoji_only,
                 find_query,
                 precomputed_segments,
@@ -954,7 +1415,10 @@ impl TimelineList {
                 key,
                 &inline_group,
                 None,
+                affinity_index,
+                current_user_id,
                 emoji_index,
+                emoji_source_index,
                 emoji_only,
                 find_query,
                 selectable_texts,
@@ -1168,7 +1632,10 @@ impl TimelineList {
         render_key: String,
         fragments: &[MessageFragment],
         message_memo: Option<&MessageRenderMemo>,
+        affinity_index: &HashMap<UserId, Affinity>,
+        current_user_id: Option<&UserId>,
         emoji_index: &HashMap<String, InlineEmojiRender>,
+        emoji_source_index: &HashMap<String, InlineEmojiRender>,
         emoji_only: bool,
         find_query: Option<&str>,
         selectable_texts: &mut HashMap<String, Entity<SelectableText>>,
@@ -1216,9 +1683,13 @@ impl TimelineList {
                 MessageFragment::InlineCode(code) => {
                     Self::push_inline_code_span(&mut combined, &mut styled_ranges, code);
                 }
-                MessageFragment::Emoji { alias } => {
-                    let key = alias.to_ascii_lowercase();
-                    if let Some(render) = emoji_index.get(&key) {
+                MessageFragment::Emoji { alias, source_ref } => {
+                    if let Some(render) = Self::resolved_emoji_render(
+                        alias,
+                        source_ref.as_ref(),
+                        emoji_index,
+                        emoji_source_index,
+                    ) {
                         if let Some(unicode) = render.unicode.as_ref() {
                             combined.push_str(unicode);
                             continue;
@@ -1234,17 +1705,29 @@ impl TimelineList {
                             continue;
                         }
                     }
-                    combined.push_str(&Self::inline_emoji_text(alias, emoji_index));
+                    combined.push_str(&Self::inline_emoji_text(
+                        alias,
+                        source_ref.as_ref(),
+                        emoji_index,
+                        emoji_source_index,
+                    ));
                 }
                 MessageFragment::Mention(user_id) => {
                     let label = format!("@{}", user_id.0);
+                    let start = combined.len();
+                    let (foreground, background) =
+                        Self::mention_colors_for_user(affinity_index, current_user_id, user_id);
                     Self::push_styled_span(
                         &mut combined,
                         &mut styled_ranges,
                         &label,
-                        mention(),
-                        mention_soft(),
+                        foreground,
+                        background,
                     );
+                    link_ranges.push(LinkRange {
+                        byte_range: start..combined.len(),
+                        url: format!("kbui-mention:{}", user_id.0),
+                    });
                 }
                 MessageFragment::ChannelMention { name } => {
                     let label = format!("#{name}");
@@ -1344,7 +1827,10 @@ impl TimelineList {
         message_key: &str,
         fragments: &[MessageFragment],
         message_memo: Option<&MessageRenderMemo>,
+        affinity_index: &HashMap<UserId, Affinity>,
+        current_user_id: Option<&UserId>,
         emoji_index: &HashMap<String, InlineEmojiRender>,
+        emoji_source_index: &HashMap<String, InlineEmojiRender>,
         emoji_only: bool,
         selectable_texts: &mut HashMap<String, Entity<SelectableText>>,
         cx: &mut Context<AppWindow>,
@@ -1355,13 +1841,17 @@ impl TimelineList {
         let mut asset_emojis: Vec<AnyElement> = Vec::new();
 
         for (index, fragment) in fragments.iter().enumerate() {
-            if Self::fragment_requires_asset_emoji_box(fragment, emoji_index) {
-                let MessageFragment::Emoji { alias } = fragment else {
+            if Self::fragment_requires_asset_emoji_box(fragment, emoji_index, emoji_source_index) {
+                let MessageFragment::Emoji { alias, source_ref } = fragment else {
                     continue;
                 };
-                let key = alias.to_ascii_lowercase();
-                if let Some(render) = emoji_index.get(&key) {
-                    if let Some(asset_path) = render.asset_path.as_ref() {
+                if let Some(render) = Self::resolved_emoji_render(
+                    alias,
+                    source_ref.as_ref(),
+                    emoji_index,
+                    emoji_source_index,
+                )
+                    && let Some(asset_path) = render.asset_path.as_ref() {
                         let size = custom_emoji_size_px(emoji_only);
                         asset_emojis.push(
                             div()
@@ -1390,7 +1880,6 @@ impl TimelineList {
                                 .into_any_element(),
                         );
                     }
-                }
                 continue;
             }
 
@@ -1429,18 +1918,30 @@ impl TimelineList {
                 MessageFragment::InlineCode(code) => {
                     Self::push_inline_code_span(&mut combined, &mut styled_ranges, code);
                 }
-                MessageFragment::Emoji { alias } => {
-                    combined.push_str(&Self::inline_emoji_text(alias, emoji_index));
+                MessageFragment::Emoji { alias, source_ref } => {
+                    combined.push_str(&Self::inline_emoji_text(
+                        alias,
+                        source_ref.as_ref(),
+                        emoji_index,
+                        emoji_source_index,
+                    ));
                 }
                 MessageFragment::Mention(user_id) => {
                     let label = format!("@{}", user_id.0);
+                    let start = combined.len();
+                    let (foreground, background) =
+                        Self::mention_colors_for_user(affinity_index, current_user_id, user_id);
                     Self::push_styled_span(
                         &mut combined,
                         &mut styled_ranges,
                         &label,
-                        mention(),
-                        mention_soft(),
+                        foreground,
+                        background,
                     );
+                    link_ranges.push(LinkRange {
+                        byte_range: start..combined.len(),
+                        url: format!("kbui-mention:{}", user_id.0),
+                    });
                 }
                 MessageFragment::ChannelMention { name } => {
                     let label = format!("#{name}");
@@ -1560,7 +2061,10 @@ impl TimelineList {
         index: usize,
         fragment: &MessageFragment,
         compact_inline: bool,
+        affinity_index: &HashMap<UserId, Affinity>,
+        current_user_id: Option<&UserId>,
         emoji_index: &HashMap<String, InlineEmojiRender>,
+        emoji_source_index: &HashMap<String, InlineEmojiRender>,
         emoji_only: bool,
         find_query: Option<&str>,
         precomputed_segments: Option<&[InlineTextSegment]>,
@@ -1689,9 +2193,13 @@ impl TimelineList {
                     .child(selectable)
                     .into_any_element()
             }
-            MessageFragment::Emoji { alias } => {
-                let key = alias.to_ascii_lowercase();
-                if let Some(render) = emoji_index.get(&key) {
+            MessageFragment::Emoji { alias, source_ref } => {
+                if let Some(render) = Self::resolved_emoji_render(
+                    alias,
+                    source_ref.as_ref(),
+                    emoji_index,
+                    emoji_source_index,
+                ) {
                     if let Some(unicode) = render.unicode.as_ref() {
                         return div()
                             .text_color(rgb(text_primary()))
@@ -1763,16 +2271,22 @@ impl TimelineList {
                     .child(format!(":{alias}:"))
                     .into_any_element()
             }
-            MessageFragment::Mention(user_id) => Self::render_styled_fragment_text(
-                message_key,
-                index,
-                format!("@{}", user_id.0),
-                mention(),
-                mention_soft(),
-                compact_inline,
-                selectable_texts,
-                cx,
-            ),
+            MessageFragment::Mention(user_id) => {
+                let label = format!("@{}", user_id.0);
+                let (foreground, background) =
+                    Self::mention_colors_for_user(affinity_index, current_user_id, user_id);
+                Self::render_linked_styled_fragment_text(
+                    message_key,
+                    index,
+                    &label,
+                    format!("kbui-mention:{}", user_id.0),
+                    foreground,
+                    background,
+                    compact_inline,
+                    selectable_texts,
+                    cx,
+                )
+            }
             MessageFragment::ChannelMention { name } => {
                 let label = format!("#{name}");
                 Self::render_linked_styled_fragment_text(
@@ -1852,7 +2366,7 @@ impl TimelineList {
                 .w_full()
                 .min_w(px(0.))
                 .rounded_md()
-                .bg(subtle_surface().opacity(0.5))
+                .bg(rgb(mention_soft()))
                 .px_2()
                 .py_1()
                 .text_sm()
@@ -1895,11 +2409,47 @@ impl TimelineList {
         }
     }
 
-    fn render_send_state(send_state: &MessageSendState) -> AnyElement {
+    fn render_send_state(
+        message_id: &crate::domain::ids::MessageId,
+        send_state: &MessageSendState,
+        cx: &mut Context<AppWindow>,
+    ) -> AnyElement {
         match send_state {
             MessageSendState::Sent => div().into_any_element(),
-            MessageSendState::Pending => badge("Sending", accent_soft(), accent()),
-            MessageSendState::Failed => badge("Failed", danger_soft(), danger()),
+            MessageSendState::Pending => div()
+                .text_xs()
+                .italic()
+                .text_color(rgb(text_secondary()))
+                .child("Sending…")
+                .into_any_element(),
+            MessageSendState::Failed => {
+                let retry_message_id = message_id.clone();
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(danger()))
+                            .child("Failed to send"),
+                    )
+                    .child(
+                        div()
+                            .id(SharedString::from(format!(
+                                "timeline-message-retry-{}",
+                                message_id.0
+                            )))
+                            .text_xs()
+                            .text_color(rgb(accent()))
+                            .cursor(gpui::CursorStyle::PointingHand)
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.retry_failed_message_send(retry_message_id.clone(), cx);
+                            }))
+                            .child("· Retry"),
+                    )
+                    .into_any_element()
+            }
         }
     }
 
@@ -2116,11 +2666,30 @@ impl TimelineList {
         }
     }
 
-    fn inline_emoji_text(alias: &str, emoji_index: &HashMap<String, InlineEmojiRender>) -> String {
+    fn resolved_emoji_render<'a>(
+        alias: &str,
+        source_ref: Option<&crate::domain::message::EmojiSourceRef>,
+        emoji_index: &'a HashMap<String, InlineEmojiRender>,
+        emoji_source_index: &'a HashMap<String, InlineEmojiRender>,
+    ) -> Option<&'a InlineEmojiRender> {
+        if let Some(source_ref) = source_ref
+            && let Some(render) = emoji_source_index.get(&source_ref.cache_key())
+        {
+            return Some(render);
+        }
         let key = alias.to_ascii_lowercase();
-        if let Some(unicode) = emoji_index
-            .get(&key)
-            .and_then(|render| render.unicode.clone())
+        emoji_index.get(&key)
+    }
+
+    fn inline_emoji_text(
+        alias: &str,
+        source_ref: Option<&crate::domain::message::EmojiSourceRef>,
+        emoji_index: &HashMap<String, InlineEmojiRender>,
+        emoji_source_index: &HashMap<String, InlineEmojiRender>,
+    ) -> String {
+        if let Some(unicode) =
+            Self::resolved_emoji_render(alias, source_ref, emoji_index, emoji_source_index)
+                .and_then(|render| render.unicode.clone())
         {
             return unicode;
         }
@@ -2133,13 +2702,12 @@ impl TimelineList {
     fn fragment_requires_asset_emoji_box(
         fragment: &MessageFragment,
         emoji_index: &HashMap<String, InlineEmojiRender>,
+        emoji_source_index: &HashMap<String, InlineEmojiRender>,
     ) -> bool {
-        let MessageFragment::Emoji { alias } = fragment else {
+        let MessageFragment::Emoji { alias, source_ref } = fragment else {
             return false;
         };
-        let key = alias.to_ascii_lowercase();
-        emoji_index
-            .get(&key)
+        Self::resolved_emoji_render(alias, source_ref.as_ref(), emoji_index, emoji_source_index)
             .map(|render| render.unicode.is_none() && render.asset_path.is_some())
             .unwrap_or(false)
     }
@@ -2281,13 +2849,6 @@ fn reaction_hover_text(reaction: &MessageReactionRender) -> Option<String> {
     Some(labels.join(", "))
 }
 
-fn reaction_hover_width_px(text: &str) -> f32 {
-    // Approximate content-based width so the hover grows with text
-    // without becoming unreasonably wide on very long lists.
-    let chars = text.chars().count().clamp(20, 96);
-    (chars as f32 * 7.2 + 18.0).clamp(190.0, 720.0)
-}
-
 fn author_role_crown_badge(_role: TeamAuthorRole) -> AnyElement {
     div()
         .relative()
@@ -2410,6 +2971,7 @@ mod tests {
     fn reaction_hover_text_includes_display_names_and_usernames() {
         let text = reaction_hover_text(&MessageReactionRender {
             emoji: ":thumbsup:".to_string(),
+            source_ref: None,
             count: 2,
             actors: vec![
                 crate::models::timeline_model::ReactionActorRender {
@@ -2421,14 +2983,51 @@ mod tests {
                     display_name: "bob".to_string(),
                 },
             ],
+            reacted_by_me: false,
         });
         assert_eq!(text, Some("Alice A (@alice), bob".to_string()));
+    }
+
+    #[test]
+    fn inline_emoji_prefers_source_ref_render_over_alias_index() {
+        let source_ref = crate::domain::message::EmojiSourceRef {
+            backend_id: crate::domain::backend::BackendId::new("keybase"),
+            ref_key: "emoji:conv=abcd:msg=42".to_string(),
+        };
+        let mut emoji_index = HashMap::new();
+        emoji_index.insert(
+            "nice".to_string(),
+            InlineEmojiRender {
+                alias: "nice".to_string(),
+                unicode: Some("🙂".to_string()),
+                asset_path: None,
+            },
+        );
+        let mut emoji_source_index = HashMap::new();
+        emoji_source_index.insert(
+            source_ref.cache_key(),
+            InlineEmojiRender {
+                alias: "nice".to_string(),
+                unicode: Some("😎".to_string()),
+                asset_path: None,
+            },
+        );
+
+        let rendered = TimelineList::inline_emoji_text(
+            "nice",
+            Some(&source_ref),
+            &emoji_index,
+            &emoji_source_index,
+        );
+
+        assert_eq!(rendered, "😎");
     }
 
     #[test]
     fn message_is_emoji_only_requires_no_attachments() {
         let fragments = vec![MessageFragment::Emoji {
             alias: "sbx".to_string(),
+            source_ref: None,
         }];
         assert!(message_is_emoji_only(&fragments, false));
         assert!(!message_is_emoji_only(&fragments, true));

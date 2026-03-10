@@ -5,10 +5,27 @@ use gpui::{
     UTF16Selection, UnderlineStyle, Window, WrappedLine, actions, div, fill, point, prelude::*, px,
     relative, rgb, rgba, size,
 };
-use std::ops::Range;
+use std::{ops::Range, sync::OnceLock, time::Instant};
 use unicode_segmentation::UnicodeSegmentation;
 
 use crate::views::{accent, selection};
+
+const TEXT_FIELD_SLOW_PATH_MS: u128 = 2;
+
+fn text_field_profile_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("KBUI_INPUT_PROFILE")
+            .ok()
+            .map(|raw| {
+                matches!(
+                    raw.trim().to_ascii_lowercase().as_str(),
+                    "1" | "true" | "yes" | "on"
+                )
+            })
+            .unwrap_or(false)
+    })
+}
 
 actions!(
     text_field,
@@ -21,6 +38,8 @@ actions!(
         Down,
         SelectLeft,
         SelectRight,
+        SelectUp,
+        SelectDown,
         SelectAll,
         Home,
         End,
@@ -37,17 +56,19 @@ pub enum TextFieldKind {
     SingleLine,
     SingleLineWithContext { key_context: &'static str },
     Multiline { line_count: usize },
+    AutoGrow { max_lines: usize },
 }
 
 impl TextFieldKind {
     fn is_multiline(self) -> bool {
-        matches!(self, Self::Multiline { .. })
+        matches!(self, Self::Multiline { .. } | Self::AutoGrow { .. })
     }
 
     fn preferred_height(self, line_height: Pixels) -> Pixels {
         match self {
             Self::SingleLine | Self::SingleLineWithContext { .. } => line_height,
             Self::Multiline { line_count } => line_height * line_count as f32,
+            Self::AutoGrow { .. } => line_height,
         }
     }
 
@@ -55,7 +76,7 @@ impl TextFieldKind {
         match self {
             Self::SingleLine => "TextField",
             Self::SingleLineWithContext { key_context } => key_context,
-            Self::Multiline { .. } => "MultilineTextField",
+            Self::Multiline { .. } | Self::AutoGrow { .. } => "MultilineTextField",
         }
     }
 }
@@ -72,6 +93,8 @@ pub struct TextField {
     is_selecting: bool,
     field_kind: TextFieldKind,
     scroll_y: Pixels,
+    pub up_at_top_triggered: bool,
+    last_content_height: Pixels,
 }
 
 impl TextField {
@@ -118,6 +141,22 @@ impl TextField {
         )
     }
 
+    pub fn new_auto_grow(
+        focus_handle: FocusHandle,
+        placeholder: impl Into<String>,
+        content: impl Into<String>,
+        max_lines: usize,
+    ) -> Self {
+        Self::with_kind(
+            focus_handle,
+            placeholder,
+            content,
+            TextFieldKind::AutoGrow {
+                max_lines: max_lines.max(1),
+            },
+        )
+    }
+
     fn with_kind(
         focus_handle: FocusHandle,
         placeholder: impl Into<String>,
@@ -139,6 +178,8 @@ impl TextField {
             is_selecting: false,
             field_kind,
             scroll_y: px(0.),
+            up_at_top_triggered: false,
+            last_content_height: px(0.),
         }
     }
 
@@ -208,7 +249,17 @@ impl TextField {
     }
 
     fn up(&mut self, _: &Up, _: &mut Window, cx: &mut Context<Self>) {
+        if self.content.trim().is_empty() {
+            self.up_at_top_triggered = true;
+            cx.notify();
+            return;
+        }
+        let before = self.cursor_offset();
         self.move_vertical(-1.0, cx);
+        if self.cursor_offset() == before {
+            self.up_at_top_triggered = true;
+            cx.notify();
+        }
     }
 
     fn down(&mut self, _: &Down, _: &mut Window, cx: &mut Context<Self>) {
@@ -221,6 +272,14 @@ impl TextField {
 
     fn select_right(&mut self, _: &SelectRight, _: &mut Window, cx: &mut Context<Self>) {
         self.select_to(self.next_boundary(self.cursor_offset()), cx);
+    }
+
+    fn select_up(&mut self, _: &SelectUp, _: &mut Window, cx: &mut Context<Self>) {
+        self.select_vertical(-1.0, cx);
+    }
+
+    fn select_down(&mut self, _: &SelectDown, _: &mut Window, cx: &mut Context<Self>) {
+        self.select_vertical(1.0, cx);
     }
 
     fn select_all(&mut self, _: &SelectAll, _: &mut Window, cx: &mut Context<Self>) {
@@ -264,16 +323,31 @@ impl TextField {
     ) {
         self.is_selecting = true;
         window.focus(&self.focus_handle(cx));
+        let offset = self.index_for_mouse_position(event.position);
+
+        if !event.modifiers.shift {
+            if event.click_count >= 3 {
+                self.select_line_at(offset, cx);
+                return;
+            }
+            if event.click_count == 2 {
+                self.select_word_at(offset, cx);
+                return;
+            }
+        }
 
         if event.modifiers.shift {
-            self.select_to(self.index_for_mouse_position(event.position), cx);
+            self.select_to(offset, cx);
         } else {
-            self.move_to(self.index_for_mouse_position(event.position), cx);
+            self.move_to(offset, cx);
         }
     }
 
-    fn on_mouse_up(&mut self, _: &MouseUpEvent, _: &mut Window, _: &mut Context<Self>) {
-        self.is_selecting = false;
+    fn on_mouse_up(&mut self, event: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
+        if self.is_selecting {
+            self.select_to(self.index_for_mouse_position(event.position), cx);
+            self.is_selecting = false;
+        }
     }
 
     fn on_mouse_move(&mut self, event: &MouseMoveEvent, _: &mut Window, cx: &mut Context<Self>) {
@@ -326,22 +400,28 @@ impl TextField {
     }
 
     fn move_vertical(&mut self, direction: f32, cx: &mut Context<Self>) {
-        if !self.is_multiline() {
-            return;
+        if let Some(next) = self.vertical_target_offset(direction) {
+            self.move_to(next, cx);
         }
+    }
 
-        let Some(layout) = self.last_layout.as_ref() else {
-            return;
-        };
+    fn select_vertical(&mut self, direction: f32, cx: &mut Context<Self>) {
+        if let Some(next) = self.vertical_target_offset(direction) {
+            self.select_to(next, cx);
+        }
+    }
+
+    fn vertical_target_offset(&self, direction: f32) -> Option<usize> {
+        if !self.is_multiline() {
+            return None;
+        }
+        let layout = self.last_layout.as_ref()?;
         let cursor = self.cursor_offset();
-        let Some(position) = layout.position_for_index(cursor) else {
-            return;
-        };
-        let next = layout.closest_index_for_position(point(
+        let position = layout.position_for_index(cursor)?;
+        Some(layout.closest_index_for_position(point(
             position.x,
             (position.y + layout.line_height * direction).max(px(0.)),
-        ));
-        self.move_to(next, cx);
+        )))
     }
 
     fn cursor_offset(&self) -> usize {
@@ -362,11 +442,11 @@ impl TextField {
             return 0;
         };
 
-        let Some(local_position) = bounds.localize(&position) else {
-            return 0;
-        };
-
-        layout.closest_index_for_position(point(local_position.x, local_position.y + self.scroll_y))
+        let local_position = point(
+            position.x - bounds.origin.x,
+            position.y - bounds.origin.y + self.scroll_y,
+        );
+        layout.closest_index_for_position(local_position)
     }
 
     fn select_to(&mut self, offset: usize, cx: &mut Context<Self>) {
@@ -381,6 +461,23 @@ impl TextField {
             self.selected_range = self.selected_range.end..self.selected_range.start;
         }
 
+        cx.notify();
+    }
+
+    fn select_word_at(&mut self, offset: usize, cx: &mut Context<Self>) {
+        let Some(range) = word_range_at_offset(&self.content, offset) else {
+            self.move_to(offset, cx);
+            return;
+        };
+        self.selected_range = range;
+        self.selection_reversed = false;
+        cx.notify();
+    }
+
+    fn select_line_at(&mut self, offset: usize, cx: &mut Context<Self>) {
+        let range = line_range_at_offset(&self.content, offset);
+        self.selected_range = range;
+        self.selection_reversed = false;
         cx.notify();
     }
 
@@ -484,6 +581,8 @@ impl EntityInputHandler for TextField {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let profile_enabled = text_field_profile_enabled();
+        let started_at = profile_enabled.then(Instant::now);
         let replacement = if self.is_multiline() {
             new_text.to_string()
         } else {
@@ -503,6 +602,20 @@ impl EntityInputHandler for TextField {
         self.marked_range.take();
         self.clear_layout_cache();
         cx.notify();
+        if let Some(started_at) = started_at {
+            let elapsed = started_at.elapsed();
+            if elapsed.as_millis() >= TEXT_FIELD_SLOW_PATH_MS {
+                tracing::warn!(
+                    target: "kbui.input.perf",
+                    phase = "replace_text_in_range",
+                    elapsed_ms = elapsed.as_millis(),
+                    content_len = self.content.len(),
+                    replacement_len = replacement.len(),
+                    is_multiline = self.is_multiline(),
+                    "slow_text_field_path"
+                );
+            }
+        }
     }
 
     fn replace_and_mark_text_in_range(
@@ -612,8 +725,71 @@ impl Element for TextLineElement {
     ) -> (LayoutId, Self::RequestLayoutState) {
         let mut style = Style::default();
         style.size.width = relative(1.).into();
-        let field_kind = self.input.read(cx).field_kind;
-        style.size.height = field_kind.preferred_height(window.line_height()).into();
+        let input = self.input.read(cx);
+        let field_kind = input.field_kind;
+        let height = match field_kind {
+            TextFieldKind::AutoGrow { max_lines } => {
+                let line_height = window.line_height();
+                let max_height = line_height * max_lines as f32;
+                let wrap_width = input
+                    .last_bounds
+                    .as_ref()
+                    .map(|b| b.size.width.max(px(1.0)));
+                let profile_enabled = text_field_profile_enabled();
+                let content_height = if let Some(wrap_width) = wrap_width {
+                    let text_style = window.text_style();
+                    let display_text = if input.content.is_empty() {
+                        &input.placeholder
+                    } else {
+                        &input.content
+                    };
+                    let font_size = text_style.font_size.to_pixels(window.rem_size());
+                    let run = TextRun {
+                        len: display_text.len(),
+                        font: text_style.font(),
+                        color: text_style.color,
+                        background_color: None,
+                        underline: None,
+                        strikethrough: None,
+                    };
+                    let shape_started_at = profile_enabled.then(Instant::now);
+                    let shaped_height = window
+                        .text_system()
+                        .shape_text(
+                            display_text.clone().into(),
+                            font_size,
+                            &[run],
+                            Some(wrap_width),
+                            None,
+                        )
+                        .map(|lines| {
+                            lines
+                                .iter()
+                                .fold(px(0.), |h, line| h + line.size(line_height).height)
+                        })
+                        .unwrap_or(line_height);
+                    if let Some(shape_started_at) = shape_started_at {
+                        let elapsed = shape_started_at.elapsed();
+                        if elapsed.as_millis() >= TEXT_FIELD_SLOW_PATH_MS {
+                            tracing::warn!(
+                                target: "kbui.input.perf",
+                                phase = "request_layout.shape_text",
+                                elapsed_ms = elapsed.as_millis(),
+                                content_len = display_text.len(),
+                                wrap_width = ?wrap_width,
+                                "slow_text_field_path"
+                            );
+                        }
+                    }
+                    shaped_height
+                } else {
+                    input.last_content_height.max(line_height)
+                };
+                content_height.min(max_height).max(line_height)
+            }
+            _ => field_kind.preferred_height(window.line_height()),
+        };
+        style.size.height = height.into();
         (window.request_layout(style, [], cx), ())
     }
 
@@ -678,17 +854,34 @@ impl Element for TextLineElement {
         let wrap_width = input
             .is_multiline()
             .then_some(bounds.size.width.max(px(1.0)));
+        let profile_enabled = text_field_profile_enabled();
+        let shape_started_at = profile_enabled.then(Instant::now);
         let lines = window
             .text_system()
             .shape_text(display_text.into(), font_size, &runs, wrap_width, None)
             .map(|lines| lines.into_vec())
             .unwrap_or_default();
+        if let Some(shape_started_at) = shape_started_at {
+            let elapsed = shape_started_at.elapsed();
+            if elapsed.as_millis() >= TEXT_FIELD_SLOW_PATH_MS {
+                tracing::warn!(
+                    target: "kbui.input.perf",
+                    phase = "prepaint.shape_text",
+                    elapsed_ms = elapsed.as_millis(),
+                    content_len = content.len(),
+                    wrap_width = ?wrap_width,
+                    is_placeholder,
+                    "slow_text_field_path"
+                );
+            }
+        }
 
         let layout = TextLayoutSnapshot {
             lines,
             line_height: window.line_height(),
             is_placeholder,
             text_len: content.len(),
+            content,
         };
         let scroll_y = if input.is_multiline() {
             visible_scroll_offset(&layout, input.scroll_y, bounds.size.height, cursor)
@@ -768,9 +961,11 @@ impl Element for TextLineElement {
             window.paint_quad(cursor);
         }
 
+        let content_height = prepaint.layout.total_height();
         let layout = std::mem::take(&mut prepaint.layout);
         let scroll_y = prepaint.scroll_y;
         self.input.update(cx, |input, _cx| {
+            input.last_content_height = content_height;
             input.last_layout = Some(layout);
             input.last_bounds = Some(bounds);
             input.scroll_y = scroll_y;
@@ -794,6 +989,8 @@ impl Render for TextField {
             .on_action(cx.listener(Self::down))
             .on_action(cx.listener(Self::select_left))
             .on_action(cx.listener(Self::select_right))
+            .on_action(cx.listener(Self::select_up))
+            .on_action(cx.listener(Self::select_down))
             .on_action(cx.listener(Self::select_all))
             .on_action(cx.listener(Self::home))
             .on_action(cx.listener(Self::end))
@@ -821,6 +1018,7 @@ struct TextLayoutSnapshot {
     line_height: Pixels,
     is_placeholder: bool,
     text_len: usize,
+    content: String,
 }
 
 impl Default for TextLayoutSnapshot {
@@ -830,11 +1028,20 @@ impl Default for TextLayoutSnapshot {
             line_height: px(0.),
             is_placeholder: false,
             text_len: 0,
+            content: String::new(),
         }
     }
 }
 
 impl TextLayoutSnapshot {
+    fn next_line_start(&self, line_start_ix: usize, line_len: usize) -> usize {
+        let mut next = line_start_ix.saturating_add(line_len);
+        if self.content.as_bytes().get(next) == Some(&b'\n') {
+            next += 1;
+        }
+        next
+    }
+
     fn total_height(&self) -> Pixels {
         self.lines.iter().fold(px(0.), |height, line| {
             height + line.size(self.line_height).height
@@ -857,7 +1064,7 @@ impl TextLayoutSnapshot {
             let line_bottom = line_origin_y + line.size(self.line_height).height;
             if position.y > line_bottom {
                 line_origin_y = line_bottom;
-                line_start_ix += line.len() + 1;
+                line_start_ix = self.next_line_start(line_start_ix, line.len());
                 continue;
             }
 
@@ -880,7 +1087,7 @@ impl TextLayoutSnapshot {
             let line_end_ix = line_start_ix + line.len();
             if index > line_end_ix {
                 line_origin_y += line.size(self.line_height).height;
-                line_start_ix = line_end_ix + 1;
+                line_start_ix = self.next_line_start(line_start_ix, line.len());
                 continue;
             }
 
@@ -924,6 +1131,7 @@ impl TextLayoutSnapshot {
 
         let mut quads = Vec::new();
         let mut line_start_ix = 0;
+        let mut line_origin_y = px(0.);
 
         for line in &self.lines {
             for segment in visual_segments(line, line_start_ix, self.line_height) {
@@ -955,14 +1163,15 @@ impl TextLayoutSnapshot {
 
                 quads.push(fill(
                     Bounds::new(
-                        point(origin.x + start_x, origin.y + segment.top),
+                        point(origin.x + start_x, origin.y + line_origin_y + segment.top),
                         size(end_x - start_x, self.line_height),
                     ),
                     rgba(selection()),
                 ));
             }
 
-            line_start_ix += line.len() + 1;
+            line_origin_y += line.size(self.line_height).height;
+            line_start_ix = self.next_line_start(line_start_ix, line.len());
         }
 
         quads
@@ -995,6 +1204,52 @@ fn visible_scroll_offset(
     }
 
     scroll_y.min(max_scroll).max(px(0.))
+}
+
+fn word_range_at_offset(content: &str, offset: usize) -> Option<Range<usize>> {
+    if content.is_empty() {
+        return None;
+    }
+
+    let target = offset.min(content.len().saturating_sub(1));
+    let mut previous_word = None;
+    let mut next_word = None;
+    for (start, word) in content.unicode_word_indices() {
+        let end = start + word.len();
+        if target >= start && target < end {
+            return Some(start..end);
+        }
+        if end <= target {
+            previous_word = Some(start..end);
+            continue;
+        }
+        if start > target {
+            next_word = Some(start..end);
+            break;
+        }
+    }
+
+    previous_word.or(next_word).or_else(|| {
+        content
+            .split_word_bound_indices()
+            .find_map(|(start, segment)| {
+                let end = start + segment.len();
+                (target >= start && target < end).then_some(start..end)
+            })
+    })
+}
+
+fn line_range_at_offset(content: &str, offset: usize) -> Range<usize> {
+    if content.is_empty() {
+        return 0..0;
+    }
+
+    let cursor = offset.min(content.len());
+    let start = content[..cursor].rfind('\n').map_or(0, |index| index + 1);
+    let end = content[cursor..]
+        .find('\n')
+        .map_or(content.len(), |index| cursor + index);
+    start..end
 }
 
 struct VisualLineSegment {

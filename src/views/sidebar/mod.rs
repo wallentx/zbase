@@ -4,18 +4,19 @@ use crate::{
         app_model::Connectivity,
         sidebar_model::{SidebarModel, SidebarRow, SidebarSection},
     },
-    views::app_window::AppWindow,
     views::{
-        SIDEBAR_WIDTH_PX, accent,
+        accent,
         avatar::{Avatar, default_avatar_background, demo_avatar_asset},
-        chevron_down_icon, chevron_right_icon, glass_surface_dark, hash_icon, mention, search_icon,
-        subtle_surface, success, success_soft, text_primary, text_secondary,
+        chevron_down_icon, chevron_right_icon, glass_surface_dark, hash_icon, is_dark_theme,
+        mention, plus_icon, search_icon, sidebar_bg, subtle_surface, success, success_soft,
+        text_primary, text_secondary, tint,
     },
 };
 use gpui::prelude::FluentBuilder;
 use gpui::{
-    AnyElement, AppContext, Context, FontWeight, InteractiveElement, IntoElement, ParentElement,
-    Render, SharedString, StatefulInteractiveElement, Styled, Window, div, px, rgb,
+    AnyElement, AppContext, ClickEvent, Context, FontWeight, InteractiveElement, IntoElement,
+    MouseMoveEvent, ParentElement, Render, SharedString, StatefulInteractiveElement, Styled,
+    Window, div, px, rgb,
 };
 use std::collections::HashMap;
 
@@ -43,8 +44,30 @@ impl Render for DragPreview {
 #[derive(Default)]
 pub struct Sidebar;
 
+pub trait SidebarHost: Sized + 'static {
+    fn sidebar_toggle_quick_switcher(&mut self, cx: &mut Context<Self>);
+    fn sidebar_open_new_chat(&mut self, window: &mut Window, cx: &mut Context<Self>);
+    fn sidebar_open_preferences(&mut self, window: &mut Window, cx: &mut Context<Self>);
+    fn sidebar_show_hover_tooltip(
+        &mut self,
+        text: String,
+        anchor_x: f32,
+        anchor_y: f32,
+        cx: &mut Context<Self>,
+    );
+    fn sidebar_hide_hover_tooltip(&mut self, cx: &mut Context<Self>);
+    fn sidebar_toggle_section(&mut self, section_id: SidebarSectionId, cx: &mut Context<Self>);
+    fn sidebar_reorder_section(
+        &mut self,
+        dragged_id: SidebarSectionId,
+        target_id: SidebarSectionId,
+        cx: &mut Context<Self>,
+    );
+    fn sidebar_navigate_to(&mut self, route: Route, window: &mut Window, cx: &mut Context<Self>);
+}
+
 impl Sidebar {
-    pub fn render(
+    pub fn render<H: SidebarHost>(
         &self,
         sidebar: &SidebarModel,
         connectivity: &Connectivity,
@@ -52,7 +75,7 @@ impl Sidebar {
         current_user_avatar_asset: Option<&str>,
         dm_avatar_assets: &HashMap<String, String>,
         current_route: &Route,
-        cx: &mut Context<AppWindow>,
+        cx: &mut Context<H>,
     ) -> AnyElement {
         let connectivity_tint = match connectivity {
             Connectivity::Online => success(),
@@ -61,13 +84,17 @@ impl Sidebar {
         };
 
         div()
-            .w(px(SIDEBAR_WIDTH_PX))
+            .w(px(sidebar.width_px))
             .flex_shrink_0()
             .h_full()
             .flex()
             .flex_col()
             .px_2()
-            .bg(glass_surface_dark())
+            .bg(if is_dark_theme() {
+                tint(sidebar_bg(), 0.98)
+            } else {
+                glass_surface_dark()
+            })
             .overflow_hidden()
             .text_color(rgb(text_primary()))
             .child(Self::render_title_bar_row(cx))
@@ -98,17 +125,33 @@ impl Sidebar {
             .into_any_element()
     }
 
-    fn render_title_bar_row(cx: &mut Context<AppWindow>) -> AnyElement {
+    fn render_title_bar_row<H: SidebarHost>(cx: &mut Context<H>) -> AnyElement {
+        let search_tooltip = format!("Search ({})", command_shortcut_label("K"));
+        let new_chat_tooltip = format!("New chat ({})", command_shortcut_label("N"));
         div()
-            .when(cfg!(target_os = "macos"), |d| d.h(px(36.)))
+            .when(cfg!(target_os = "macos"), |d| d.h(px(44.)))
             .flex()
             .items_end()
             .justify_end()
+            .gap_1()
             .child(
                 div()
                     .id(SharedString::from("sidebar-search-trigger"))
                     .on_click(cx.listener(|this, _, _, cx| {
-                        this.toggle_quick_switcher(cx);
+                        this.sidebar_hide_hover_tooltip(cx);
+                        this.sidebar_toggle_quick_switcher(cx);
+                    }))
+                    .on_mouse_move(cx.listener({
+                        let search_tooltip = search_tooltip.clone();
+                        move |this, event: &MouseMoveEvent, _, cx| {
+                            this.sidebar_show_hover_tooltip(
+                                search_tooltip.clone(),
+                                f32::from(event.position.x),
+                                f32::from(event.position.y),
+                                cx,
+                            );
+                            cx.stop_propagation();
+                        }
                     }))
                     .w(px(24.))
                     .h(px(24.))
@@ -119,14 +162,42 @@ impl Sidebar {
                     .hover(|s| s.bg(subtle_surface()))
                     .child(search_icon(text_secondary())),
             )
+            .child(
+                div()
+                    .id(SharedString::from("sidebar-new-chat-trigger"))
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.sidebar_hide_hover_tooltip(cx);
+                        this.sidebar_open_new_chat(window, cx);
+                    }))
+                    .on_mouse_move(cx.listener({
+                        let new_chat_tooltip = new_chat_tooltip.clone();
+                        move |this, event: &MouseMoveEvent, _, cx| {
+                            this.sidebar_show_hover_tooltip(
+                                new_chat_tooltip.clone(),
+                                f32::from(event.position.x),
+                                f32::from(event.position.y),
+                                cx,
+                            );
+                            cx.stop_propagation();
+                        }
+                    }))
+                    .w(px(24.))
+                    .h(px(24.))
+                    .rounded_full()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .hover(|s| s.bg(subtle_surface()))
+                    .child(plus_icon(text_secondary())),
+            )
             .into_any_element()
     }
 
-    fn render_profile_footer(
+    fn render_profile_footer<H: SidebarHost>(
         connectivity_tint: u32,
         current_user_display_name: &str,
         current_user_avatar_asset: Option<&str>,
-        cx: &mut Context<AppWindow>,
+        cx: &mut Context<H>,
     ) -> AnyElement {
         div()
             .py_2()
@@ -136,7 +207,9 @@ impl Sidebar {
             .child(
                 div()
                     .id(SharedString::from("sidebar-profile"))
-                    .on_click(cx.listener(AppWindow::preferences_click))
+                    .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                        this.sidebar_open_preferences(window, cx);
+                    }))
                     .flex()
                     .items_center()
                     .gap_2()
@@ -168,12 +241,12 @@ impl Sidebar {
             .into_any_element()
     }
 
-    fn render_section(
+    fn render_section<H: SidebarHost>(
         section: &SidebarSection,
         visible_rows: &[SidebarRow],
         dm_avatar_assets: &HashMap<String, String>,
         current_route: &Route,
-        cx: &mut Context<AppWindow>,
+        cx: &mut Context<H>,
     ) -> AnyElement {
         let section_id = section.id.clone();
         let section_id_for_drop = section.id.clone();
@@ -201,7 +274,7 @@ impl Sidebar {
                     .rounded_md()
                     .when(!is_unread_section, |div| {
                         div.on_click(cx.listener(move |this, _, _, cx| {
-                            this.toggle_sidebar_section_click(section_id.clone(), cx);
+                            this.sidebar_toggle_section(section_id.clone(), cx);
                         }))
                         .on_drag(DraggedSection(section.id.clone()), {
                             let title = drag_title.clone();
@@ -216,7 +289,7 @@ impl Sidebar {
                         })
                         .on_drop(cx.listener(
                             move |this, dragged: &DraggedSection, _, cx| {
-                                this.reorder_sidebar_section(
+                                this.sidebar_reorder_section(
                                     dragged.0.clone(),
                                     section_id_for_drop.clone(),
                                     cx,
@@ -243,11 +316,11 @@ impl Sidebar {
             .into_any_element()
     }
 
-    fn render_row(
+    fn render_row<H: SidebarHost>(
         row: &SidebarRow,
         dm_avatar_assets: &HashMap<String, String>,
         current_route: &Route,
-        cx: &mut Context<AppWindow>,
+        cx: &mut Context<H>,
     ) -> AnyElement {
         let selected = &row.route == current_route;
         let has_unread = row.unread_count > 0;
@@ -266,7 +339,7 @@ impl Sidebar {
             .items_center()
             .justify_between()
             .on_click(cx.listener(move |this, _, window, cx| {
-                this.navigate_to(route.clone(), window, cx);
+                this.sidebar_navigate_to(route.clone(), window, cx);
             }))
             .child(
                 div()
@@ -330,5 +403,13 @@ impl Sidebar {
                 .child(chevron_right_icon(text_secondary()))
                 .into_any_element(),
         }
+    }
+}
+
+fn command_shortcut_label(key: &str) -> String {
+    if cfg!(target_os = "macos") {
+        format!("⌘{key}")
+    } else {
+        format!("Cmd+{key}")
     }
 }

@@ -1,6 +1,7 @@
 use crate::domain::{
+    affinity::Affinity,
     ids::{ConversationId, MessageId, UserId},
-    message::MessageRecord,
+    message::{EmojiSourceRef, MessageRecord},
     user::UserSummary,
 };
 use std::collections::HashMap;
@@ -21,8 +22,10 @@ pub struct ReactionActorRender {
 #[derive(Clone, Debug)]
 pub struct MessageReactionRender {
     pub emoji: String,
+    pub source_ref: Option<EmojiSourceRef>,
     pub count: usize,
     pub actors: Vec<ReactionActorRender>,
+    pub reacted_by_me: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -68,23 +71,35 @@ pub enum TimelineRow {
     UnreadDivider(String),
     SystemEvent(SystemEventRow),
     Message(MessageRow),
-    TypingIndicator(String),
     LoadingIndicator(String),
 }
 
 #[derive(Clone, Debug)]
 pub struct TimelineModel {
     pub conversation_id: ConversationId,
+    pub current_user_id: Option<UserId>,
     pub rows: Vec<TimelineRow>,
     pub highlighted_message_id: Option<MessageId>,
+    pub editing_message_id: Option<MessageId>,
     pub unread_marker: Option<MessageId>,
+    pub affinity_index: HashMap<UserId, Affinity>,
     pub emoji_index: HashMap<String, InlineEmojiRender>,
+    pub emoji_source_index: HashMap<String, InlineEmojiRender>,
     pub reaction_index: HashMap<MessageId, Vec<MessageReactionRender>>,
     pub author_role_index: HashMap<UserId, TeamAuthorRole>,
     pub pending_scroll_target: Option<MessageId>,
     pub older_cursor: Option<String>,
     pub newer_cursor: Option<String>,
     pub loading_older: bool,
+    pub hovered_message_id: Option<MessageId>,
+    pub hovered_message_is_thread: Option<bool>,
+    /// Cursor X position (window coords) captured on hover.
+    pub hovered_message_anchor_x: Option<f32>,
+    /// Hovered message container left edge in window coords.
+    pub hovered_message_window_left: Option<f32>,
+    /// Hovered message container width in window coords.
+    pub hovered_message_window_width: Option<f32>,
+    pub typing_text: Option<String>,
 }
 
 impl TimelineModel {

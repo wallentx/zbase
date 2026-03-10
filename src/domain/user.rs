@@ -1,4 +1,4 @@
-use crate::domain::{ids::UserId, presence::Presence};
+use crate::domain::{affinity::Affinity, ids::UserId, presence::Presence};
 
 #[derive(Clone, Debug)]
 pub struct UserSummary {
@@ -7,4 +7,5 @@ pub struct UserSummary {
     pub title: String,
     pub avatar_asset: Option<String>,
     pub presence: Presence,
+    pub affinity: Affinity,
 }

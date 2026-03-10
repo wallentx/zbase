@@ -1,18 +1,22 @@
 use crate::domain::{
+    affinity::Affinity,
     call::{CallStatus, ParticipantSummary},
     conversation::ConversationSummary,
     ids::{CallId, ConversationId, MessageId, UserId, WorkspaceId},
-    message::MessageRecord,
+    message::{EmojiSourceRef, MessageRecord},
     pins::PinnedState,
     presence::Presence,
+    profile::{SocialGraphEntry, SocialGraphListType, UserProfile},
     search::SearchResult,
+    user::UserSummary,
 };
+use std::collections::HashMap;
 
 use super::{
     action::DraftKey,
     bindings::{ConversationBinding, MessageBinding, WorkspaceBinding},
     effect::UploadedAttachment,
-    ids::{DebounceKey, LocalAttachmentId, OpId, QueryId},
+    ids::{ClientMessageId, DebounceKey, LocalAttachmentId, OpId, QueryId},
     state::TimelineKey,
 };
 
@@ -60,6 +64,7 @@ pub struct ConversationEmojiEntry {
 #[derive(Clone, Debug)]
 pub struct MessageReactionEntry {
     pub emoji: String,
+    pub source_ref: Option<EmojiSourceRef>,
     pub actor_ids: Vec<UserId>,
     pub updated_ms: i64,
 }
@@ -127,6 +132,16 @@ pub enum BackendEvent {
         newer_cursor: Option<String>,
     },
     MessageUpserted(MessageRecord),
+    MessageSendConfirmed {
+        op_id: OpId,
+        client_message_id: ClientMessageId,
+        server_message: MessageRecord,
+    },
+    MessageSendFailed {
+        op_id: OpId,
+        client_message_id: ClientMessageId,
+        error: String,
+    },
     MessageDeleted {
         conversation_id: ConversationId,
         message_id: MessageId,
@@ -145,9 +160,41 @@ pub enum BackendEvent {
         avatar_asset: Option<String>,
         updated_ms: i64,
     },
+    UserProfileLoaded {
+        account_id: crate::domain::backend::AccountId,
+        profile: UserProfile,
+    },
+    SocialGraphListLoaded {
+        user_id: UserId,
+        list_type: SocialGraphListType,
+        entries: Vec<SocialGraphEntry>,
+    },
+    FollowStatusChanged {
+        user_id: UserId,
+        you_are_following: bool,
+    },
+    FollowStatusChangeFailed {
+        user_id: UserId,
+        attempted_follow: bool,
+        error: String,
+    },
+    AffinityChanged {
+        user_id: UserId,
+        affinity: Affinity,
+    },
+    AffinitySynced {
+        affinities: HashMap<UserId, Affinity>,
+    },
     ConversationEmojisSynced {
         conversation_id: ConversationId,
         emojis: Vec<ConversationEmojiEntry>,
+    },
+    EmojiSourceSynced {
+        source_ref: EmojiSourceRef,
+        alias: String,
+        unicode: Option<String>,
+        asset_path: Option<String>,
+        updated_ms: i64,
     },
     MessageReactionsSynced {
         conversation_id: ConversationId,
@@ -161,8 +208,19 @@ pub enum BackendEvent {
         conversation_id: ConversationId,
         message_id: MessageId,
         emoji: String,
+        source_ref: Option<EmojiSourceRef>,
         actor_id: UserId,
         updated_ms: i64,
+    },
+    MessageReactionRemoved {
+        conversation_id: ConversationId,
+        message_id: MessageId,
+        emoji: String,
+        actor_id: UserId,
+    },
+    ReactionFailed {
+        op_id: OpId,
+        error: String,
     },
     TeamRolesUpdated {
         conversation_id: ConversationId,
@@ -184,6 +242,16 @@ pub enum BackendEvent {
         query_id: QueryId,
         results: Vec<SearchResult>,
         is_complete: bool,
+    },
+    UserSearchResults {
+        query_id: QueryId,
+        results: Vec<UserSummary>,
+    },
+    ConversationCreated {
+        op_id: OpId,
+        workspace_id: WorkspaceId,
+        conversation: ConversationSummary,
+        conversation_binding: ConversationBinding,
     },
     CallUpdated(CallPatch),
     KeybaseNotifyStub {

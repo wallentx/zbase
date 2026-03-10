@@ -4,6 +4,7 @@ pub enum Availability {
     Away,
     DoNotDisturb,
     Offline,
+    Unknown,
 }
 
 #[derive(Clone, Debug)]

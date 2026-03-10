@@ -17,7 +17,7 @@ use crate::{
         backend::{ProviderConversationRef, ProviderMessageRef},
         conversation::{ConversationKind, ConversationSummary},
         ids::{ConversationId, MessageId, UserId, WorkspaceId},
-        message::{MessageReaction, MessageRecord},
+        message::{EmojiSourceRef, MessageReaction, MessageRecord},
     },
     state::event::BootstrapPayload,
 };
@@ -26,9 +26,9 @@ use super::{
     paths,
     schema::{
         CachedConversationBinding, CachedConversationEmoji, CachedConversationSummary,
-        CachedConversationTeamBinding, CachedMessageBinding, CachedMessageReaction,
-        CachedMessageRecord, CachedMeta, CachedTeamRoleEntry, CachedTeamRoleMap, CachedUserProfile,
-        SCHEMA_VERSION,
+        CachedConversationTeamBinding, CachedEmojiSourceRef, CachedMessageBinding,
+        CachedMessageReaction, CachedMessageRecord, CachedMeta, CachedReactionOp,
+        CachedTeamRoleEntry, CachedTeamRoleMap, CachedUserProfile, SCHEMA_VERSION,
     },
 };
 
@@ -40,12 +40,14 @@ const CF_BINDINGS: &str = "bindings";
 const CF_USERS: &str = "users";
 const CF_EMOJIS: &str = "emojis";
 const CF_REACTIONS: &str = "reactions";
+const CF_REACTION_OPS: &str = "reaction_ops";
 const CF_TEAMS: &str = "teams";
 
 const META_KEY: &[u8] = b"bootstrap_meta";
 const USER_PROFILE_PREFIX: &str = "user:";
 const EMOJI_PREFIX: &str = "emoji:";
 const REACTION_PREFIX: &str = "rxn:";
+const REACTION_OP_PREFIX: &str = "rxnop:";
 const TEAM_ROLE_PREFIX: &str = "team_roles:";
 const CONVERSATION_TEAM_PREFIX: &str = "conv_team:";
 const CRAWL_CHECKPOINT_PREFIX: &str = "crawl:conv:";
@@ -146,7 +148,7 @@ impl LocalStore {
         db_opts.set_max_open_files(256);
         db_opts.set_max_background_jobs(2);
 
-        let cf_names = [
+        let mut cf_names = [
             CF_META,
             CF_CONVERSATIONS,
             CF_MESSAGES,
@@ -155,16 +157,52 @@ impl LocalStore {
             CF_USERS,
             CF_EMOJIS,
             CF_REACTIONS,
+            CF_REACTION_OPS,
             CF_TEAMS,
-        ];
-        let descriptors = cf_names
-            .iter()
-            .map(|name| ColumnFamilyDescriptor::new(*name, Options::default()))
-            .collect::<Vec<_>>();
+        ]
+        .iter()
+        .map(|name| (*name).to_string())
+        .collect::<Vec<_>>();
 
-        let db =
+        // Existing local stores can carry forward column families from older or
+        // newer builds. Open all existing families to avoid startup failures when
+        // RocksDB reports "Column families not opened: <name>".
+        if path.exists()
+            && let Ok(existing_families) =
+                DBWithThreadMode::<MultiThreaded>::list_cf(&db_opts, &path)
+        {
+            for name in existing_families {
+                if !cf_names.iter().any(|known| known == &name) {
+                    cf_names.push(name);
+                }
+            }
+        }
+
+        let open_with_names = |names: &[String]| {
+            let descriptors = names
+                .iter()
+                .map(|name| ColumnFamilyDescriptor::new(name.clone(), Options::default()))
+                .collect::<Vec<_>>();
             DBWithThreadMode::<MultiThreaded>::open_cf_descriptors(&db_opts, &path, descriptors)
-                .map_err(io::Error::other)?;
+        };
+
+        let db = match open_with_names(&cf_names) {
+            Ok(db) => db,
+            Err(error) => {
+                let mut retry_names = cf_names.clone();
+                let mut added = false;
+                for name in parse_missing_cf_names(error.as_ref()) {
+                    if !retry_names.iter().any(|known| known == &name) {
+                        retry_names.push(name);
+                        added = true;
+                    }
+                }
+                if !added {
+                    return Err(io::Error::other(error));
+                }
+                open_with_names(&retry_names).map_err(io::Error::other)?
+            }
+        };
         Ok(Self { db })
     }
 
@@ -937,7 +975,7 @@ impl LocalStore {
         for item in iter {
             let (key, value) = item.map_err(io::Error::other)?;
             let key_text = String::from_utf8_lossy(&key);
-            if !key_text.starts_with(&prefix) {
+            if !key_text.starts_with(prefix) {
                 break;
             }
             let emoji: CachedConversationEmoji = decode(&value)?;
@@ -1025,23 +1063,138 @@ impl LocalStore {
         conversation_id: &ConversationId,
         message_id: &MessageId,
         emoji: &str,
+        source_ref: Option<&EmojiSourceRef>,
         actor_id: &UserId,
         updated_ms: i64,
     ) -> io::Result<()> {
         let reactions_cf = self.cf(CF_REACTIONS)?;
+        let key = message_reaction_key(conversation_id, message_id, emoji, actor_id);
+        let mut cached_source_ref = source_ref.map(|value| CachedEmojiSourceRef {
+            backend_id: value.backend_id.0.clone(),
+            ref_key: value.ref_key.clone(),
+        });
+        if cached_source_ref.is_none()
+            && let Some(existing_bytes) = self
+                .db
+                .get_cf(&reactions_cf, &key)
+                .map_err(io::Error::other)?
+            && let Ok(existing) = decode::<CachedMessageReaction>(&existing_bytes)
+        {
+            cached_source_ref = existing.source_ref;
+        }
         let record = CachedMessageReaction {
             message_id: message_id.0.clone(),
+            emoji: emoji.to_string(),
+            source_ref: cached_source_ref,
+            actor_id: actor_id.0.clone(),
+            updated_ms,
+        };
+        self.db
+            .put_cf(&reactions_cf, key, encode(&record)?)
+            .map_err(io::Error::other)
+    }
+
+    pub fn delete_message_reaction(
+        &self,
+        conversation_id: &ConversationId,
+        message_id: &MessageId,
+        emoji: &str,
+        actor_id: &UserId,
+    ) -> io::Result<()> {
+        let reactions_cf = self.cf(CF_REACTIONS)?;
+        self.db
+            .delete_cf(
+                &reactions_cf,
+                message_reaction_key(conversation_id, message_id, emoji, actor_id),
+            )
+            .map_err(io::Error::other)
+    }
+
+    pub fn upsert_message_reaction_op(
+        &self,
+        conversation_id: &ConversationId,
+        op_message_id: &MessageId,
+        target_message_id: &MessageId,
+        emoji: &str,
+        actor_id: &UserId,
+        updated_ms: i64,
+    ) -> io::Result<()> {
+        let reaction_ops_cf = self.cf(CF_REACTION_OPS)?;
+        let record = CachedReactionOp {
+            op_message_id: op_message_id.0.clone(),
+            target_message_id: target_message_id.0.clone(),
             emoji: emoji.to_string(),
             actor_id: actor_id.0.clone(),
             updated_ms,
         };
         self.db
             .put_cf(
-                &reactions_cf,
-                message_reaction_key(conversation_id, message_id, emoji, actor_id),
+                &reaction_ops_cf,
+                message_reaction_op_key(conversation_id, op_message_id),
                 encode(&record)?,
             )
             .map_err(io::Error::other)
+    }
+
+    pub fn delete_message_reaction_op(
+        &self,
+        conversation_id: &ConversationId,
+        op_message_id: &MessageId,
+    ) -> io::Result<()> {
+        let reaction_ops_cf = self.cf(CF_REACTION_OPS)?;
+        self.db
+            .delete_cf(
+                &reaction_ops_cf,
+                message_reaction_op_key(conversation_id, op_message_id),
+            )
+            .map_err(io::Error::other)
+    }
+
+    pub fn take_message_reaction_op(
+        &self,
+        conversation_id: &ConversationId,
+        op_message_id: &MessageId,
+    ) -> io::Result<Option<(MessageId, String, UserId)>> {
+        let reaction_ops_cf = self.cf(CF_REACTION_OPS)?;
+        let key = message_reaction_op_key(conversation_id, op_message_id);
+        let Some(bytes) = self
+            .db
+            .get_cf(&reaction_ops_cf, key.as_bytes())
+            .map_err(io::Error::other)?
+        else {
+            return Ok(None);
+        };
+        self.db
+            .delete_cf(&reaction_ops_cf, key.as_bytes())
+            .map_err(io::Error::other)?;
+        let stored: CachedReactionOp = decode(&bytes)?;
+        Ok(Some((
+            MessageId::new(stored.target_message_id),
+            stored.emoji,
+            UserId::new(stored.actor_id),
+        )))
+    }
+
+    pub fn get_message_reaction_op(
+        &self,
+        conversation_id: &ConversationId,
+        op_message_id: &MessageId,
+    ) -> io::Result<Option<(MessageId, String, UserId)>> {
+        let reaction_ops_cf = self.cf(CF_REACTION_OPS)?;
+        let key = message_reaction_op_key(conversation_id, op_message_id);
+        let Some(bytes) = self
+            .db
+            .get_cf(&reaction_ops_cf, key.as_bytes())
+            .map_err(io::Error::other)?
+        else {
+            return Ok(None);
+        };
+        let stored: CachedReactionOp = decode(&bytes)?;
+        Ok(Some((
+            MessageId::new(stored.target_message_id),
+            stored.emoji,
+            UserId::new(stored.actor_id),
+        )))
     }
 
     pub fn load_message_reactions_for_messages(
@@ -1290,6 +1443,7 @@ impl LocalStore {
             CF_USERS,
             CF_EMOJIS,
             CF_REACTIONS,
+            CF_REACTION_OPS,
             CF_TEAMS,
         ] {
             let cf = self.cf(cf_name)?;
@@ -1307,6 +1461,18 @@ impl LocalStore {
             .cf_handle(name)
             .ok_or_else(|| io::Error::other(format!("missing column family: {name}")))
     }
+}
+
+fn parse_missing_cf_names(error: &str) -> Vec<String> {
+    let marker = "Column families not opened:";
+    let Some((_, tail)) = error.split_once(marker) else {
+        return Vec::new();
+    };
+    tail.split(',')
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(ToOwned::to_owned)
+        .collect()
 }
 
 fn conversation_key(conversation_id: &ConversationId) -> String {
@@ -1412,9 +1578,16 @@ fn message_sort_component(message_id: &MessageId) -> String {
 }
 
 fn compare_message_ids(left: &MessageId, right: &MessageId) -> std::cmp::Ordering {
-    match (left.0.parse::<u64>().ok(), right.0.parse::<u64>().ok()) {
-        (Some(left), Some(right)) => left.cmp(&right),
-        _ => left.0.cmp(&right.0),
+    let left_num = left.0.parse::<u64>().ok();
+    let right_num = right.0.parse::<u64>().ok();
+
+    match (left_num, right_num) {
+        (Some(left_num), Some(right_num)) => {
+            left_num.cmp(&right_num).then_with(|| left.0.cmp(&right.0))
+        }
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (None, None) => left.0.cmp(&right.0),
     }
 }
 
@@ -1511,6 +1684,13 @@ fn message_reaction_key(
     )
 }
 
+fn message_reaction_op_key(conversation_id: &ConversationId, op_message_id: &MessageId) -> String {
+    format!(
+        "{REACTION_OP_PREFIX}{}:{}",
+        conversation_id.0, op_message_id.0
+    )
+}
+
 fn encode_reaction_key_component(value: &str) -> String {
     let mut out = String::with_capacity(value.len() * 2);
     for byte in value.as_bytes() {
@@ -1522,20 +1702,30 @@ fn encode_reaction_key_component(value: &str) -> String {
 fn aggregate_cached_message_reactions(
     records: Option<&Vec<CachedMessageReaction>>,
 ) -> Vec<MessageReaction> {
-    let mut by_emoji: HashMap<String, HashSet<UserId>> = HashMap::new();
+    let mut by_emoji: HashMap<String, (HashSet<UserId>, Option<EmojiSourceRef>)> = HashMap::new();
     for record in records.into_iter().flatten() {
-        by_emoji
+        let entry = by_emoji
             .entry(record.emoji.clone())
-            .or_default()
-            .insert(UserId::new(record.actor_id.clone()));
+            .or_insert_with(|| (HashSet::new(), None));
+        entry.0.insert(UserId::new(record.actor_id.clone()));
+        if entry.1.is_none() {
+            entry.1 = record.source_ref.as_ref().map(|source_ref| EmojiSourceRef {
+                backend_id: crate::domain::backend::BackendId::new(source_ref.backend_id.clone()),
+                ref_key: source_ref.ref_key.clone(),
+            });
+        }
     }
 
     let mut reactions = by_emoji
         .into_iter()
-        .map(|(emoji, actor_ids)| {
+        .map(|(emoji, (actor_ids, source_ref))| {
             let mut actor_ids = actor_ids.into_iter().collect::<Vec<_>>();
             actor_ids.sort_by(|left, right| left.0.cmp(&right.0));
-            MessageReaction { emoji, actor_ids }
+            MessageReaction {
+                emoji,
+                source_ref,
+                actor_ids,
+            }
         })
         .collect::<Vec<_>>();
     reactions.sort_by(|left, right| left.emoji.cmp(&right.emoji));
@@ -1610,6 +1800,7 @@ mod tests {
             link_previews: Vec::new(),
             permalink: String::new(),
             fragments: vec![MessageFragment::Text(format!("message-{id}"))],
+            source_text: None,
             attachments: vec![AttachmentSummary {
                 name: format!("file-{id}.txt"),
                 kind: AttachmentKind::File,
@@ -1649,6 +1840,7 @@ mod tests {
                     display: "example".to_string(),
                 },
             ],
+            source_text: None,
             attachments: Vec::new(),
             reactions: Vec::new(),
             thread_reply_count: 0,
@@ -2089,6 +2281,7 @@ mod tests {
                 &conversation_id,
                 &message_one,
                 ":thumbsup:",
+                None,
                 &UserId::new("alice"),
                 100,
             )
@@ -2098,6 +2291,7 @@ mod tests {
                 &conversation_id,
                 &message_one,
                 ":thumbsup:",
+                None,
                 &UserId::new("bob"),
                 101,
             )
@@ -2107,6 +2301,7 @@ mod tests {
                 &conversation_id,
                 &message_two,
                 ":eyes:",
+                None,
                 &UserId::new("carol"),
                 102,
             )
@@ -2129,6 +2324,64 @@ mod tests {
             Some(1),
             "message two should have one actor"
         );
+
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn message_reaction_op_mapping_roundtrip() {
+        let path = temp_rocks_path("reaction-op-map");
+        let store = LocalStore::open_at(path.clone()).expect("open rocks");
+        let conversation_id = ConversationId::new("kb_conv:rxn-op");
+        let op_message_id = MessageId::new("9001");
+        let target_message_id = MessageId::new("42");
+
+        store
+            .upsert_message_reaction_op(
+                &conversation_id,
+                &op_message_id,
+                &target_message_id,
+                ":thumbsup:",
+                &UserId::new("alice"),
+                123,
+            )
+            .expect("upsert reaction op");
+
+        let resolved = store
+            .take_message_reaction_op(&conversation_id, &op_message_id)
+            .expect("take reaction op");
+        assert_eq!(
+            resolved,
+            Some((
+                target_message_id.clone(),
+                ":thumbsup:".to_string(),
+                UserId::new("alice")
+            ))
+        );
+
+        let empty = store
+            .take_message_reaction_op(&conversation_id, &op_message_id)
+            .expect("take reaction op again");
+        assert!(empty.is_none(), "reaction op should be consumed");
+
+        store
+            .upsert_message_reaction_op(
+                &conversation_id,
+                &op_message_id,
+                &target_message_id,
+                ":eyes:",
+                &UserId::new("bob"),
+                124,
+            )
+            .expect("reinsert reaction op");
+        store
+            .delete_message_reaction_op(&conversation_id, &op_message_id)
+            .expect("delete reaction op");
+
+        let missing = store
+            .take_message_reaction_op(&conversation_id, &op_message_id)
+            .expect("take after delete");
+        assert!(missing.is_none(), "deleted reaction op should not resolve");
 
         let _ = std::fs::remove_dir_all(path);
     }

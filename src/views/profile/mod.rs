@@ -1,0 +1,839 @@
+use crate::{
+    domain::{
+        affinity::Affinity,
+        ids::UserId,
+        presence::{Availability, Presence},
+        profile::{ProfileSection, ProofState, SocialGraph, SocialGraphListType, UserProfile},
+    },
+    models::profile_panel_model::{ProfilePanelModel, SocialTab},
+    views::{
+        accent,
+        app_window::AppWindow,
+        avatar::{Avatar, default_avatar_background},
+        badge, border, close_icon, danger, danger_soft, panel_alt_bg, panel_alt_surface,
+        panel_surface, subtle_surface, success, success_soft, text_primary, text_secondary,
+        warning, warning_soft,
+    },
+};
+use gpui::prelude::FluentBuilder;
+use gpui::{
+    AnyElement, Context, CursorStyle, FontWeight, InteractiveElement, IntoElement, ParentElement,
+    StatefulInteractiveElement, Styled, div, px, rgb,
+};
+
+pub fn render_profile_panel(
+    profile_panel: &ProfilePanelModel,
+    cx: &mut Context<AppWindow>,
+) -> AnyElement {
+    let Some(user_id) = profile_panel.user_id.as_ref() else {
+        return empty_profile_panel(cx);
+    };
+    let profile = profile_panel.profile.as_ref();
+    let display_name = profile
+        .map(|value| value.display_name.trim())
+        .filter(|value| !value.is_empty())
+        .unwrap_or(&user_id.0)
+        .to_string();
+    let username = profile
+        .map(|value| value.username.trim())
+        .filter(|value| !value.is_empty())
+        .unwrap_or(&user_id.0)
+        .to_string();
+    let avatar_asset = profile.and_then(|value| value.avatar_asset.as_deref());
+    let presence = profile
+        .map(|value| value.presence.clone())
+        .unwrap_or_else(default_presence);
+    let affinity = profile
+        .map(|value| value.affinity)
+        .unwrap_or(Affinity::None);
+    let social_graph = profile.and_then(profile_social_graph);
+    let follow = social_graph.is_some_and(|graph| graph.you_are_following);
+    let follow_label = if follow { "Unfollow" } else { "Follow" };
+    let title = profile
+        .and_then(|p| p.title.as_deref())
+        .map(str::trim)
+        .filter(|t| !t.is_empty());
+    let bio = profile
+        .and_then(|value| value.bio.as_deref())
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let location = profile
+        .and_then(|value| value.location.as_deref())
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let has_bio_block = bio.is_some() || location.is_some();
+
+    let identity_proofs = profile.map(profile_identity_proofs).unwrap_or_default();
+    let team_showcase = profile.map(profile_team_showcase).unwrap_or_default();
+    let custom_fields = profile.map(profile_custom_fields).unwrap_or_default();
+    let social_entries = social_graph_entries(social_graph, profile_panel.active_social_tab);
+
+    div()
+        .size_full()
+        .id("right-pane-profile-scroll")
+        .overflow_y_scroll()
+        .scrollbar_width(px(8.))
+        .p_4()
+        .flex()
+        .flex_col()
+        .gap_3()
+        // Header with close icon (matches pane_header pattern)
+        .child(pane_header(cx))
+        // Hero card: avatar, name, presence, actions
+        .child(
+            div()
+                .rounded_lg()
+                .bg(panel_surface())
+                .border_1()
+                .border_color(rgb(border()))
+                .p_4()
+                .flex()
+                .flex_col()
+                .items_center()
+                .gap_3()
+                // Avatar with presence dot
+                .child(
+                    div()
+                        .relative()
+                        .child(Avatar::render(
+                            &display_name,
+                            avatar_asset,
+                            80.,
+                            default_avatar_background(&display_name),
+                            text_primary(),
+                        ))
+                        .child(presence_dot(&presence)),
+                )
+                // Name + username + title
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .items_center()
+                        .gap_0p5()
+                        .child(
+                            div()
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(rgb(profile_name_color(affinity)))
+                                .child(display_name.clone()),
+                        )
+                        .child(
+                            div()
+                                .text_sm()
+                                .text_color(rgb(text_secondary()))
+                                .child(format!("@{username}")),
+                        )
+                        .when_some(title, |container, title| {
+                            container.child(
+                                div()
+                                    .text_xs()
+                                    .text_color(rgb(text_secondary()))
+                                    .child(title.to_string()),
+                            )
+                        }),
+                )
+                // Action buttons
+                .child(
+                    div()
+                        .flex()
+                        .gap_2()
+                        .child({
+                            let user_id = user_id.clone();
+                            div()
+                                .id("profile-open-message")
+                                .cursor(CursorStyle::PointingHand)
+                                .hover(|s| s.opacity(0.85))
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.profile_open_message(user_id.clone(), cx);
+                                }))
+                                .child(badge("Message", panel_alt_bg(), text_primary()))
+                        })
+                        .child({
+                            let user_id = user_id.clone();
+                            div()
+                                .id("profile-follow-toggle")
+                                .cursor(CursorStyle::PointingHand)
+                                .hover(|s| s.opacity(0.85))
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    if follow {
+                                        this.profile_unfollow_user(user_id.clone(), cx);
+                                    } else {
+                                        this.profile_follow_user(user_id.clone(), cx);
+                                    }
+                                }))
+                                .child(badge(
+                                    follow_label,
+                                    if follow { panel_alt_bg() } else { accent() },
+                                    text_primary(),
+                                ))
+                        }),
+                )
+                // Loading state
+                .when(profile_panel.loading && profile.is_none(), |container| {
+                    container.child(
+                        div()
+                            .w_full()
+                            .rounded_md()
+                            .bg(panel_alt_surface())
+                            .p_3()
+                            .text_sm()
+                            .text_color(rgb(text_secondary()))
+                            .child("Loading profile\u{2026}"),
+                    )
+                }),
+        )
+        // Bio + location block
+        .when(has_bio_block, |container| {
+            container.child(
+                div()
+                    .rounded_lg()
+                    .bg(panel_surface())
+                    .border_1()
+                    .border_color(rgb(border()))
+                    .p_3()
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .when_some(bio, |card, bio| {
+                        card.child(
+                            div()
+                                .text_sm()
+                                .text_color(rgb(text_primary()))
+                                .child(bio.to_string()),
+                        )
+                    })
+                    .when_some(location, |card, location| {
+                        card.child(
+                            div()
+                                .text_xs()
+                                .text_color(rgb(text_secondary()))
+                                .child(format!("\u{1F4CD} {location}")),
+                        )
+                    }),
+            )
+        })
+        // Social graph section
+        .when_some(social_graph, |container, graph| {
+            let followers_count = graph.followers_count.unwrap_or(0);
+            let following_count = graph.following_count.unwrap_or(0);
+            container.child(
+                div()
+                    .rounded_lg()
+                    .bg(panel_surface())
+                    .border_1()
+                    .border_color(rgb(border()))
+                    .p_3()
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .child(
+                        div()
+                            .flex()
+                            .border_b_1()
+                            .border_color(rgb(border()))
+                            .gap_4()
+                            .child(social_tab(
+                                "Followers",
+                                followers_count,
+                                profile_panel.active_social_tab == SocialTab::Followers,
+                                "profile-followers-tab",
+                                SocialGraphListType::Followers,
+                                cx,
+                            ))
+                            .child(social_tab(
+                                "Following",
+                                following_count,
+                                profile_panel.active_social_tab == SocialTab::Following,
+                                "profile-following-tab",
+                                SocialGraphListType::Following,
+                                cx,
+                            )),
+                    )
+                    .when(profile_panel.loading_social_list, |section| {
+                        section.child(
+                            div()
+                                .rounded_md()
+                                .bg(panel_alt_surface())
+                                .p_3()
+                                .text_sm()
+                                .text_color(rgb(text_secondary()))
+                                .child("Loading people\u{2026}"),
+                        )
+                    })
+                    .when(
+                        !profile_panel.loading_social_list && social_entries.is_empty(),
+                        |section| {
+                            section.child(
+                                div()
+                                    .rounded_md()
+                                    .bg(panel_alt_surface())
+                                    .p_3()
+                                    .text_sm()
+                                    .text_color(rgb(text_secondary()))
+                                    .child("No people to show yet."),
+                            )
+                        },
+                    )
+                    .children(
+                        social_entries
+                            .into_iter()
+                            .enumerate()
+                            .map(|(index, entry)| {
+                                let entry_user_id = entry.user_id.clone();
+                                let entry_name = if entry.display_name.trim().is_empty() {
+                                    entry.user_id.0.clone()
+                                } else {
+                                    entry.display_name.clone()
+                                };
+                                div()
+                                    .id(("profile-social-entry", index))
+                                    .rounded_md()
+                                    .bg(panel_alt_surface())
+                                    .px_2()
+                                    .py_2()
+                                    .flex()
+                                    .items_center()
+                                    .justify_between()
+                                    .cursor(CursorStyle::PointingHand)
+                                    .hover(|s| s.bg(subtle_surface()))
+                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                        this.open_user_profile_panel(
+                                            entry_user_id.clone(),
+                                            window,
+                                            cx,
+                                        );
+                                    }))
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .items_center()
+                                            .gap_2()
+                                            .child(Avatar::render(
+                                                &entry_name,
+                                                entry.avatar_asset.as_deref(),
+                                                28.,
+                                                default_avatar_background(&entry_name),
+                                                text_primary(),
+                                            ))
+                                            .child(
+                                                div()
+                                                    .text_sm()
+                                                    .text_color(rgb(profile_name_color(
+                                                        entry.affinity,
+                                                    )))
+                                                    .child(entry_name),
+                                            ),
+                                    )
+                                    .into_any_element()
+                            }),
+                    ),
+            )
+        })
+        // Identity proofs
+        .when(!identity_proofs.is_empty(), |container| {
+            container.child(render_proofs_section(identity_proofs))
+        })
+        // Teams
+        .when(!team_showcase.is_empty(), |container| {
+            container.child(render_teams_section(team_showcase))
+        })
+        // Custom fields
+        .when(!custom_fields.is_empty(), |container| {
+            container.child(render_custom_fields_section(custom_fields))
+        })
+        .into_any_element()
+}
+
+pub fn render_profile_card(
+    profile_panel: &ProfilePanelModel,
+    user_id: &UserId,
+    cx: &mut Context<AppWindow>,
+) -> AnyElement {
+    let profile = profile_panel
+        .profile
+        .as_ref()
+        .filter(|profile| profile.user_id == *user_id);
+    let display_name = profile
+        .map(|value| value.display_name.trim())
+        .filter(|value| !value.is_empty())
+        .unwrap_or(&user_id.0)
+        .to_string();
+    let username = profile
+        .map(|value| value.username.trim())
+        .filter(|value| !value.is_empty())
+        .unwrap_or(&user_id.0)
+        .to_string();
+    let avatar_asset = profile.and_then(|value| value.avatar_asset.as_deref());
+    let presence = profile
+        .map(|value| value.presence.clone())
+        .unwrap_or_else(default_presence);
+    let affinity = profile
+        .map(|value| value.affinity)
+        .unwrap_or(Affinity::None);
+    let social_graph = profile.and_then(profile_social_graph);
+    let follow = social_graph.is_some_and(|graph| graph.you_are_following);
+
+    div()
+        .rounded_xl()
+        .bg(panel_surface())
+        .border_1()
+        .border_color(rgb(border()))
+        .shadow(crate::views::card_shadow())
+        .w(px(320.))
+        .p_3()
+        .flex()
+        .flex_col()
+        .gap_2()
+        .id("profile-card")
+        .on_click(cx.listener(|_, _, _, cx| {
+            cx.stop_propagation();
+        }))
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .gap_3()
+                .child(
+                    div()
+                        .relative()
+                        .child(Avatar::render(
+                            &display_name,
+                            avatar_asset,
+                            48.,
+                            default_avatar_background(&display_name),
+                            text_primary(),
+                        ))
+                        .child(presence_dot_small(&presence)),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap_0p5()
+                        .child(
+                            div()
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(rgb(profile_name_color(affinity)))
+                                .child(display_name),
+                        )
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(rgb(text_secondary()))
+                                .child(format!("@{username}")),
+                        ),
+                ),
+        )
+        .when_some(
+            profile
+                .and_then(|value| value.bio.as_deref())
+                .map(str::trim)
+                .filter(|value| !value.is_empty()),
+            |container, bio| {
+                container.child(
+                    div()
+                        .text_sm()
+                        .text_color(rgb(text_secondary()))
+                        .child(bio.to_string()),
+                )
+            },
+        )
+        .when_some(social_graph, |container, graph| {
+            container.child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(text_secondary()))
+                    .child(format!(
+                        "{} followers \u{00B7} {} following",
+                        graph.followers_count.unwrap_or(0),
+                        graph.following_count.unwrap_or(0)
+                    )),
+            )
+        })
+        .child(
+            div()
+                .pt_1()
+                .flex()
+                .gap_2()
+                .child({
+                    let user_id = user_id.clone();
+                    div()
+                        .id("profile-card-view-full")
+                        .cursor(CursorStyle::PointingHand)
+                        .hover(|s| s.opacity(0.85))
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.open_user_profile_panel(user_id.clone(), window, cx);
+                        }))
+                        .child(badge("View profile", accent(), text_primary()))
+                })
+                .child({
+                    let user_id = user_id.clone();
+                    div()
+                        .id("profile-card-follow-toggle")
+                        .cursor(CursorStyle::PointingHand)
+                        .hover(|s| s.opacity(0.85))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            if follow {
+                                this.profile_unfollow_user(user_id.clone(), cx);
+                            } else {
+                                this.profile_follow_user(user_id.clone(), cx);
+                            }
+                        }))
+                        .child(badge(
+                            if follow { "Unfollow" } else { "Follow" },
+                            panel_alt_bg(),
+                            text_primary(),
+                        ))
+                })
+                .child(
+                    div()
+                        .id("profile-card-close")
+                        .cursor(CursorStyle::PointingHand)
+                        .hover(|s| s.opacity(0.85))
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.dismiss_overlays(cx);
+                        }))
+                        .child(badge("Close", panel_alt_bg(), text_primary())),
+                ),
+        )
+        .into_any_element()
+}
+
+fn pane_header(cx: &mut Context<AppWindow>) -> AnyElement {
+    div()
+        .flex()
+        .items_center()
+        .justify_between()
+        .child(
+            div()
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(rgb(text_primary()))
+                .child("Profile"),
+        )
+        .child(
+            div()
+                .id("profile-pane-close")
+                .on_click(cx.listener(|this, _, window, cx| {
+                    this.close_right_pane(window, cx);
+                }))
+                .w(px(22.))
+                .h(px(22.))
+                .rounded_full()
+                .flex()
+                .items_center()
+                .justify_center()
+                .cursor(CursorStyle::PointingHand)
+                .hover(|s| s.bg(subtle_surface()))
+                .child(close_icon(text_secondary())),
+        )
+        .into_any_element()
+}
+
+fn empty_profile_panel(cx: &mut Context<AppWindow>) -> AnyElement {
+    div()
+        .size_full()
+        .id("right-pane-profile-scroll")
+        .overflow_y_scroll()
+        .scrollbar_width(px(8.))
+        .p_4()
+        .flex()
+        .flex_col()
+        .gap_3()
+        .child(pane_header(cx))
+        .child(
+            div()
+                .rounded_lg()
+                .bg(panel_alt_surface())
+                .p_4()
+                .text_sm()
+                .text_color(rgb(text_secondary()))
+                .child("Select a person to view their profile."),
+        )
+        .into_any_element()
+}
+
+fn section_header(title: &str) -> AnyElement {
+    div()
+        .font_weight(FontWeight::MEDIUM)
+        .text_sm()
+        .text_color(rgb(text_secondary()))
+        .child(title.to_string())
+        .into_any_element()
+}
+
+fn social_tab(
+    label: &str,
+    count: u32,
+    selected: bool,
+    id: &'static str,
+    list_type: SocialGraphListType,
+    cx: &mut Context<AppWindow>,
+) -> AnyElement {
+    div()
+        .id(id)
+        .pb_2()
+        .text_sm()
+        .font_weight(FontWeight::MEDIUM)
+        .cursor(CursorStyle::PointingHand)
+        .text_color(rgb(if selected {
+            text_primary()
+        } else {
+            text_secondary()
+        }))
+        .hover(|s| s.text_color(rgb(text_primary())))
+        .when(selected, |tab| tab.border_b_2().border_color(rgb(accent())))
+        .on_click(cx.listener(move |this, _, _, cx| {
+            this.profile_select_social_tab(list_type, cx);
+        }))
+        .child(format!("{label} ({count})"))
+        .into_any_element()
+}
+
+fn presence_dot(presence: &Presence) -> AnyElement {
+    let color = presence_dot_color(&presence.availability);
+    div()
+        .absolute()
+        .bottom(px(0.))
+        .right(px(0.))
+        .w(px(14.))
+        .h(px(14.))
+        .rounded_full()
+        .bg(panel_surface())
+        .flex()
+        .items_center()
+        .justify_center()
+        .child(div().w(px(10.)).h(px(10.)).rounded_full().bg(rgb(color)))
+        .into_any_element()
+}
+
+fn presence_dot_small(presence: &Presence) -> AnyElement {
+    let color = presence_dot_color(&presence.availability);
+    div()
+        .absolute()
+        .bottom(px(0.))
+        .right(px(0.))
+        .w(px(12.))
+        .h(px(12.))
+        .rounded_full()
+        .bg(panel_surface())
+        .flex()
+        .items_center()
+        .justify_center()
+        .child(div().w(px(8.)).h(px(8.)).rounded_full().bg(rgb(color)))
+        .into_any_element()
+}
+
+fn presence_dot_color(availability: &Availability) -> u32 {
+    match availability {
+        Availability::Active => success(),
+        Availability::Away => warning(),
+        Availability::DoNotDisturb => danger(),
+        Availability::Offline | Availability::Unknown => text_secondary(),
+    }
+}
+
+fn render_proofs_section(proofs: Vec<crate::domain::profile::IdentityProof>) -> AnyElement {
+    div()
+        .rounded_lg()
+        .bg(panel_surface())
+        .border_1()
+        .border_color(rgb(border()))
+        .p_3()
+        .flex()
+        .flex_col()
+        .gap_2()
+        .child(section_header("Identity proofs"))
+        .children(proofs.into_iter().map(|proof| {
+            let (label, state_bg, state_fg) = match proof.state {
+                ProofState::Verified => ("verified", success_soft(), success()),
+                ProofState::Broken => ("broken", danger_soft(), danger()),
+                ProofState::Pending => ("pending", warning_soft(), warning()),
+                ProofState::Unknown => ("unknown", panel_alt_bg(), text_secondary()),
+            };
+            div()
+                .rounded_md()
+                .bg(panel_alt_surface())
+                .px_2()
+                .py_2()
+                .flex()
+                .items_center()
+                .justify_between()
+                .child(
+                    div()
+                        .text_sm()
+                        .text_color(rgb(text_primary()))
+                        .child(format!(
+                            "{} \u{00B7} {}",
+                            proof.service_name, proof.service_username
+                        )),
+                )
+                .child(badge(label, state_bg, state_fg))
+                .into_any_element()
+        }))
+        .into_any_element()
+}
+
+fn render_teams_section(teams: Vec<crate::domain::profile::TeamShowcaseEntry>) -> AnyElement {
+    div()
+        .rounded_lg()
+        .bg(panel_surface())
+        .border_1()
+        .border_color(rgb(border()))
+        .p_3()
+        .flex()
+        .flex_col()
+        .gap_2()
+        .child(section_header("Teams"))
+        .children(teams.into_iter().map(|team| {
+            div()
+                .rounded_md()
+                .bg(panel_alt_surface())
+                .px_2()
+                .py_2()
+                .flex()
+                .flex_col()
+                .gap_0p5()
+                .child(
+                    div()
+                        .text_sm()
+                        .text_color(rgb(text_primary()))
+                        .child(team.name),
+                )
+                .when(!team.description.trim().is_empty(), |card| {
+                    card.child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(text_secondary()))
+                            .child(team.description),
+                    )
+                })
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(rgb(text_secondary()))
+                        .child(format!("{} members", team.members_count)),
+                )
+                .into_any_element()
+        }))
+        .into_any_element()
+}
+
+fn render_custom_fields_section(fields: Vec<crate::domain::profile::CustomField>) -> AnyElement {
+    div()
+        .rounded_lg()
+        .bg(panel_surface())
+        .border_1()
+        .border_color(rgb(border()))
+        .p_3()
+        .flex()
+        .flex_col()
+        .gap_2()
+        .child(section_header("Details"))
+        .children(fields.into_iter().map(|field| {
+            div()
+                .rounded_md()
+                .bg(panel_alt_surface())
+                .px_2()
+                .py_2()
+                .flex()
+                .justify_between()
+                .items_center()
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(rgb(text_secondary()))
+                        .child(field.label),
+                )
+                .child(
+                    div()
+                        .text_sm()
+                        .text_color(rgb(text_primary()))
+                        .child(field.value),
+                )
+                .into_any_element()
+        }))
+        .into_any_element()
+}
+
+fn profile_social_graph(profile: &UserProfile) -> Option<&SocialGraph> {
+    profile.sections.iter().find_map(|section| match section {
+        ProfileSection::SocialGraph(graph) => Some(graph),
+        _ => None,
+    })
+}
+
+fn social_graph_entries(
+    social_graph: Option<&SocialGraph>,
+    tab: SocialTab,
+) -> Vec<crate::domain::profile::SocialGraphEntry> {
+    match (social_graph, tab) {
+        (Some(graph), SocialTab::Followers) => graph.followers.clone().unwrap_or_default(),
+        (Some(graph), SocialTab::Following) => graph.following.clone().unwrap_or_default(),
+        (None, _) => Vec::new(),
+    }
+}
+
+fn profile_identity_proofs(profile: &UserProfile) -> Vec<crate::domain::profile::IdentityProof> {
+    profile
+        .sections
+        .iter()
+        .find_map(|section| match section {
+            ProfileSection::IdentityProofs(items) => Some(items.clone()),
+            _ => None,
+        })
+        .unwrap_or_default()
+}
+
+fn profile_team_showcase(profile: &UserProfile) -> Vec<crate::domain::profile::TeamShowcaseEntry> {
+    profile
+        .sections
+        .iter()
+        .find_map(|section| match section {
+            ProfileSection::TeamShowcase(items) => Some(items.clone()),
+            _ => None,
+        })
+        .unwrap_or_default()
+}
+
+fn profile_custom_fields(profile: &UserProfile) -> Vec<crate::domain::profile::CustomField> {
+    profile
+        .sections
+        .iter()
+        .find_map(|section| match section {
+            ProfileSection::CustomFields(items) => Some(items.clone()),
+            _ => None,
+        })
+        .unwrap_or_default()
+}
+
+fn presence_label(presence: &Presence) -> String {
+    let base = match presence.availability {
+        Availability::Active => "Active",
+        Availability::Away => "Away",
+        Availability::DoNotDisturb => "Do not disturb",
+        Availability::Offline => "Offline",
+        Availability::Unknown => "",
+    };
+    let status = presence.status_text.as_deref().map(str::trim).unwrap_or("");
+    match (base.is_empty(), status.is_empty()) {
+        (true, true) => String::new(),
+        (true, false) => status.to_string(),
+        (false, true) => base.to_string(),
+        (false, false) => format!("{base} \u{00B7} {status}"),
+    }
+}
+
+fn profile_name_color(affinity: Affinity) -> u32 {
+    match affinity {
+        Affinity::None => text_primary(),
+        Affinity::Positive => success(),
+        Affinity::Broken => danger(),
+    }
+}
+
+fn default_presence() -> Presence {
+    Presence {
+        availability: Availability::Unknown,
+        status_text: None,
+    }
+}

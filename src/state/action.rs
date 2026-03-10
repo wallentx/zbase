@@ -1,7 +1,9 @@
 use crate::domain::{
-    ids::{ConversationId, MessageId},
+    ids::{ConversationId, MessageId, UserId},
+    profile::SocialGraphListType,
     route::Route,
     search::SearchFilter,
+    user::UserSummary,
 };
 
 use super::state::TimelineKey;
@@ -24,6 +26,18 @@ pub enum UiAction {
     SetSidebarFilter(String),
     SetSearchQuery(String),
     SubmitSearch,
+    OpenNewChat,
+    CloseNewChat,
+    NewChatSearchUsers {
+        query: String,
+    },
+    NewChatAddParticipant {
+        user: UserSummary,
+    },
+    NewChatRemoveParticipant {
+        user_id: UserId,
+    },
+    NewChatCreate,
     QuickSwitcherSearch {
         seq: u64,
         query: String,
@@ -41,6 +55,26 @@ pub enum UiAction {
     SendMessage {
         key: DraftKey,
     },
+    EditMessage {
+        conversation_id: ConversationId,
+        message_id: MessageId,
+        text: String,
+    },
+    DeleteMessage {
+        conversation_id: ConversationId,
+        message_id: MessageId,
+    },
+    SendAttachment {
+        key: DraftKey,
+        local_path: String,
+        filename: String,
+        caption: String,
+    },
+    ReactToMessage {
+        conversation_id: ConversationId,
+        message_id: MessageId,
+        emoji: String,
+    },
     StartCall {
         conversation_id: ConversationId,
     },
@@ -55,5 +89,28 @@ pub enum UiAction {
     LoadOlderMessages {
         key: TimelineKey,
         cursor: String,
+    },
+    ShowUserProfileCard {
+        user_id: UserId,
+    },
+    ShowUserProfilePanel {
+        user_id: UserId,
+    },
+    OpenOrCreateDirectMessage {
+        user_id: UserId,
+    },
+    RefreshProfilePresence {
+        user_id: UserId,
+        conversation_id: Option<ConversationId>,
+    },
+    LoadSocialGraphList {
+        user_id: UserId,
+        list_type: SocialGraphListType,
+    },
+    FollowUser {
+        user_id: UserId,
+    },
+    UnfollowUser {
+        user_id: UserId,
     },
 }

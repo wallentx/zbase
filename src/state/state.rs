@@ -1,12 +1,15 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::domain::{
+    affinity::Affinity,
     backend::{AccountId, BackendCapabilities, BackendId},
     call::CallStatus,
     conversation::ConversationSummary,
     ids::{CallId, ConversationId, MessageId, SidebarSectionId, UserId, WorkspaceId},
-    message::MessageRecord,
+    message::{EmojiSourceRef, MessageRecord},
     pins::PinnedState,
+    presence::Presence,
+    profile::UserProfile,
     route::Route,
     search::{SearchFilter, SearchResult},
     user::UserSummary,
@@ -121,12 +124,21 @@ pub struct UiSearchState {
 }
 
 #[derive(Clone, Debug, Default)]
+pub struct UiNewChatState {
+    pub open: bool,
+    pub search_query: String,
+    pub search_results: Vec<UserSummary>,
+    pub selected_participants: Vec<UserSummary>,
+    pub creating: bool,
+    pub error: Option<String>,
+}
+
+#[derive(Clone, Debug, Default)]
 pub struct UiOverlayState {
     pub quick_switcher_open: bool,
     pub command_palette_open: bool,
     pub emoji_picker_open: bool,
     pub active_modal: Option<String>,
-    pub active_context_menu: Option<String>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -158,7 +170,11 @@ pub struct AccountState {
 pub struct BackendRuntimeState {
     pub accounts: HashMap<AccountId, AccountState>,
     pub user_profiles: HashMap<UserId, UserProfileState>,
+    pub user_affinities: HashMap<UserId, Affinity>,
+    pub user_presences: HashMap<UserId, Presence>,
+    pub profile_panel: UserProfilePanelState,
     pub conversation_emojis: HashMap<ConversationId, HashMap<String, EmojiRenderState>>,
+    pub emoji_sources: HashMap<String, EmojiRenderState>,
     pub message_reactions: HashMap<ConversationId, HashMap<MessageId, Vec<MessageReactionState>>>,
     pub conversation_pins: HashMap<ConversationId, PinnedState>,
     pub conversation_team_ids: HashMap<ConversationId, String>,
@@ -175,6 +191,13 @@ pub struct UserProfileState {
     pub updated_ms: i64,
 }
 
+#[derive(Clone, Debug, Default)]
+pub struct UserProfilePanelState {
+    pub profiles: HashMap<UserId, UserProfile>,
+    pub loading: HashSet<UserId>,
+    pub loading_social_list: HashSet<UserId>,
+}
+
 #[derive(Clone, Debug)]
 pub struct EmojiRenderState {
     pub alias: String,
@@ -186,6 +209,7 @@ pub struct EmojiRenderState {
 #[derive(Clone, Debug)]
 pub struct MessageReactionState {
     pub emoji: String,
+    pub source_ref: Option<EmojiSourceRef>,
     pub actor_ids: Vec<UserId>,
     pub updated_ms: i64,
 }
@@ -201,6 +225,7 @@ pub struct UiState {
     pub timeline: UiTimelineState,
     pub thread: UiThreadState,
     pub search: UiSearchState,
+    pub new_chat: UiNewChatState,
     pub overlay: UiOverlayState,
     pub call: UiCallState,
     pub notifications: UiNotificationsState,
@@ -231,6 +256,7 @@ impl Default for UiState {
             timeline: UiTimelineState::default(),
             thread: UiThreadState::default(),
             search: UiSearchState::default(),
+            new_chat: UiNewChatState::default(),
             overlay: UiOverlayState::default(),
             call: UiCallState::default(),
             notifications: UiNotificationsState::default(),

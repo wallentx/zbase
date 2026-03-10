@@ -10,10 +10,12 @@ pub mod input;
 pub mod main_panel;
 pub mod overlays;
 pub mod preferences;
+pub mod profile;
 pub mod right_pane;
 pub mod search;
 pub mod selectable_text;
 pub mod sidebar;
+pub mod splash;
 pub mod timeline;
 
 use gpui::{
@@ -55,8 +57,14 @@ struct Palette {
     warning_soft: u32,
     danger: u32,
     danger_soft: u32,
+    affinity_positive: u32,
+    affinity_positive_soft: u32,
+    affinity_broken: u32,
+    affinity_broken_soft: u32,
     mention: u32,
     mention_soft: u32,
+    mention_you: u32,
+    mention_you_soft: u32,
     selection: u32,
 }
 
@@ -83,8 +91,14 @@ const LIGHT_PALETTE: Palette = Palette {
     warning_soft: 0xf8efdf,
     danger: 0xb47a74,
     danger_soft: 0xf7ecea,
+    affinity_positive: 0x5e8f88,
+    affinity_positive_soft: 0xe9f3f1,
+    affinity_broken: 0xb47a74,
+    affinity_broken_soft: 0xf7ecea,
     mention: 0x6588a7,
     mention_soft: 0xe9f0f5,
+    mention_you: 0xa58558,
+    mention_you_soft: 0xf8efdf,
     selection: 0x6f87ad26,
 };
 
@@ -111,8 +125,14 @@ const DARK_PALETTE: Palette = Palette {
     warning_soft: 0x352b1d,
     danger: 0xc6918c,
     danger_soft: 0x362220,
+    affinity_positive: 0x79b2a7,
+    affinity_positive_soft: 0x1e302f,
+    affinity_broken: 0xc6918c,
+    affinity_broken_soft: 0x362220,
     mention: 0x8eb4d2,
     mention_soft: 0x1f3140,
+    mention_you: 0xc9a978,
+    mention_you_soft: 0x352b1d,
     selection: 0x8aa4c733,
 };
 
@@ -236,6 +256,22 @@ pub fn danger_soft() -> u32 {
     palette().danger_soft
 }
 
+pub fn affinity_positive() -> u32 {
+    palette().affinity_positive
+}
+
+pub fn affinity_positive_soft() -> u32 {
+    palette().affinity_positive_soft
+}
+
+pub fn affinity_broken() -> u32 {
+    palette().affinity_broken
+}
+
+pub fn affinity_broken_soft() -> u32 {
+    palette().affinity_broken_soft
+}
+
 pub fn mention() -> u32 {
     palette().mention
 }
@@ -244,9 +280,52 @@ pub fn mention_soft() -> u32 {
     palette().mention_soft
 }
 
+pub fn mention_you() -> u32 {
+    palette().mention_you
+}
+
+pub fn mention_you_soft() -> u32 {
+    palette().mention_you_soft
+}
+
 pub fn selection() -> u32 {
     palette().selection
 }
+
+pub fn mention_colors_for_user(
+    affinity_index: &std::collections::HashMap<
+        crate::domain::ids::UserId,
+        crate::domain::affinity::Affinity,
+    >,
+    current_user_id: Option<&crate::domain::ids::UserId>,
+    user_id: &crate::domain::ids::UserId,
+) -> (u32, u32) {
+    if current_user_id.is_some_and(|me| me.0.eq_ignore_ascii_case(&user_id.0)) {
+        return (mention_you(), mention_you_soft());
+    }
+    let affinity = affinity_index
+        .get(user_id)
+        .copied()
+        .or_else(|| {
+            let lower = user_id.0.to_ascii_lowercase();
+            if lower == user_id.0 {
+                None
+            } else {
+                affinity_index
+                    .get(&crate::domain::ids::UserId::new(lower))
+                    .copied()
+            }
+        })
+        .unwrap_or(crate::domain::affinity::Affinity::None);
+    match affinity {
+        crate::domain::affinity::Affinity::None => (mention(), mention_soft()),
+        crate::domain::affinity::Affinity::Positive => {
+            (affinity_positive(), affinity_positive_soft())
+        }
+        crate::domain::affinity::Affinity::Broken => (affinity_broken(), affinity_broken_soft()),
+    }
+}
+
 pub const WINDOW_MIN_WIDTH_PX: f32 = 780.0;
 pub const WINDOW_MIN_HEIGHT_PX: f32 = 680.0;
 pub const SHELL_HORIZONTAL_PADDING_PX: f32 = 0.0;
@@ -273,8 +352,8 @@ pub fn app_backdrop() -> Background {
     } else {
         linear_gradient(
             135.,
-            linear_color_stop(tint(0xedf2f7, 0.55), 0.0),
-            linear_color_stop(tint(0xe2e8f0, 0.60), 1.0),
+            linear_color_stop(tint(0xf0f5f9, 0.62), 0.0),
+            linear_color_stop(tint(0xeaeff5, 0.66), 1.0),
         )
     }
 }
@@ -289,7 +368,7 @@ pub fn glass_surface() -> Hsla {
 
 pub fn glass_surface_strong() -> Hsla {
     if is_dark_theme() {
-        tint(0x141d25, 0.30)
+        tint(0x212f3e, 0.46)
     } else {
         tint(0xffffff, 0.88)
     }
@@ -297,9 +376,9 @@ pub fn glass_surface_strong() -> Hsla {
 
 pub fn glass_surface_dark() -> Hsla {
     if is_dark_theme() {
-        tint(0x141d25, 0.95)
+        tint(0x111920, 0.92)
     } else {
-        tint(0xffffff, 0.40)
+        tint(0xffffff, 0.76)
     }
 }
 
@@ -313,9 +392,9 @@ pub fn modal_surface() -> Hsla {
 
 pub fn content_surface() -> Hsla {
     if is_dark_theme() {
-        tint(0x141d25, 0.50)
+        tint(0x182330, 0.65)
     } else {
-        tint(0xffffff, 0.72)
+        tint(0xffffff, 0.82)
     }
 }
 
@@ -560,13 +639,12 @@ fn percent_decode(value: &str) -> String {
     let mut out = String::with_capacity(value.len());
     let mut index = 0usize;
     while index < bytes.len() {
-        if bytes[index] == b'%' && index + 2 < bytes.len() {
-            if let (Some(hi), Some(lo)) = (hex(bytes[index + 1]), hex(bytes[index + 2])) {
+        if bytes[index] == b'%' && index + 2 < bytes.len()
+            && let (Some(hi), Some(lo)) = (hex(bytes[index + 1]), hex(bytes[index + 2])) {
                 out.push((hi << 4 | lo) as char);
                 index += 3;
                 continue;
             }
-        }
         out.push(bytes[index] as char);
         index += 1;
     }
@@ -620,6 +698,10 @@ pub fn plus_icon(color: u32) -> AnyElement {
 
 pub fn emoji_icon(color: u32) -> AnyElement {
     icon_asset("assets/icons/emoji.svg", 18., color)
+}
+
+pub fn paperclip_icon(color: u32) -> AnyElement {
+    icon_asset("assets/icons/paperclip.svg", 18., color)
 }
 
 pub fn mention_icon(color: u32) -> AnyElement {
@@ -692,6 +774,10 @@ pub fn close_icon(color: u32) -> AnyElement {
 
 pub fn crown_icon(color: u32) -> AnyElement {
     icon_asset("assets/icons/crown.svg", 14., color)
+}
+
+pub fn send_icon(color: u32) -> AnyElement {
+    icon_asset("assets/icons/send.svg", 16., color)
 }
 
 pub fn composer_tool(icon: AnyElement, color: u32) -> AnyElement {

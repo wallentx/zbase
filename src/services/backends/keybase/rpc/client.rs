@@ -2,6 +2,7 @@ use std::{collections::BTreeMap, io};
 
 use rmpv::Value;
 use tokio::sync::mpsc;
+use tokio::time::{self, Duration, Instant};
 
 use super::transport::FramedMsgpackTransport;
 
@@ -105,6 +106,83 @@ impl KeybaseRpcClient {
         ]);
         self.transport.write_value(&payload).await?;
         self.wait_for_response(msgid).await
+    }
+
+    /// Like `call`, but collects any in-flight callbacks/notifications that
+    /// arrive before the final response.
+    ///
+    /// This includes:
+    /// - type 0 RPC request callbacks (which are still acked)
+    /// - type 2 notifications (no ack required)
+    ///
+    /// Used for protocols like identify3 where proof rows are emitted via
+    /// `identify3Ui` notifications while the identify call is still in-flight.
+    pub async fn call_collecting_callbacks(
+        &mut self,
+        method: &str,
+        args: Vec<Value>,
+    ) -> io::Result<(Value, Vec<RpcNotification>)> {
+        const TRAILING_CALLBACK_IDLE_TIMEOUT: Duration = Duration::from_millis(200);
+        const TRAILING_CALLBACK_MAX_WINDOW: Duration = Duration::from_millis(1500);
+
+        let msgid = self.next_message_id();
+        let payload = Value::Array(vec![
+            Value::from(0),
+            Value::from(msgid),
+            Value::from(method),
+            Value::Array(args),
+        ]);
+        self.transport.write_value(&payload).await?;
+
+        let mut callbacks = Vec::new();
+        let mut response_value: Option<Value> = None;
+        let mut drain_deadline: Option<Instant> = None;
+
+        loop {
+            let message = if let Some(response) = response_value.as_ref() {
+                let Some(deadline) = drain_deadline else {
+                    return Ok((response.clone(), callbacks));
+                };
+                let now = Instant::now();
+                if now >= deadline {
+                    return Ok((response.clone(), callbacks));
+                }
+                let wait_for = (deadline - now).min(TRAILING_CALLBACK_IDLE_TIMEOUT);
+                match time::timeout(wait_for, self.transport.read_value()).await {
+                    Ok(result) => result?,
+                    Err(_) => return Ok((response.clone(), callbacks)),
+                }
+            } else {
+                self.transport.read_value().await?
+            };
+            match parse_response_message(message.clone()) {
+                Some((resp_msgid, error, result)) if resp_msgid == msgid => {
+                    if let Some(error_value) = error {
+                        return Err(io::Error::other(format!("rpc error: {error_value:?}")));
+                    }
+                    response_value = Some(result.unwrap_or(Value::Nil));
+                    drain_deadline = Some(Instant::now() + TRAILING_CALLBACK_MAX_WINDOW);
+                    continue;
+                }
+                _ => {}
+            }
+
+            if let Some((req_msgid, notification)) = parse_request_message(message.clone()) {
+                callbacks.push(notification);
+                let ack = Value::Array(vec![
+                    Value::from(1),
+                    Value::from(req_msgid),
+                    Value::Nil,
+                    Value::Nil,
+                ]);
+                self.transport.write_value(&ack).await?;
+                continue;
+            }
+
+            if let Some(notification) = parse_notification_message(message) {
+                callbacks.push(notification);
+            }
+        }
     }
 
     pub async fn run_notification_loop(

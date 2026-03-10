@@ -1,3 +1,5 @@
+use std::path::Path;
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AttachmentKind {
     Image,
@@ -47,5 +49,18 @@ impl Default for AttachmentSummary {
             waveform: None,
             source: None,
         }
+    }
+}
+
+pub fn attachment_kind_from_path(path: &Path) -> AttachmentKind {
+    let ext = path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| ext.to_ascii_lowercase());
+    match ext.as_deref() {
+        Some("jpg" | "jpeg" | "png" | "gif" | "bmp" | "webp") => AttachmentKind::Image,
+        Some("mp4" | "mov" | "avi" | "mkv") => AttachmentKind::Video,
+        Some("mp3" | "m4a" | "ogg" | "wav" | "aac") => AttachmentKind::Audio,
+        _ => AttachmentKind::File,
     }
 }

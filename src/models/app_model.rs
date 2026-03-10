@@ -1,4 +1,4 @@
-use crate::domain::ids::WorkspaceId;
+use crate::domain::ids::{UserId, WorkspaceId};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Connectivity {
@@ -13,6 +13,7 @@ pub struct AppModel {
     pub active_workspace_id: WorkspaceId,
     pub connectivity: Connectivity,
     pub global_unread_count: u32,
+    pub current_user_id: Option<UserId>,
     pub current_user_display_name: String,
     pub current_user_avatar_asset: Option<String>,
 }

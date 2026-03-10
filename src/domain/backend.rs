@@ -56,11 +56,14 @@ impl ProviderMessageRef {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Default)]
 pub struct BackendCapabilities {
     pub supports_threads: bool,
     pub supports_message_edit: bool,
     pub supports_message_delete: bool,
     pub supports_reactions: bool,
+    pub supports_custom_emoji: bool,
+    pub supports_user_affinity: bool,
     pub supports_pins: bool,
     pub supports_uploads: bool,
     pub supports_presence: bool,
@@ -68,8 +71,13 @@ pub struct BackendCapabilities {
     pub supports_calls: bool,
     pub supports_global_search: bool,
     pub supports_conversation_search: bool,
+    pub supports_user_search: bool,
     pub supports_mark_unread: bool,
     pub supports_scheduled_send: bool,
+    pub supports_create_conversation: bool,
+    pub supports_user_profiles: bool,
+    pub supports_identity_proofs: bool,
+    pub supports_social_graph: bool,
 }
 
 impl BackendCapabilities {
@@ -79,6 +87,8 @@ impl BackendCapabilities {
             supports_message_edit: true,
             supports_message_delete: true,
             supports_reactions: true,
+            supports_custom_emoji: true,
+            supports_user_affinity: true,
             supports_pins: true,
             supports_uploads: true,
             supports_presence: true,
@@ -86,28 +96,14 @@ impl BackendCapabilities {
             supports_calls: true,
             supports_global_search: true,
             supports_conversation_search: true,
+            supports_user_search: true,
             supports_mark_unread: true,
             supports_scheduled_send: false,
+            supports_create_conversation: true,
+            supports_user_profiles: true,
+            supports_identity_proofs: true,
+            supports_social_graph: true,
         }
     }
 }
 
-impl Default for BackendCapabilities {
-    fn default() -> Self {
-        Self {
-            supports_threads: false,
-            supports_message_edit: false,
-            supports_message_delete: false,
-            supports_reactions: false,
-            supports_pins: false,
-            supports_uploads: false,
-            supports_presence: false,
-            supports_typing: false,
-            supports_calls: false,
-            supports_global_search: false,
-            supports_conversation_search: false,
-            supports_mark_unread: false,
-            supports_scheduled_send: false,
-        }
-    }
-}

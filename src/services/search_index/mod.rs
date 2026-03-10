@@ -71,7 +71,7 @@ impl SearchIndex {
 
     pub fn open_at(path: impl AsRef<Path>) -> io::Result<Self> {
         let path = path.as_ref();
-        std::fs::create_dir_all(&path)?;
+        std::fs::create_dir_all(path)?;
 
         let schema = build_schema();
         let index = open_or_rebuild_index(path, schema)?;

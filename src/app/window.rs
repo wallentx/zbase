@@ -54,6 +54,7 @@ pub fn open_main_window(cx: &mut App) {
         let app_store = build_app_store(&models);
         let backend_router = build_backend_router(&models);
         let search_text = models.search.query.clone();
+        let emoji_picker_text = models.emoji_picker.query.clone();
         let find_in_chat_text = models.find_in_chat.query.clone();
         let composer_text = models.composer.draft_text.clone();
         let thread_text = models.thread_pane.reply_draft.clone();
@@ -68,11 +69,25 @@ pub fn open_main_window(cx: &mut App) {
                 )
             });
             let quick_switcher_input = cx.new(|cx| {
-                TextField::new(
+                TextField::new_with_key_context(
                     cx.focus_handle(),
                     "Jump to channel, DM, or message",
                     String::new(),
+                    "QuickSwitcherTextField",
                 )
+            });
+            let new_chat_input = cx.new(|cx| {
+                TextField::new(
+                    cx.focus_handle(),
+                    "Search people by username",
+                    String::new(),
+                )
+            });
+            let emoji_picker_input = cx.new(|cx| {
+                TextField::new(cx.focus_handle(), "Search emoji", emoji_picker_text.clone())
+            });
+            let file_upload_caption_input = cx.new(|cx| {
+                TextField::new_multiline(cx.focus_handle(), "Add a caption...", String::new(), 2)
             });
             let find_in_chat_input = cx.new(|cx| {
                 TextField::new_with_key_context(
@@ -83,19 +98,19 @@ pub fn open_main_window(cx: &mut App) {
                 )
             });
             let composer_input = cx.new(|cx| {
-                TextField::new_multiline(
+                TextField::new_auto_grow(
                     cx.focus_handle(),
                     "Message this conversation",
                     composer_text.clone(),
-                    5,
+                    8,
                 )
             });
             let thread_input = cx.new(|cx| {
-                TextField::new_multiline(
+                TextField::new_auto_grow(
                     cx.focus_handle(),
                     "Reply in thread",
                     thread_text.clone(),
-                    4,
+                    6,
                 )
             });
             let sidebar_filter_input = cx.new(|cx| {
@@ -112,6 +127,9 @@ pub fn open_main_window(cx: &mut App) {
                 backend_router,
                 cx.focus_handle(),
                 quick_switcher_input,
+                new_chat_input,
+                emoji_picker_input,
+                file_upload_caption_input,
                 find_in_chat_input,
                 search_input,
                 composer_input,

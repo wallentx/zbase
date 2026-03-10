@@ -1,5 +1,6 @@
 use crate::domain::{
     attachment::AttachmentSummary,
+    backend::BackendId,
     ids::{ConversationId, MessageId, UserId},
 };
 
@@ -23,15 +24,35 @@ pub enum BroadcastKind {
     All,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct EmojiSourceRef {
+    pub backend_id: BackendId,
+    pub ref_key: String,
+}
+
+impl EmojiSourceRef {
+    pub fn cache_key(&self) -> String {
+        format!("{}:{}", self.backend_id.0, self.ref_key)
+    }
+}
+
 #[derive(Clone, Debug)]
 pub enum MessageFragment {
     Text(String),
     InlineCode(String),
-    Emoji { alias: String },
+    Emoji {
+        alias: String,
+        source_ref: Option<EmojiSourceRef>,
+    },
     Mention(UserId),
-    ChannelMention { name: String },
+    ChannelMention {
+        name: String,
+    },
     BroadcastMention(BroadcastKind),
-    Link { url: String, display: String },
+    Link {
+        url: String,
+        display: String,
+    },
     Code(String),
     Quote(String),
 }
@@ -79,6 +100,7 @@ pub enum MessageSendState {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct MessageReaction {
     pub emoji: String,
+    pub source_ref: Option<EmojiSourceRef>,
     pub actor_ids: Vec<UserId>,
 }
 
@@ -100,6 +122,7 @@ pub struct MessageRecord {
     pub link_previews: Vec<LinkPreview>,
     pub permalink: String,
     pub fragments: Vec<MessageFragment>,
+    pub source_text: Option<String>,
     pub attachments: Vec<AttachmentSummary>,
     pub reactions: Vec<MessageReaction>,
     pub thread_reply_count: u32,

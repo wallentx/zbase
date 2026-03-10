@@ -124,15 +124,42 @@ impl CachedLinkPreview {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "fragment_type", rename_all = "snake_case")]
 pub enum CachedMessageFragment {
-    Text { text: String },
-    InlineCode { text: String },
-    Emoji { alias: String },
-    Mention { user_id: String },
-    ChannelMention { name: String },
-    BroadcastMention { kind: String },
-    Link { url: String, display: String },
-    Code { text: String },
-    Quote { text: String },
+    Text {
+        text: String,
+    },
+    InlineCode {
+        text: String,
+    },
+    Emoji {
+        alias: String,
+        #[serde(default)]
+        source_ref: Option<CachedEmojiSourceRef>,
+    },
+    Mention {
+        user_id: String,
+    },
+    ChannelMention {
+        name: String,
+    },
+    BroadcastMention {
+        kind: String,
+    },
+    Link {
+        url: String,
+        display: String,
+    },
+    Code {
+        text: String,
+    },
+    Quote {
+        text: String,
+    },
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct CachedEmojiSourceRef {
+    pub backend_id: String,
+    pub ref_key: String,
 }
 
 impl CachedMessageFragment {
@@ -140,8 +167,12 @@ impl CachedMessageFragment {
         match fragment {
             MessageFragment::Text(text) => Self::Text { text: text.clone() },
             MessageFragment::InlineCode(text) => Self::InlineCode { text: text.clone() },
-            MessageFragment::Emoji { alias } => Self::Emoji {
+            MessageFragment::Emoji { alias, source_ref } => Self::Emoji {
                 alias: alias.clone(),
+                source_ref: source_ref.as_ref().map(|source_ref| CachedEmojiSourceRef {
+                    backend_id: source_ref.backend_id.0.clone(),
+                    ref_key: source_ref.ref_key.clone(),
+                }),
             },
             MessageFragment::Mention(user_id) => Self::Mention {
                 user_id: user_id.0.clone(),
@@ -163,8 +194,16 @@ impl CachedMessageFragment {
         match self {
             Self::Text { text } => Some(MessageFragment::Text(text.clone())),
             Self::InlineCode { text } => Some(MessageFragment::InlineCode(text.clone())),
-            Self::Emoji { alias } => Some(MessageFragment::Emoji {
+            Self::Emoji { alias, source_ref } => Some(MessageFragment::Emoji {
                 alias: alias.clone(),
+                source_ref: source_ref.as_ref().map(|source_ref| {
+                    crate::domain::message::EmojiSourceRef {
+                        backend_id: crate::domain::backend::BackendId::new(
+                            source_ref.backend_id.clone(),
+                        ),
+                        ref_key: source_ref.ref_key.clone(),
+                    }
+                }),
             }),
             Self::Mention { user_id } => {
                 Some(MessageFragment::Mention(UserId::new(user_id.clone())))
@@ -393,6 +432,8 @@ pub struct CachedMessageRecord {
     pub thread_reply_count: u32,
     pub send_state: String,
     #[serde(default)]
+    pub source_text: Option<String>,
+    #[serde(default)]
     pub edit_id: Option<String>,
     #[serde(default)]
     pub edited_at_ms: Option<i64>,
@@ -435,6 +476,7 @@ impl CachedMessageRecord {
                 .collect(),
             thread_reply_count: message.thread_reply_count,
             send_state: message_send_state_label(&message.send_state).to_string(),
+            source_text: message.source_text.clone(),
             edit_id: message
                 .edited
                 .as_ref()
@@ -492,6 +534,7 @@ impl CachedMessageRecord {
                 .collect(),
             permalink: self.permalink.clone(),
             fragments,
+            source_text: self.source_text.clone(),
             attachments,
             reactions: Vec::new(),
             thread_reply_count: self.thread_reply_count,
@@ -578,6 +621,17 @@ pub struct CachedConversationEmoji {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct CachedMessageReaction {
     pub message_id: String,
+    pub emoji: String,
+    #[serde(default)]
+    pub source_ref: Option<CachedEmojiSourceRef>,
+    pub actor_id: String,
+    pub updated_ms: i64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct CachedReactionOp {
+    pub op_message_id: String,
+    pub target_message_id: String,
     pub emoji: String,
     pub actor_id: String,
     pub updated_ms: i64,
@@ -681,7 +735,7 @@ fn message_fragment_body_text(fragment: &MessageFragment) -> String {
         | MessageFragment::Code(text)
         | MessageFragment::Quote(text) => text.clone(),
         MessageFragment::InlineCode(text) => format!("`{text}`"),
-        MessageFragment::Emoji { alias } => format!(":{alias}:"),
+        MessageFragment::Emoji { alias, .. } => format!(":{alias}:"),
         MessageFragment::Mention(user_id) => format!("@{}", user_id.0),
         MessageFragment::ChannelMention { name } => format!("#{name}"),
         MessageFragment::BroadcastMention(BroadcastKind::Here) => "@here".to_string(),
@@ -739,6 +793,7 @@ mod tests {
                 MessageFragment::Code("let x = 1;".to_string()),
                 MessageFragment::Quote("quoted".to_string()),
             ],
+            source_text: None,
             attachments: Vec::new(),
             reactions: Vec::new(),
             thread_reply_count: 2,
@@ -835,6 +890,7 @@ mod tests {
             link_previews: Vec::new(),
             thread_reply_count: 0,
             send_state: "sent".to_string(),
+            source_text: None,
             edit_id: None,
             edited_at_ms: None,
         };

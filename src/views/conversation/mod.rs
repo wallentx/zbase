@@ -10,17 +10,18 @@ use crate::{
         avatar::{Avatar, default_avatar_background},
         chevron_down_icon, close_icon,
         composer::ComposerPanel,
-        glass_surface_dark,
-        hash_icon,
+        glass_surface_dark, hash_icon,
         input::TextField,
-        pin_icon, search_icon, shell_border, subtle_surface, text_primary, text_secondary,
+        is_dark_theme, pin_icon, search_icon, shell_border, subtle_surface, text_primary,
+        text_secondary,
         timeline::TimelineList,
+        tint,
     },
 };
 use gpui::prelude::FluentBuilder;
 use gpui::{
-    AnyElement, Context, Entity, FontWeight, InteractiveElement, IntoElement, ListState,
-    ParentElement, StatefulInteractiveElement, Styled, div, px, rgb,
+    AnyElement, Context, Entity, ExternalPaths, FontWeight, InteractiveElement, IntoElement,
+    ListState, ParentElement, StatefulInteractiveElement, Styled, div, px, rgb,
 };
 
 #[derive(Default)]
@@ -77,7 +78,23 @@ impl ConversationView {
             .flex()
             .flex_col()
             .overflow_hidden()
-            .child(ConversationHeader::default().render(conversation, cx))
+            .drag_over::<ExternalPaths>(|style, _, _, _| {
+                style
+                    .bg(if is_dark_theme() {
+                        tint(0x0b1117, 0.72)
+                    } else {
+                        tint(0xe8eef5, 0.70)
+                    })
+                    .border_2()
+                    .border_color(rgb(accent()))
+            })
+            .on_drop(cx.listener(|this, paths: &ExternalPaths, _, cx| {
+                let file_paths = paths.paths().to_vec();
+                if !file_paths.is_empty() {
+                    this.open_composer_file_upload_with_paths(file_paths, cx);
+                }
+            }))
+            .child(ConversationHeader.render(conversation, cx))
             .when_some(conversation.pinned_message.as_ref(), |container, pinned| {
                 container.child(Self::render_pinned_banner(pinned, cx))
             })
@@ -92,7 +109,22 @@ impl ConversationView {
                     .flex()
                     .flex_col()
                     .overflow_hidden()
-                    .child(TimelineList::default().render(timeline, timeline_list_state, cx))
+                    .child(TimelineList.render(timeline, timeline_list_state, cx))
+                    .when_some(timeline.typing_text.clone(), |container, typing_label| {
+                        container.child(
+                            div()
+                                .absolute()
+                                .left_0()
+                                .right_0()
+                                .bottom(px(0.))
+                                .pl(px(48.))
+                                .pr_4()
+                                .py_0p5()
+                                .text_xs()
+                                .text_color(rgb(text_secondary()))
+                                .child(typing_label),
+                        )
+                    })
                     .when(show_jump, |container| {
                         container.child(
                             div()
@@ -106,7 +138,7 @@ impl ConversationView {
                         )
                     }),
             )
-            .child(ComposerPanel::default().render(composer, composer_input, cx))
+            .child(ComposerPanel.render(composer, composer_input, cx))
             .into_any_element()
     }
 

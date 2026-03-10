@@ -30,13 +30,13 @@ impl MainPanelHost {
         cx: &mut Context<AppWindow>,
     ) -> AnyElement {
         let content = match &models.navigation.current {
-            Route::WorkspaceHome { .. } => WorkspaceHomeView::default().render(
+            Route::WorkspaceHome { .. } => WorkspaceHomeView.render(
                 &models.app,
                 &models.workspace,
                 &models.notifications,
                 cx,
             ),
-            Route::Channel { .. } | Route::DirectMessage { .. } => ConversationView::default()
+            Route::Channel { .. } | Route::DirectMessage { .. } => ConversationView
                 .render(
                     &models.conversation,
                     &models.timeline,
@@ -50,11 +50,11 @@ impl MainPanelHost {
                     cx,
                 ),
             Route::Search { .. } => {
-                SearchView::default().render(&models.search, video_render_cache, search_input, cx)
+                SearchView.render(&models.search, video_render_cache, search_input, cx)
             }
-            Route::Activity { .. } => InboxView::default().render(&models.notifications, cx),
-            Route::Preferences => PreferencesView::default().render(&models.settings, cx),
-            Route::ActiveCall { .. } => CallWindow::default().render(&models.call),
+            Route::Activity { .. } => InboxView.render(&models.notifications, cx),
+            Route::Preferences => PreferencesView.render(&models.settings, cx),
+            Route::ActiveCall { .. } => CallWindow.render(&models.call),
         };
 
         div()

@@ -15,12 +15,17 @@ actions!(
         OpenSearchPane,
         OpenSearch,
         ConfirmPrimary,
+        OpenQuickSwitcherRecent2,
+        OpenQuickSwitcherRecent3,
+        OpenQuickSwitcherRecent4,
+        OpenQuickSwitcherRecent5,
         SelectPrevious,
         SelectNext,
         SelectSidebarPrevious,
         SelectSidebarNext,
         ActivateSidebarSelection,
         ToggleQuickSwitcher,
+        OpenNewChat,
         ToggleFindInChat,
         CloseFindInChat,
         FindNextMatch,
@@ -29,6 +34,9 @@ actions!(
         ToggleKeybaseInspector,
         ToggleBenchmarkCapture,
         DismissOverlays,
+        EditLastMessage,
+        CancelEdit,
+        ToggleSplashScreen,
     ]
 );
 

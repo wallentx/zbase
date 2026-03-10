@@ -1,14 +1,20 @@
 use crate::{
+    domain::attachment::{AttachmentKind, AttachmentSource, AttachmentSummary},
     models::{
+        emoji_picker_model::EmojiPickerModel,
+        file_upload_model::FileUploadLightboxModel,
+        new_chat_model::NewChatModel,
         notifications_model::NotificationsModel,
         overlay_model::{FullscreenImageOverlay, OverlayModel},
+        profile_panel_model::ProfilePanelModel,
         quick_switcher_model::{QuickSwitcherModel, QuickSwitcherResult, QuickSwitcherResultKind},
     },
+    state::state::EmojiRenderState,
     views::{
-        accent, accent_soft, app_window::AppWindow, badge, card_shadow, dm_icon, hash_icon,
-        image_source_from_attachment_source, input::TextField, modal_surface, panel_alt_bg,
-        panel_surface, search_icon, shell_border, shell_border_strong, subtle_surface,
-        text_primary, text_secondary, tint,
+        accent, accent_soft, app_window::AppWindow, attachment_display_label, badge, card_shadow,
+        dm_icon, hash_icon, image_source_from_attachment_source, input::TextField, modal_surface,
+        panel_alt_bg, panel_surface, search_icon, shell_border, shell_border_strong,
+        subtle_surface, text_primary, text_secondary, tint,
     },
 };
 use gpui::prelude::FluentBuilder;
@@ -17,9 +23,14 @@ use gpui::{
     ParentElement, SharedString, StatefulInteractiveElement, Styled, StyledImage, div, img, px,
     rgb,
 };
+use std::collections::HashMap;
+
+mod emoji_picker;
+mod new_chat;
 
 const QUICK_SWITCHER_RENDER_LIMIT_UNREAD: usize = 14;
 const QUICK_SWITCHER_RENDER_LIMIT_RECENT: usize = 14;
+const QUICK_SWITCHER_RECENT_SHORTCUT_LIMIT: usize = 5;
 const QUICK_SWITCHER_RENDER_LIMIT_CONVERSATIONS: usize = 3;
 const QUICK_SWITCHER_RENDER_LIMIT_MESSAGES: usize = 10;
 
@@ -30,25 +41,37 @@ impl OverlayHost {
     pub fn render(
         &self,
         overlay: &OverlayModel,
+        profile_panel: &ProfilePanelModel,
         _notifications: &NotificationsModel,
         quick_switcher: &QuickSwitcherModel,
+        new_chat: &NewChatModel,
         quick_switcher_input: &Entity<TextField>,
+        new_chat_input: &Entity<TextField>,
+        file_upload_caption_input: &Entity<TextField>,
+        emoji_picker_state: &EmojiPickerModel,
+        emoji_picker_input: &Entity<TextField>,
+        custom_emoji_index: Option<&HashMap<String, EmojiRenderState>>,
+        supports_custom_emoji: bool,
         quick_switcher_indexing_status: Option<&str>,
         cx: &mut Context<AppWindow>,
     ) -> AnyElement {
         if overlay.active_modal.is_none()
-            && overlay.active_context_menu.is_none()
+            && !overlay.new_chat_open
             && !overlay.quick_switcher_open
             && !overlay.command_palette_open
             && !overlay.emoji_picker_open
             && overlay.fullscreen_image.is_none()
+            && overlay.file_upload_lightbox.is_none()
+            && overlay.profile_card_user_id.is_none()
         {
             return div().into_any_element();
         }
 
-        let has_backdrop = overlay.quick_switcher_open
+        let has_backdrop = overlay.new_chat_open
+            || overlay.quick_switcher_open
             || overlay.command_palette_open
-            || overlay.fullscreen_image.is_some();
+            || overlay.fullscreen_image.is_some()
+            || overlay.file_upload_lightbox.is_some();
 
         div()
             .absolute()
@@ -65,6 +88,13 @@ impl OverlayHost {
                         this.dismiss_overlays(cx);
                     }))
             })
+            .when(overlay.new_chat_open, |container| {
+                container.child(new_chat::render_new_chat_modal(
+                    new_chat,
+                    new_chat_input,
+                    cx,
+                ))
+            })
             .when(overlay.quick_switcher_open, |container| {
                 container.child(Self::render_search_overlay(
                     quick_switcher,
@@ -79,6 +109,16 @@ impl OverlayHost {
             .when_some(overlay.fullscreen_image.as_ref(), |container, image| {
                 container.child(Self::render_fullscreen_image_overlay(image, cx))
             })
+            .when_some(
+                overlay.file_upload_lightbox.as_ref(),
+                |container, lightbox| {
+                    container.child(Self::render_file_upload_lightbox(
+                        lightbox,
+                        file_upload_caption_input,
+                        cx,
+                    ))
+                },
+            )
             .when(!has_backdrop, |d| {
                 d.justify_end().items_end().px_6().pb_4().child(
                     div()
@@ -105,74 +145,26 @@ impl OverlayHost {
                                     ),
                             )
                         })
-                        .when_some(overlay.active_context_menu.as_ref(), |container, menu| {
-                            container.child(
-                                div()
-                                    .rounded_lg()
-                                    .bg(panel_surface())
-                                    .px_3()
-                                    .py_2()
-                                    .flex()
-                                    .items_center()
-                                    .gap_2()
-                                    .child(menu.clone())
-                                    .child(
-                                        div()
-                                            .id("overlay-context-close")
-                                            .on_click(cx.listener(|this, _, _, cx| {
-                                                this.dismiss_overlays(cx);
-                                            }))
-                                            .child(badge("Done", panel_alt_bg(), text_primary())),
-                                    ),
-                            )
-                        })
                         .when(overlay.emoji_picker_open, |container| {
-                            container.child(
-                                div()
-                                    .rounded_lg()
-                                    .bg(panel_surface())
-                                    .px_3()
-                                    .py_2()
-                                    .flex()
-                                    .gap_2()
-                                    .child(
-                                        div()
-                                            .id("overlay-emoji-smile")
-                                            .on_click(cx.listener(|this, _, _, cx| {
-                                                this.composer_insert_emoji("🙂 ", cx);
-                                            }))
-                                            .child(badge("🙂", panel_alt_bg(), text_primary())),
-                                    )
-                                    .child(
-                                        div()
-                                            .id("overlay-emoji-rocket")
-                                            .on_click(cx.listener(|this, _, _, cx| {
-                                                this.composer_insert_emoji("🚀 ", cx);
-                                            }))
-                                            .child(badge("🚀", panel_alt_bg(), text_primary())),
-                                    )
-                                    .child(
-                                        div()
-                                            .id("overlay-emoji-check")
-                                            .on_click(cx.listener(|this, _, _, cx| {
-                                                this.thread_insert_emoji("✅ ", cx);
-                                            }))
-                                            .child(badge("✅", panel_alt_bg(), text_primary())),
-                                    )
-                                    .child(
-                                        div()
-                                            .id("overlay-emoji-close")
-                                            .on_click(cx.listener(|this, _, _, cx| {
-                                                this.dismiss_overlays(cx);
-                                            }))
-                                            .child(badge(
-                                                "Close",
-                                                panel_alt_bg(),
-                                                text_secondary(),
-                                            )),
-                                    ),
-                            )
-                        }),
+                            container.child(emoji_picker::render_emoji_picker(
+                                overlay,
+                                emoji_picker_state,
+                                emoji_picker_input,
+                                custom_emoji_index,
+                                supports_custom_emoji,
+                                cx,
+                            ))
+                        })
+                        .when_some(
+                            overlay.profile_card_user_id.as_ref(),
+                            |container, user_id| {
+                                container.child(crate::views::profile::render_profile_card(
+                                    profile_panel,
+                                    user_id,
+                                    cx,
+                                ))
+                            },
+                        ),
                 )
             })
             .into_any_element()
@@ -210,6 +202,8 @@ impl OverlayHost {
                 )
                 .into_any_element();
         };
+        let (frame_width, frame_height) =
+            fullscreen_image_frame_size(image.width, image.height, 1120.0, 780.0);
 
         div()
             .id("overlay-fullscreen-image")
@@ -231,10 +225,97 @@ impl OverlayHost {
                     .justify_center()
                     .gap_3()
                     .child(
-                        div().flex_1().w_full().min_h(px(0.)).child(
-                            img(image_source)
-                                .w_full()
-                                .h_full()
+                        div()
+                            .flex_1()
+                            .w_full()
+                            .min_h(px(0.))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .child(
+                                img(image_source)
+                                    .w(px(frame_width))
+                                    .h(px(frame_height))
+                                    .object_fit(ObjectFit::Contain)
+                                    .with_fallback(|| {
+                                        div()
+                                            .size_full()
+                                            .flex()
+                                            .items_center()
+                                            .justify_center()
+                                            .text_sm()
+                                            .text_color(rgb(text_secondary()))
+                                            .child("Image unavailable")
+                                            .into_any_element()
+                                    }),
+                            ),
+                    )
+                    .when_some(caption, |container, caption| {
+                        container.child(
+                            div()
+                                .max_w(px(900.))
+                                .text_sm()
+                                .text_color(rgb(text_primary()))
+                                .child(caption),
+                        )
+                    }),
+            )
+            .into_any_element()
+    }
+
+    fn render_file_upload_lightbox(
+        lightbox: &FileUploadLightboxModel,
+        file_upload_caption_input: &Entity<TextField>,
+        cx: &mut Context<AppWindow>,
+    ) -> AnyElement {
+        let total = lightbox.candidates.len();
+        let index = lightbox.current_index.min(total.saturating_sub(1));
+        let Some(candidate) = lightbox.candidates.get(index) else {
+            return div()
+                .mt(px(120.))
+                .w(px(420.))
+                .rounded_xl()
+                .border_1()
+                .border_color(shell_border_strong())
+                .bg(modal_surface())
+                .shadow(card_shadow())
+                .px_4()
+                .py_3()
+                .text_sm()
+                .text_color(rgb(text_primary()))
+                .child("No files selected.")
+                .into_any_element();
+        };
+
+        let source_text = candidate.path.to_string_lossy().to_string();
+        let image_source = AttachmentSource::LocalPath(source_text.clone());
+        let attachment_label = attachment_display_label(&AttachmentSummary {
+            name: candidate.filename.clone(),
+            kind: candidate.kind.clone(),
+            size_bytes: candidate.size_bytes,
+            ..AttachmentSummary::default()
+        });
+        let is_last = index + 1 >= total;
+        let counter = format!("{} of {}", index + 1, total);
+
+        let preview = match candidate.kind {
+            AttachmentKind::Image => {
+                if let Some(preview_source) = image_source_from_attachment_source(&image_source) {
+                    let (frame_width, frame_height) = file_upload_preview_frame_size(
+                        candidate.width,
+                        candidate.height,
+                        480.0,
+                        280.0,
+                    );
+                    div()
+                        .size_full()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .child(
+                            img(preview_source)
+                                .w(px(frame_width))
+                                .h(px(frame_height))
                                 .object_fit(ObjectFit::Contain)
                                 .with_fallback(|| {
                                     div()
@@ -247,15 +328,171 @@ impl OverlayHost {
                                         .child("Image unavailable")
                                         .into_any_element()
                                 }),
-                        ),
+                        )
+                        .into_any_element()
+                } else {
+                    div()
+                        .size_full()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .text_sm()
+                        .text_color(rgb(text_secondary()))
+                        .child("Image unavailable")
+                        .into_any_element()
+                }
+            }
+            AttachmentKind::Video => div()
+                .size_full()
+                .flex()
+                .items_center()
+                .justify_center()
+                .text_sm()
+                .text_color(rgb(text_secondary()))
+                .child("Video preview coming soon")
+                .into_any_element(),
+            AttachmentKind::Audio => div()
+                .size_full()
+                .flex()
+                .items_center()
+                .justify_center()
+                .text_sm()
+                .text_color(rgb(text_secondary()))
+                .child("Audio file selected")
+                .into_any_element(),
+            AttachmentKind::File => div()
+                .size_full()
+                .flex()
+                .items_center()
+                .justify_center()
+                .text_sm()
+                .text_color(rgb(text_secondary()))
+                .child("File selected")
+                .into_any_element(),
+        };
+
+        div()
+            .mt(px(96.))
+            .w(px(520.))
+            .max_h(px(620.))
+            .rounded_xl()
+            .border_1()
+            .border_color(shell_border_strong())
+            .bg(modal_surface())
+            .shadow(card_shadow())
+            .flex()
+            .flex_col()
+            .overflow_hidden()
+            .id("overlay-file-upload-lightbox")
+            .on_click(cx.listener(|_, _, _, cx| {
+                cx.stop_propagation();
+            }))
+            .child(
+                div()
+                    .px_4()
+                    .py_3()
+                    .border_b_1()
+                    .border_color(shell_border())
+                    .text_sm()
+                    .text_color(rgb(text_primary()))
+                    .child("Upload files"),
+            )
+            .child(
+                div()
+                    .px_4()
+                    .py_3()
+                    .flex_1()
+                    .min_h(px(0.))
+                    .flex()
+                    .flex_col()
+                    .gap_3()
+                    .child(
+                        div()
+                            .h(px(280.))
+                            .rounded_lg()
+                            .bg(panel_surface())
+                            .border_1()
+                            .border_color(shell_border())
+                            .overflow_hidden()
+                            .child(preview),
                     )
-                    .when_some(caption, |container, caption| {
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(rgb(text_primary()))
+                            .child(candidate.filename.clone()),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(text_secondary()))
+                            .child(format!("{counter} · {attachment_label}")),
+                    )
+                    .child(
+                        div()
+                            .id("file-upload-caption-input")
+                            .rounded_md()
+                            .bg(panel_surface())
+                            .border_1()
+                            .border_color(shell_border())
+                            .px_3()
+                            .py_2()
+                            .text_sm()
+                            .text_color(rgb(text_primary()))
+                            .on_click(cx.listener(AppWindow::focus_file_upload_caption_input))
+                            .child(file_upload_caption_input.clone()),
+                    ),
+            )
+            .child(
+                div()
+                    .px_4()
+                    .py_3()
+                    .border_t_1()
+                    .border_color(shell_border())
+                    .flex()
+                    .items_center()
+                    .justify_end()
+                    .gap_2()
+                    .child(
+                        div()
+                            .id("file-upload-cancel")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.file_upload_cancel(cx);
+                            }))
+                            .child(badge("Cancel", panel_alt_bg(), text_primary())),
+                    )
+                    .when(!is_last, |container| {
                         container.child(
                             div()
-                                .max_w(px(900.))
-                                .text_sm()
-                                .text_color(rgb(text_primary()))
-                                .child(caption),
+                                .id("file-upload-next")
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.file_upload_next(cx);
+                                }))
+                                .child(badge("Next", panel_alt_bg(), text_primary())),
+                        )
+                    })
+                    .when(is_last || total == 1, |container| {
+                        container.child(
+                            div()
+                                .id("file-upload-send")
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    if total > 1 {
+                                        this.file_upload_send_all(window, cx);
+                                    } else {
+                                        this.file_upload_send_current(window, cx);
+                                    }
+                                }))
+                                .child(badge("Send", accent(), panel_alt_bg())),
+                        )
+                    })
+                    .when(total > 1, |container| {
+                        container.child(
+                            div()
+                                .id("file-upload-send-all")
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.file_upload_send_all(window, cx);
+                                }))
+                                .child(badge("Send All", panel_alt_bg(), text_primary())),
                         )
                     }),
             )
@@ -314,6 +551,7 @@ impl OverlayHost {
                     "Unread",
                     &unread_indices,
                     quick_switcher,
+                    false,
                     cx,
                 ));
             }
@@ -322,6 +560,7 @@ impl OverlayHost {
                     "Recent",
                     &recent_indices,
                     quick_switcher,
+                    true,
                     cx,
                 ));
             }
@@ -331,6 +570,7 @@ impl OverlayHost {
                     "Channels and DMs",
                     &conversation_indices,
                     quick_switcher,
+                    false,
                     cx,
                 ));
             }
@@ -339,6 +579,7 @@ impl OverlayHost {
                     "Messages",
                     &message_indices,
                     quick_switcher,
+                    false,
                     cx,
                 ));
             }
@@ -354,7 +595,7 @@ impl OverlayHost {
                     .text_sm()
                     .text_color(rgb(text_secondary()))
                     .child(if query_empty {
-                        "No unread channels yet."
+                        "No conversations yet."
                     } else {
                         "No matches found."
                     }),
@@ -451,6 +692,7 @@ impl OverlayHost {
         title: &str,
         indices: &[usize],
         quick_switcher: &QuickSwitcherModel,
+        show_recent_shortcuts: bool,
         cx: &mut Context<AppWindow>,
     ) -> AnyElement {
         div()
@@ -464,16 +706,25 @@ impl OverlayHost {
                     .text_color(rgb(text_secondary()))
                     .child(title.to_string()),
             )
-            .children(indices.iter().filter_map(|index| {
-                quick_switcher.results.get(*index).map(|result| {
-                    Self::quick_switcher_row(
-                        *index,
-                        result,
-                        quick_switcher.selected_index == *index,
-                        cx,
-                    )
-                })
-            }))
+            .children(
+                indices
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(display_index, index)| {
+                        quick_switcher.results.get(*index).map(|result| {
+                            let shortcut_hint = (show_recent_shortcuts
+                                && display_index < QUICK_SWITCHER_RECENT_SHORTCUT_LIMIT)
+                                .then(|| format!("⌘+{}", display_index + 1));
+                            Self::quick_switcher_row(
+                                *index,
+                                result,
+                                quick_switcher.selected_index == *index,
+                                shortcut_hint,
+                                cx,
+                            )
+                        })
+                    }),
+            )
             .into_any_element()
     }
 
@@ -481,6 +732,7 @@ impl OverlayHost {
         index: usize,
         result: &QuickSwitcherResult,
         selected: bool,
+        shortcut_hint: Option<String>,
         cx: &mut Context<AppWindow>,
     ) -> AnyElement {
         let label_ranges = if matches!(result.kind, QuickSwitcherResultKind::Message) {
@@ -542,6 +794,14 @@ impl OverlayHost {
                         )
                     }),
             )
+            .when_some(shortcut_hint, |container, hint| {
+                container.child(
+                    div()
+                        .text_xs()
+                        .text_color(rgb(text_secondary()))
+                        .child(badge(hint, panel_alt_bg(), text_secondary())),
+                )
+            })
             .into_any_element()
     }
 
@@ -670,6 +930,13 @@ impl OverlayHost {
                     .flex_col()
                     .gap_1()
                     .child(Self::command_palette_row(
+                        "overlay-command-new-chat",
+                        "Start new chat",
+                        "⌘N",
+                        "new-chat",
+                        cx,
+                    ))
+                    .child(Self::command_palette_row(
                         "overlay-command-search",
                         "Search messages",
                         "⌘J",
@@ -732,4 +999,38 @@ impl OverlayHost {
             )
             .into_any_element()
     }
+}
+
+fn fullscreen_image_frame_size(
+    width: Option<u32>,
+    height: Option<u32>,
+    max_width: f32,
+    max_height: f32,
+) -> (f32, f32) {
+    let mut width = width.unwrap_or(1600) as f32;
+    let mut height = height.unwrap_or(1000) as f32;
+    if width <= 1.0 || height <= 1.0 {
+        return (max_width.min(900.0), max_height.min(600.0));
+    }
+    let scale = (max_width / width).min(max_height / height).min(1.0);
+    width *= scale;
+    height *= scale;
+    (width.max(120.0), height.max(120.0))
+}
+
+fn file_upload_preview_frame_size(
+    width: Option<u32>,
+    height: Option<u32>,
+    max_width: f32,
+    max_height: f32,
+) -> (f32, f32) {
+    let mut width = width.unwrap_or(900) as f32;
+    let mut height = height.unwrap_or(600) as f32;
+    if width <= 1.0 || height <= 1.0 {
+        return (max_width.min(420.0), max_height.min(240.0));
+    }
+    let scale = (max_width / width).min(max_height / height).min(1.0);
+    width *= scale;
+    height *= scale;
+    (width.max(60.0), height.max(60.0))
 }

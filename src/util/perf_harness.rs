@@ -12,7 +12,7 @@ const ENV_BENCH_LABEL: &str = "KBUI_BENCH_LABEL";
 const ENV_BENCH_SCENARIO: &str = "KBUI_BENCH_SCENARIO";
 const ENV_BENCH_OUTPUT: &str = "KBUI_BENCH_OUTPUT";
 
-const PERF_TIMER_COUNT: usize = 7;
+const PERF_TIMER_COUNT: usize = 8;
 
 #[derive(Clone, Copy, Debug)]
 pub enum PerfTimer {
@@ -20,6 +20,7 @@ pub enum PerfTimer {
     SidebarRender,
     MainPanelRender,
     RightPaneRender,
+    ComposerInputObserver,
     DispatchUiAction,
     SyncModelsFromStore,
     DrainBackendEvents,
@@ -31,6 +32,7 @@ impl PerfTimer {
         Self::SidebarRender,
         Self::MainPanelRender,
         Self::RightPaneRender,
+        Self::ComposerInputObserver,
         Self::DispatchUiAction,
         Self::SyncModelsFromStore,
         Self::DrainBackendEvents,
@@ -42,9 +44,10 @@ impl PerfTimer {
             Self::SidebarRender => 1,
             Self::MainPanelRender => 2,
             Self::RightPaneRender => 3,
-            Self::DispatchUiAction => 4,
-            Self::SyncModelsFromStore => 5,
-            Self::DrainBackendEvents => 6,
+            Self::ComposerInputObserver => 4,
+            Self::DispatchUiAction => 5,
+            Self::SyncModelsFromStore => 6,
+            Self::DrainBackendEvents => 7,
         }
     }
 
@@ -54,6 +57,7 @@ impl PerfTimer {
             Self::SidebarRender => "sidebar_render",
             Self::MainPanelRender => "main_panel_render",
             Self::RightPaneRender => "right_pane_render",
+            Self::ComposerInputObserver => "composer_input_observer",
             Self::DispatchUiAction => "dispatch_ui_action",
             Self::SyncModelsFromStore => "sync_models_from_store",
             Self::DrainBackendEvents => "drain_backend_events",

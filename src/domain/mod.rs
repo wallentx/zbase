@@ -1,3 +1,4 @@
+pub mod affinity;
 pub mod attachment;
 pub mod backend;
 pub mod call;
@@ -6,6 +7,7 @@ pub mod ids;
 pub mod message;
 pub mod pins;
 pub mod presence;
+pub mod profile;
 pub mod route;
 pub mod search;
 pub mod user;

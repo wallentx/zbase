@@ -3,7 +3,10 @@ use crate::{
     views::{
         accent,
         app_window::AppWindow,
-        input::{Copy, Down, End, Home, Left, Right, SelectAll, SelectLeft, SelectRight, Up},
+        input::{
+            Copy, Down, End, Home, Left, Right, SelectAll, SelectDown, SelectLeft, SelectRight,
+            SelectUp, Up,
+        },
         selection,
     },
 };
@@ -192,18 +195,25 @@ impl SelectableText {
     }
 
     fn move_vertical(&mut self, direction: f32, cx: &mut Context<Self>) {
-        let Some(layout) = self.last_layout.as_ref() else {
-            return;
-        };
+        if let Some(next) = self.vertical_target_offset(direction) {
+            self.move_to(next, cx);
+        }
+    }
+
+    fn select_vertical(&mut self, direction: f32, cx: &mut Context<Self>) {
+        if let Some(next) = self.vertical_target_offset(direction) {
+            self.select_to(next, cx);
+        }
+    }
+
+    fn vertical_target_offset(&self, direction: f32) -> Option<usize> {
+        let layout = self.last_layout.as_ref()?;
         let cursor = self.cursor_offset();
-        let Some(position) = layout.position_for_index(cursor) else {
-            return;
-        };
-        let next = layout.closest_index_for_position(point(
+        let position = layout.position_for_index(cursor)?;
+        Some(layout.closest_index_for_position(point(
             position.x,
             (position.y + layout.line_height * direction).max(px(0.)),
-        ));
-        self.move_to(next, cx);
+        )))
     }
 
     fn left(&mut self, _: &Left, _: &mut Window, cx: &mut Context<Self>) {
@@ -236,6 +246,14 @@ impl SelectableText {
 
     fn select_right(&mut self, _: &SelectRight, _: &mut Window, cx: &mut Context<Self>) {
         self.select_to(self.next_boundary(self.cursor_offset()), cx);
+    }
+
+    fn select_up(&mut self, _: &SelectUp, _: &mut Window, cx: &mut Context<Self>) {
+        self.select_vertical(-1.0, cx);
+    }
+
+    fn select_down(&mut self, _: &SelectDown, _: &mut Window, cx: &mut Context<Self>) {
+        self.select_vertical(1.0, cx);
     }
 
     fn select_all(&mut self, _: &SelectAll, _: &mut Window, cx: &mut Context<Self>) {
@@ -319,11 +337,23 @@ impl SelectableText {
     ) {
         self.is_selecting = true;
         window.focus(&self.focus_handle(cx));
+        let offset = self.index_for_mouse_position(event.position);
+
+        if !event.modifiers.shift {
+            if event.click_count >= 3 {
+                self.select_line_at(offset, cx);
+                return;
+            }
+            if event.click_count == 2 {
+                self.select_word_at(offset, cx);
+                return;
+            }
+        }
 
         if event.modifiers.shift {
-            self.select_to(self.index_for_mouse_position(event.position), cx);
+            self.select_to(offset, cx);
         } else {
-            self.move_to(self.index_for_mouse_position(event.position), cx);
+            self.move_to(offset, cx);
         }
     }
 
@@ -343,6 +373,7 @@ impl SelectableText {
 
     fn on_mouse_up(&mut self, event: &MouseUpEvent, window: &mut Window, cx: &mut Context<Self>) {
         if self.is_selecting {
+            self.select_to(self.index_for_mouse_position(event.position), cx);
             self.is_selecting = false;
             if self.selected_range.is_empty() {
                 let index = self.index_for_mouse_position(event.position);
@@ -358,6 +389,23 @@ impl SelectableText {
 
     pub fn is_selecting(&self) -> bool {
         self.is_selecting
+    }
+
+    fn select_word_at(&mut self, offset: usize, cx: &mut Context<Self>) {
+        let Some(range) = word_range_at_offset(&self.content, offset) else {
+            self.move_to(offset, cx);
+            return;
+        };
+        self.selected_range = range;
+        self.selection_reversed = false;
+        cx.notify();
+    }
+
+    fn select_line_at(&mut self, offset: usize, cx: &mut Context<Self>) {
+        let range = line_range_at_offset(&self.content, offset);
+        self.selected_range = range;
+        self.selection_reversed = false;
+        cx.notify();
     }
 
     fn build_text_runs(&self, base_color: Hsla, font: gpui::Font) -> Vec<TextRun> {
@@ -466,10 +514,15 @@ fn build_text_runs_for_content(
         if run_italic {
             run_font.style = FontStyle::Italic;
         }
+        let has_styled_color = styled_ranges
+            .iter()
+            .any(|s| s.color.is_some() && range_covers_span(&s.byte_range, span_start, span_end));
         let underline = if link_active {
-            run_color = link_color;
+            if !has_styled_color {
+                run_color = link_color;
+            }
             Some(UnderlineStyle {
-                color: Some(link_color),
+                color: Some(run_color),
                 ..Default::default()
             })
         } else {
@@ -528,7 +581,7 @@ struct InlineAttachmentPaint {
 #[cfg(debug_assertions)]
 fn selectable_text_debug_enabled() -> bool {
     std::env::var("KBUI_TEXT_DEBUG")
-        .map(|v| !v.trim().is_empty() && v != "0" && v.to_ascii_lowercase() != "false")
+        .map(|v| !v.trim().is_empty() && v != "0" && !v.eq_ignore_ascii_case("false"))
         .unwrap_or(false)
 }
 
@@ -565,7 +618,7 @@ fn debug_preview_text(value: &str, limit: usize) -> String {
         }
     }
     if value.chars().count() > limit {
-        out.push_str("…");
+        out.push('…');
     }
     out
 }
@@ -868,18 +921,15 @@ impl Render for SelectableText {
             .on_action(cx.listener(Self::down))
             .on_action(cx.listener(Self::select_left))
             .on_action(cx.listener(Self::select_right))
+            .on_action(cx.listener(Self::select_up))
+            .on_action(cx.listener(Self::select_down))
             .on_action(cx.listener(Self::select_all))
             .on_action(cx.listener(Self::home))
             .on_action(cx.listener(Self::end))
             .on_action(cx.listener(Self::copy))
             .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
             .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
-            .on_mouse_up_out(
-                MouseButton::Left,
-                cx.listener(|this: &mut Self, _: &MouseUpEvent, _, _| {
-                    this.is_selecting = false;
-                }),
-            )
+            .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .on_mouse_move(cx.listener(Self::on_mouse_move))
             .child(SelectableTextElement { view: cx.entity() })
     }
@@ -1250,6 +1300,52 @@ fn visual_segments(
 
 fn ranges_overlap(a: &Range<usize>, b: &Range<usize>) -> bool {
     a.start < b.end && b.start < a.end
+}
+
+fn word_range_at_offset(content: &str, offset: usize) -> Option<Range<usize>> {
+    if content.is_empty() {
+        return None;
+    }
+
+    let target = offset.min(content.len().saturating_sub(1));
+    let mut previous_word = None;
+    let mut next_word = None;
+    for (start, word) in content.unicode_word_indices() {
+        let end = start + word.len();
+        if target >= start && target < end {
+            return Some(start..end);
+        }
+        if end <= target {
+            previous_word = Some(start..end);
+            continue;
+        }
+        if start > target {
+            next_word = Some(start..end);
+            break;
+        }
+    }
+
+    previous_word.or(next_word).or_else(|| {
+        content
+            .split_word_bound_indices()
+            .find_map(|(start, segment)| {
+                let end = start + segment.len();
+                (target >= start && target < end).then_some(start..end)
+            })
+    })
+}
+
+fn line_range_at_offset(content: &str, offset: usize) -> Range<usize> {
+    if content.is_empty() {
+        return 0..0;
+    }
+
+    let cursor = offset.min(content.len());
+    let start = content[..cursor].rfind('\n').map_or(0, |index| index + 1);
+    let end = content[cursor..]
+        .find('\n')
+        .map_or(content.len(), |index| cursor + index);
+    start..end
 }
 
 fn resource_from_attachment_source(source: &str) -> Resource {

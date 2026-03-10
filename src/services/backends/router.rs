@@ -203,6 +203,33 @@ impl BackendRouter {
                     reply_to: reply_ref,
                 })
             }
+            BackendCommand::SendAttachment {
+                op_id,
+                draft_key: _,
+                conversation_id,
+                client_message_id,
+                local_path,
+                filename,
+                caption,
+            } => {
+                let binding = self
+                    .conversation_bindings
+                    .get(&conversation_id)
+                    .cloned()
+                    .ok_or_else(|| {
+                        BackendError::MissingConversationBinding(conversation_id.0.clone())
+                    })?;
+                let backend = self.backend_for_binding(&binding.backend_id)?;
+                backend.execute(RoutedBackendCommand::SendAttachment {
+                    op_id,
+                    account_id: binding.account_id,
+                    conversation: binding.provider_conversation_ref,
+                    client_message_id,
+                    local_path,
+                    filename,
+                    caption,
+                })
+            }
             BackendCommand::EditMessage {
                 op_id,
                 conversation_id,
@@ -358,6 +385,49 @@ impl BackendRouter {
                 query,
                 filters,
             } => self.route_search(query_id, scope, query, filters),
+            BackendCommand::SearchUsers { query_id, query } => {
+                let (account_id, backend_id) = self.default_account_backend()?;
+                let backend = self.backend_for_binding(&backend_id)?;
+                backend.execute(RoutedBackendCommand::SearchUsers {
+                    account_id,
+                    query_id,
+                    query,
+                })
+            }
+            BackendCommand::CreateConversation {
+                op_id,
+                participants,
+                kind,
+            } => {
+                let (account_id, backend_id) = self.default_account_backend()?;
+                let workspace_binding = self
+                    .default_workspace_binding_for_account(&account_id, &backend_id)?
+                    .clone();
+                let participant_ids = participants
+                    .into_iter()
+                    .map(|participant| participant.0)
+                    .collect::<Vec<_>>();
+                let events = {
+                    let backend = self.backend_for_binding(&backend_id)?;
+                    backend.execute(RoutedBackendCommand::CreateConversation {
+                        op_id,
+                        account_id,
+                        workspace: workspace_binding.provider_workspace_ref,
+                        participants: participant_ids,
+                        kind,
+                    })?
+                };
+                for event in &events {
+                    if let BackendEvent::ConversationCreated {
+                        conversation_binding,
+                        ..
+                    } = event
+                    {
+                        self.register_conversation_binding(conversation_binding.clone());
+                    }
+                }
+                Ok(events)
+            }
             BackendCommand::StartCall {
                 op_id,
                 conversation_id,
@@ -377,19 +447,57 @@ impl BackendRouter {
                 })
             }
             BackendCommand::LeaveCall { op_id, call_id } => {
-                let Some((account_id, backend_id)) = self
-                    .accounts
-                    .iter()
-                    .next()
-                    .map(|(account_id, backend_id)| (account_id.clone(), backend_id.clone()))
-                else {
-                    return Err(BackendError::MissingAccount(AccountId::default()));
-                };
+                let (account_id, backend_id) = self.default_account_backend()?;
                 let backend = self.backend_for_binding(&backend_id)?;
                 backend.execute(RoutedBackendCommand::LeaveCall {
                     op_id,
                     account_id,
                     call_id,
+                })
+            }
+            BackendCommand::LoadUserProfile { user_id } => {
+                let (account_id, backend_id) = self.default_account_backend()?;
+                let backend = self.backend_for_binding(&backend_id)?;
+                backend.execute(RoutedBackendCommand::LoadUserProfile {
+                    account_id,
+                    user_id,
+                })
+            }
+            BackendCommand::RefreshParticipants {
+                user_id,
+                conversation_id,
+            } => {
+                let (account_id, backend_id) = self.default_account_backend()?;
+                let backend = self.backend_for_binding(&backend_id)?;
+                backend.execute(RoutedBackendCommand::RefreshParticipants {
+                    account_id,
+                    user_id,
+                    conversation_id,
+                })
+            }
+            BackendCommand::LoadSocialGraphList { user_id, list_type } => {
+                let (account_id, backend_id) = self.default_account_backend()?;
+                let backend = self.backend_for_binding(&backend_id)?;
+                backend.execute(RoutedBackendCommand::LoadSocialGraphList {
+                    account_id,
+                    user_id,
+                    list_type,
+                })
+            }
+            BackendCommand::FollowUser { user_id } => {
+                let (account_id, backend_id) = self.default_account_backend()?;
+                let backend = self.backend_for_binding(&backend_id)?;
+                backend.execute(RoutedBackendCommand::FollowUser {
+                    account_id,
+                    user_id,
+                })
+            }
+            BackendCommand::UnfollowUser { user_id } => {
+                let (account_id, backend_id) = self.default_account_backend()?;
+                let backend = self.backend_for_binding(&backend_id)?;
+                backend.execute(RoutedBackendCommand::UnfollowUser {
+                    account_id,
+                    user_id,
                 })
             }
         }
@@ -487,5 +595,24 @@ impl BackendRouter {
             Some(backend) => Ok(backend.as_mut()),
             None => Err(BackendError::MissingBackend(backend_id.clone())),
         }
+    }
+
+    fn default_account_backend(&self) -> Result<(AccountId, BackendId), BackendError> {
+        self.accounts
+            .iter()
+            .next()
+            .map(|(account_id, backend_id)| (account_id.clone(), backend_id.clone()))
+            .ok_or_else(|| BackendError::MissingAccount(AccountId::default()))
+    }
+
+    fn default_workspace_binding_for_account(
+        &self,
+        account_id: &AccountId,
+        backend_id: &BackendId,
+    ) -> Result<&WorkspaceBinding, BackendError> {
+        self.workspace_bindings
+            .values()
+            .find(|binding| &binding.account_id == account_id && &binding.backend_id == backend_id)
+            .ok_or_else(|| BackendError::MissingWorkspaceBinding(account_id.0.clone()))
     }
 }
