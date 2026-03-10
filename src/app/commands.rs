@@ -1,7 +1,7 @@
 use gpui::{Action, actions};
 
 actions!(
-    kbui,
+    zbase,
     [
         NavigateBack,
         NavigateForward,
@@ -41,7 +41,7 @@ actions!(
 );
 
 #[derive(Clone, PartialEq, Debug, Action)]
-#[action(namespace = kbui, no_json)]
+#[action(namespace = zbase, no_json)]
 pub struct OpenUrl {
     pub url: String,
 }

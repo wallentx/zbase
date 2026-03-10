@@ -23,8 +23,8 @@ use gpui::{
 };
 use std::env;
 
-const ENV_BENCH_USE_DEMO: &str = "KBUI_BENCH_USE_DEMO";
-const ENV_BENCH_SKIP_BACKEND: &str = "KBUI_BENCH_SKIP_BACKEND";
+const ENV_BENCH_USE_DEMO: &str = "ZBASE_BENCH_USE_DEMO";
+const ENV_BENCH_SKIP_BACKEND: &str = "ZBASE_BENCH_SKIP_BACKEND";
 
 pub fn open_main_window(cx: &mut App) {
     let bounds = Bounds::centered(None, size(px(1440.), px(920.)), cx);
@@ -142,7 +142,7 @@ pub fn open_main_window(cx: &mut App) {
         window.focus(&root.focus_handle(cx));
         root
     })
-    .expect("failed to open kbui window");
+    .expect("failed to open zbase window");
 }
 
 fn env_flag(name: &str) -> bool {

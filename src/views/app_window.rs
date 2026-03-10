@@ -74,11 +74,11 @@ use std::{
     time::{Duration, Instant},
 };
 
-const ENV_BENCH_SKIP_BACKEND: &str = "KBUI_BENCH_SKIP_BACKEND";
-const ENV_BENCH_SCRIPT: &str = "KBUI_BENCH_SCRIPT";
-const ENV_BENCH_SCRIPT_TICK_MS: &str = "KBUI_BENCH_SCRIPT_TICK_MS";
-const ENV_BENCH_TIMELINE_MESSAGES: &str = "KBUI_BENCH_TIMELINE_MESSAGES";
-const ENV_BENCH_EXIT_ON_STOP: &str = "KBUI_BENCH_EXIT_ON_STOP";
+const ENV_BENCH_SKIP_BACKEND: &str = "ZBASE_BENCH_SKIP_BACKEND";
+const ENV_BENCH_SCRIPT: &str = "ZBASE_BENCH_SCRIPT";
+const ENV_BENCH_SCRIPT_TICK_MS: &str = "ZBASE_BENCH_SCRIPT_TICK_MS";
+const ENV_BENCH_TIMELINE_MESSAGES: &str = "ZBASE_BENCH_TIMELINE_MESSAGES";
+const ENV_BENCH_EXIT_ON_STOP: &str = "ZBASE_BENCH_EXIT_ON_STOP";
 const BACKEND_POLL_BOOT_INTERVAL: Duration = Duration::from_millis(16);
 const BACKEND_POLL_READY_INTERVAL: Duration = Duration::from_millis(200);
 const QUICK_SWITCHER_REMOTE_MIN_QUERY_CHARS: usize = 2;
@@ -672,7 +672,7 @@ impl AppWindow {
                     this.models.quick_switcher.loading_messages = false;
                     this.models.update_quick_switcher_query(query);
                     tracing::debug!(
-                        target: "kbui.quick_switcher.perf",
+                        target: "zbase.quick_switcher.perf",
                         seq,
                         observer_ms = observer_started_at.elapsed().as_millis(),
                         "quick_switcher_input_observer empty_query"
@@ -733,7 +733,7 @@ impl AppWindow {
                                 Arc::new(local_output.matched_entry_indices);
                             this.quick_switcher_last_local_corpus_revision = corpus_revision;
                             tracing::debug!(
-                                target: "kbui.quick_switcher.perf",
+                                target: "zbase.quick_switcher.perf",
                                 seq,
                                 local_compute_ms,
                                 input_to_local_ms = query_observed_at_local.elapsed().as_millis(),
@@ -778,7 +778,7 @@ impl AppWindow {
                                     query: query.clone(),
                                 });
                                 tracing::debug!(
-                                    target: "kbui.quick_switcher.perf",
+                                    target: "zbase.quick_switcher.perf",
                                     seq,
                                     input_to_remote_dispatch_ms =
                                         query_observed_at_remote.elapsed().as_millis(),
@@ -792,7 +792,7 @@ impl AppWindow {
                     .detach();
                 }
                 tracing::debug!(
-                    target: "kbui.quick_switcher.perf",
+                    target: "zbase.quick_switcher.perf",
                     seq,
                     observer_ms = observer_started_at.elapsed().as_millis(),
                     local_debounce_ms = local_debounce.as_millis(),
@@ -1080,7 +1080,7 @@ impl AppWindow {
                                     .remove(&query_seq)
                                 {
                                     tracing::debug!(
-                                        target: "kbui.quick_switcher.perf",
+                                        target: "zbase.quick_switcher.perf",
                                         seq = query_seq,
                                         remote_dispatch_to_apply_ms =
                                             dispatched_at.elapsed().as_millis(),
@@ -1090,7 +1090,7 @@ impl AppWindow {
                                     );
                                 } else {
                                     tracing::debug!(
-                                        target: "kbui.quick_switcher.perf",
+                                        target: "zbase.quick_switcher.perf",
                                         seq = query_seq,
                                         is_complete = *is_complete,
                                         result_count = results.len(),
@@ -1217,7 +1217,7 @@ impl AppWindow {
                                 .remove(&query_seq)
                             {
                                 tracing::debug!(
-                                    target: "kbui.quick_switcher.perf",
+                                    target: "zbase.quick_switcher.perf",
                                     seq = query_seq,
                                     remote_dispatch_to_apply_ms =
                                         dispatched_at.elapsed().as_millis(),
@@ -1227,7 +1227,7 @@ impl AppWindow {
                                 );
                             } else {
                                 tracing::debug!(
-                                    target: "kbui.quick_switcher.perf",
+                                    target: "zbase.quick_switcher.perf",
                                     seq = query_seq,
                                     is_complete = *is_complete,
                                     result_count = results.len(),
@@ -1736,7 +1736,7 @@ impl AppWindow {
                 timestamp_ms: Some(now_unix_ms().saturating_sub((idx as i64) * 60_000)),
                 event: None,
                 link_previews: Vec::new(),
-                permalink: format!("kbui://bench/{idx}"),
+                permalink: format!("zbase://bench/{idx}"),
                 fragments,
                 source_text: None,
                 attachments: Vec::new(),
@@ -2027,7 +2027,7 @@ impl AppWindow {
                                         .remove(&query_seq)
                                     {
                                         tracing::debug!(
-                                            target: "kbui.quick_switcher.perf",
+                                            target: "zbase.quick_switcher.perf",
                                             seq = query_seq,
                                             remote_dispatch_to_apply_ms =
                                                 dispatched_at.elapsed().as_millis(),
@@ -2037,7 +2037,7 @@ impl AppWindow {
                                         );
                                     } else {
                                         tracing::debug!(
-                                            target: "kbui.quick_switcher.perf",
+                                            target: "zbase.quick_switcher.perf",
                                             seq = query_seq,
                                             is_complete = *is_complete,
                                             result_count = results.len(),
@@ -5062,14 +5062,14 @@ impl AppWindow {
             self.quick_switcher_indexing_messages_indexed,
         );
         match method {
-            "kbui.internal.crawl.start" => {
+            "zbase.internal.crawl.start" => {
                 self.quick_switcher_indexing_active = true;
                 self.quick_switcher_indexing_total_conversations =
                     extract_u64_from_internal_payload(payload_preview, "conversation_count");
                 self.quick_switcher_indexing_completed_conversations = 0;
                 self.quick_switcher_indexing_messages_indexed = 0;
             }
-            "kbui.internal.crawl.conversation_progress" => {
+            "zbase.internal.crawl.conversation_progress" => {
                 self.quick_switcher_indexing_active = true;
                 if let Some(indexed_messages) =
                     extract_u64_from_internal_payload(payload_preview, "messages_indexed")
@@ -5077,7 +5077,7 @@ impl AppWindow {
                     self.quick_switcher_indexing_messages_indexed = indexed_messages;
                 }
             }
-            "kbui.internal.crawl.conversation_complete" => {
+            "zbase.internal.crawl.conversation_complete" => {
                 self.quick_switcher_indexing_active = true;
                 self.quick_switcher_indexing_completed_conversations = self
                     .quick_switcher_indexing_completed_conversations
@@ -5088,7 +5088,7 @@ impl AppWindow {
                     self.quick_switcher_indexing_messages_indexed = indexed_messages;
                 }
             }
-            "kbui.internal.crawl.finished" => {
+            "zbase.internal.crawl.finished" => {
                 if let Some(completed) =
                     extract_u64_from_internal_payload(payload_preview, "completed_conversations")
                 {
@@ -5194,7 +5194,7 @@ impl AppWindow {
             .entries
             .values()
             .filter(|entry| {
-                !self.keybase_inspector.unknown_only || entry.method.starts_with("kbui.internal.")
+                !self.keybase_inspector.unknown_only || entry.method.starts_with("zbase.internal.")
             })
             .cloned()
             .collect();
@@ -5424,9 +5424,9 @@ impl AppWindow {
     ) {
         if let Some((route, message_id)) = self.models.resolve_deep_link(url) {
             self.navigate_to_message(route, message_id, window, cx);
-        } else if let Some(username) = url.strip_prefix("kbui-mention:") {
+        } else if let Some(username) = url.strip_prefix("zbase-mention:") {
             self.open_user_profile_card(UserId::new(username.to_string()), cx);
-        } else if let Some(channel_name) = url.strip_prefix("kbui-channel:") {
+        } else if let Some(channel_name) = url.strip_prefix("zbase-channel:") {
             if let Some(route) = self.models.resolve_channel_mention(channel_name) {
                 self.navigate_to(route, window, cx);
             }
@@ -6222,7 +6222,7 @@ impl Render for AppWindow {
                     );
                     if self.models.overlay.quick_switcher_open {
                         tracing::debug!(
-                            target: "kbui.quick_switcher.perf",
+                            target: "zbase.quick_switcher.perf",
                             overlay_render_ms = overlay_t0.elapsed().as_millis(),
                             rendered_rows = self.models.quick_switcher.results.len(),
                             "quick_switcher_overlay_render"

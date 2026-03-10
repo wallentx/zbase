@@ -15,7 +15,7 @@ const TEXT_FIELD_SLOW_PATH_MS: u128 = 2;
 fn text_field_profile_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| {
-        std::env::var("KBUI_INPUT_PROFILE")
+        std::env::var("ZBASE_INPUT_PROFILE")
             .ok()
             .map(|raw| {
                 matches!(
@@ -606,7 +606,7 @@ impl EntityInputHandler for TextField {
             let elapsed = started_at.elapsed();
             if elapsed.as_millis() >= TEXT_FIELD_SLOW_PATH_MS {
                 tracing::warn!(
-                    target: "kbui.input.perf",
+                    target: "zbase.input.perf",
                     phase = "replace_text_in_range",
                     elapsed_ms = elapsed.as_millis(),
                     content_len = self.content.len(),
@@ -772,7 +772,7 @@ impl Element for TextLineElement {
                         let elapsed = shape_started_at.elapsed();
                         if elapsed.as_millis() >= TEXT_FIELD_SLOW_PATH_MS {
                             tracing::warn!(
-                                target: "kbui.input.perf",
+                                target: "zbase.input.perf",
                                 phase = "request_layout.shape_text",
                                 elapsed_ms = elapsed.as_millis(),
                                 content_len = display_text.len(),
@@ -865,7 +865,7 @@ impl Element for TextLineElement {
             let elapsed = shape_started_at.elapsed();
             if elapsed.as_millis() >= TEXT_FIELD_SLOW_PATH_MS {
                 tracing::warn!(
-                    target: "kbui.input.perf",
+                    target: "zbase.input.perf",
                     phase = "prepaint.shape_text",
                     elapsed_ms = elapsed.as_millis(),
                     content_len = content.len(),

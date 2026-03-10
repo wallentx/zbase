@@ -1,11 +1,11 @@
 [package]
-name = "kbui"
-version = "0.1.0"
+name = "zbase"
+version = "1.0.0"
 edition = "2024"
 
 [package.metadata.bundle]
-name = "KBUI"
-identifier = "com.kbui.app"
+name = "zBase"
+identifier = "com.zbase.app"
 icon = ["assets/macos/AppIcon.icns"]
 
 [dependencies]

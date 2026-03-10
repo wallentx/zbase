@@ -21,7 +21,7 @@ fn parse_log_level(raw: &str) -> Option<tracing::Level> {
 
 fn default_log_level() -> tracing::Level {
     let bench_mode =
-        std::env::var("KBUI_BENCH_AUTOSTART").is_ok() || std::env::var("KBUI_BENCH_SCRIPT").is_ok();
+        std::env::var("ZBASE_BENCH_AUTOSTART").is_ok() || std::env::var("ZBASE_BENCH_SCRIPT").is_ok();
     if bench_mode {
         tracing::Level::WARN
     } else {
@@ -30,7 +30,7 @@ fn default_log_level() -> tracing::Level {
 }
 
 fn main() {
-    let max_level = std::env::var("KBUI_LOG_LEVEL")
+    let max_level = std::env::var("ZBASE_LOG_LEVEL")
         .ok()
         .and_then(|raw| parse_log_level(&raw))
         .unwrap_or_else(default_log_level);

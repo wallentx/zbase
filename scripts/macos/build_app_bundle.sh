@@ -3,19 +3,19 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 PROFILE="${1:-debug}"
-APP_NAME="${APP_NAME:-KBUI}"
-BUNDLE_IDENTIFIER="${BUNDLE_IDENTIFIER:-com.kbui.app}"
+APP_NAME="${APP_NAME:-zBase}"
+BUNDLE_IDENTIFIER="${BUNDLE_IDENTIFIER:-com.zbase.app}"
 ICON_PATH="${ROOT_DIR}/assets/macos/AppIcon.icns"
 VERSION="$(awk -F'"' '/^version = / { print $2; exit }' "${ROOT_DIR}/Cargo.toml")"
 SKIP_BUILD="${SKIP_BUILD:-0}"
 
 if [[ "${PROFILE}" == "release" ]]; then
-  BIN_PATH="${ROOT_DIR}/target/release/kbui"
+  BIN_PATH="${ROOT_DIR}/target/release/zbase"
   if [[ "${SKIP_BUILD}" != "1" ]]; then
     cargo build --release --manifest-path "${ROOT_DIR}/Cargo.toml"
   fi
 else
-  BIN_PATH="${ROOT_DIR}/target/debug/kbui"
+  BIN_PATH="${ROOT_DIR}/target/debug/zbase"
   if [[ "${SKIP_BUILD}" != "1" ]]; then
     cargo build --manifest-path "${ROOT_DIR}/Cargo.toml"
   fi
@@ -43,8 +43,8 @@ PLIST_PATH="${CONTENTS_DIR}/Info.plist"
 rm -rf "${APP_DIR}"
 mkdir -p "${MACOS_DIR}" "${RESOURCES_DIR}"
 
-cp "${BIN_PATH}" "${MACOS_DIR}/kbui"
-chmod +x "${MACOS_DIR}/kbui"
+cp "${BIN_PATH}" "${MACOS_DIR}/zbase"
+chmod +x "${MACOS_DIR}/zbase"
 cp "${ICON_PATH}" "${RESOURCES_DIR}/AppIcon.icns"
 
 cat > "${PLIST_PATH}" <<EOF
@@ -57,7 +57,7 @@ cat > "${PLIST_PATH}" <<EOF
   <key>CFBundleDisplayName</key>
   <string>${APP_NAME}</string>
   <key>CFBundleExecutable</key>
-  <string>kbui</string>
+  <string>zbase</string>
   <key>CFBundleIconFile</key>
   <string>AppIcon</string>
   <key>CFBundleIdentifier</key>

@@ -1780,7 +1780,7 @@ mod tests {
     fn temp_rocks_path(label: &str) -> PathBuf {
         let mut path = std::env::temp_dir();
         let unique = format!(
-            "kbui-local-store-test-{label}-{}-{}",
+            "zbase-local-store-test-{label}-{}-{}",
             std::process::id(),
             now_unix_ms()
         );

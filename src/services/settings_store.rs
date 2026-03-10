@@ -31,7 +31,7 @@ impl SettingsStore {
     fn path() -> PathBuf {
         std::env::current_dir()
             .unwrap_or_else(|_| PathBuf::from("."))
-            .join(".kbui")
+            .join(".zbase")
             .join("settings.conf")
     }
 }

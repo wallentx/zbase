@@ -218,7 +218,7 @@ impl KeybaseRpcClient {
             // Keep visibility into wire-level packets we are not yet decoding.
             if sender
                 .send(RpcNotification {
-                    method: "kbui.internal.unparsed_rpc_frame".to_string(),
+                    method: "zbase.internal.unparsed_rpc_frame".to_string(),
                     params: message,
                 })
                 .await

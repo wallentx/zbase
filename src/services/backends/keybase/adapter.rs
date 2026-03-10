@@ -189,7 +189,7 @@ impl ChatBackend for KeybaseBackend {
                 if !scheduled {
                     send_internal(
                         &sender,
-                        "kbui.internal.task_runtime.deduped",
+                        "zbase.internal.task_runtime.deduped",
                         Value::from("bootstrap"),
                     );
                 }
@@ -225,7 +225,7 @@ impl ChatBackend for KeybaseBackend {
                 {
                     send_internal(
                         &sender,
-                        "kbui.internal.cached_placeholder_filtered",
+                        "zbase.internal.cached_placeholder_filtered",
                         Value::Map(vec![
                             (
                                 Value::from("conversation_id"),
@@ -312,7 +312,7 @@ impl ChatBackend for KeybaseBackend {
                     if let Some(sender) = sender_for_debug.as_ref() {
                         send_internal(
                             sender,
-                            "kbui.internal.thread_edge_repair.on_access",
+                            "zbase.internal.thread_edge_repair.on_access",
                             Value::Map(vec![
                                 (
                                     Value::from("conversation_id"),
@@ -998,7 +998,7 @@ impl ChatBackend for KeybaseBackend {
                     });
                     if let Err(error) = edit_result {
                         warn!(
-                            target: "kbui.keybase.send_edit",
+                            target: "zbase.keybase.send_edit",
                             conversation_id = %conversation_id.0,
                             message_id = target_message_id,
                             %error,
@@ -1007,7 +1007,7 @@ impl ChatBackend for KeybaseBackend {
                     }
                 } else {
                     warn!(
-                        target: "kbui.keybase.send_edit",
+                        target: "zbase.keybase.send_edit",
                         conversation_id = %conversation_id.0,
                         message_id = target_message_id,
                         "skipping edit publish because keybase socket is unavailable"
@@ -1068,7 +1068,7 @@ impl ChatBackend for KeybaseBackend {
                     });
                     if let Err(error) = delete_result {
                         warn!(
-                            target: "kbui.keybase.delete_message",
+                            target: "zbase.keybase.delete_message",
                             conversation_id = %conversation_id.0,
                             message_id = target_message_id,
                             %error,
@@ -1077,7 +1077,7 @@ impl ChatBackend for KeybaseBackend {
                     }
                 } else {
                     warn!(
-                        target: "kbui.keybase.delete_message",
+                        target: "zbase.keybase.delete_message",
                         conversation_id = %conversation_id.0,
                         message_id = target_message_id,
                         "skipping message delete because keybase socket is unavailable"
@@ -1276,7 +1276,7 @@ impl ChatBackend for KeybaseBackend {
                             if let Some(sender) = self.inbound_sender.clone() {
                                 send_internal(
                                     &sender,
-                                    "kbui.internal.mark_read_sent",
+                                    "zbase.internal.mark_read_sent",
                                     Value::Map(vec![
                                         (
                                             Value::from("conversation_id"),
@@ -1297,7 +1297,7 @@ impl ChatBackend for KeybaseBackend {
                             if let Some(sender) = self.inbound_sender.clone() {
                                 send_internal(
                                     &sender,
-                                    "kbui.internal.mark_read_failed",
+                                    "zbase.internal.mark_read_failed",
                                     Value::from(error.to_string()),
                                 );
                             }
@@ -1422,7 +1422,7 @@ impl ChatBackend for KeybaseBackend {
                             if let Some(sender) = self.inbound_sender.clone() {
                                 send_internal(
                                     &sender,
-                                    "kbui.internal.user_search_failed",
+                                    "zbase.internal.user_search_failed",
                                     Value::from(error.to_string()),
                                 );
                             }
@@ -1519,7 +1519,7 @@ impl ChatBackend for KeybaseBackend {
                             if let Some(sender) = self.inbound_sender.clone() {
                                 send_internal(
                                     &sender,
-                                    "kbui.internal.create_conversation_failed",
+                                    "zbase.internal.create_conversation_failed",
                                     Value::from(error.to_string()),
                                 );
                             }
@@ -1627,10 +1627,10 @@ fn run_listener(
     search_index: Arc<SearchIndex>,
     pending_outbox_sends: Arc<Mutex<HashMap<String, PendingSendMeta>>>,
 ) {
-    send_internal(&sender, "kbui.internal.listener_starting", Value::Nil);
+    send_internal(&sender, "zbase.internal.listener_starting", Value::Nil);
 
     let Some(path) = socket_path() else {
-        send_internal(&sender, "kbui.internal.socket_path_missing", Value::Nil);
+        send_internal(&sender, "zbase.internal.socket_path_missing", Value::Nil);
         return;
     };
 
@@ -1639,7 +1639,7 @@ fn run_listener(
         Err(error) => {
             send_internal(
                 &sender,
-                "kbui.internal.runtime_init_failed",
+                "zbase.internal.runtime_init_failed",
                 Value::from(error.to_string()),
             );
             return;
@@ -1651,7 +1651,7 @@ fn run_listener(
             Ok(transport) => {
                 send_internal(
                     &sender,
-                    "kbui.internal.socket_connected",
+                    "zbase.internal.socket_connected",
                     Value::from(path.display().to_string()),
                 );
                 let mut client = KeybaseRpcClient::new(transport);
@@ -1661,14 +1661,14 @@ fn run_listener(
                 {
                     send_internal(
                         &sender,
-                        "kbui.internal.set_notifications_failed",
+                        "zbase.internal.set_notifications_failed",
                         Value::from(error.to_string()),
                     );
                     return;
                 }
                 send_internal(
                     &sender,
-                    "kbui.internal.notifications_subscribed",
+                    "zbase.internal.notifications_subscribed",
                     Value::Nil,
                 );
 
@@ -1678,7 +1678,7 @@ fn run_listener(
                     if let Err(error) = client.run_notification_loop(tx).await {
                         send_internal(
                             &sender_for_error,
-                            "kbui.internal.notification_loop_error",
+                            "zbase.internal.notification_loop_error",
                             Value::from(error.to_string()),
                         );
                     }
@@ -1865,13 +1865,13 @@ fn run_listener(
                         break;
                     }
                 }
-                send_internal(&sender, "kbui.internal.notification_loop_ended", Value::Nil);
+                send_internal(&sender, "zbase.internal.notification_loop_ended", Value::Nil);
             }
             Err(error) => {
                 warn!("keybase socket connect failed: {error}");
                 send_internal(
                     &sender,
-                    "kbui.internal.socket_connect_failed",
+                    "zbase.internal.socket_connect_failed",
                     Value::from(error.to_string()),
                 );
             }
@@ -2045,7 +2045,7 @@ fn log_non_text_placeholder_once(
 
     let keys = non_text_placeholder_key_preview(message_body);
     warn!(
-        target: "kbui.keybase.non_text_placeholder",
+        target: "zbase.keybase.non_text_placeholder",
         conversation_id = %conversation_id.0,
         message_id = message_id,
         message_type = message_type,
@@ -2078,7 +2078,7 @@ fn run_bootstrap(
     local_store: Arc<LocalStore>,
     search_index: Arc<SearchIndex>,
 ) {
-    send_internal(&sender, "kbui.internal.bootstrap_starting", Value::Nil);
+    send_internal(&sender, "zbase.internal.bootstrap_starting", Value::Nil);
 
     let mut sent_cached_payload = false;
     match local_store.load_bootstrap_seed(
@@ -2114,16 +2114,16 @@ fn run_bootstrap(
                 cached_conversation_ids,
             );
             start_background_thread_edge_migration(&sender, &local_store);
-            send_internal(&sender, "kbui.internal.bootstrap_cache_hit", Value::Nil);
+            send_internal(&sender, "zbase.internal.bootstrap_cache_hit", Value::Nil);
             sent_cached_payload = true;
         }
         Ok(None) => {
-            send_internal(&sender, "kbui.internal.bootstrap_cache_miss", Value::Nil);
+            send_internal(&sender, "zbase.internal.bootstrap_cache_miss", Value::Nil);
         }
         Err(error) => {
             send_internal(
                 &sender,
-                "kbui.internal.bootstrap_cache_load_failed",
+                "zbase.internal.bootstrap_cache_load_failed",
                 Value::from(error.to_string()),
             );
         }
@@ -2144,7 +2144,7 @@ fn run_bootstrap(
         Err(error) => {
             send_internal(
                 &sender,
-                "kbui.internal.bootstrap_runtime_init_failed",
+                "zbase.internal.bootstrap_runtime_init_failed",
                 Value::from(error.to_string()),
             );
             return;
@@ -2171,7 +2171,7 @@ fn run_bootstrap(
             if let Err(error) = local_store.persist_bootstrap_payload(&payload) {
                 send_internal(
                     &sender,
-                    "kbui.internal.bootstrap_cache_persist_failed",
+                    "zbase.internal.bootstrap_cache_persist_failed",
                     Value::from(error.to_string()),
                 );
             }
@@ -2193,12 +2193,12 @@ fn run_bootstrap(
                 account_display_name,
             );
             start_background_thread_edge_migration(&sender, &local_store);
-            send_internal(&sender, "kbui.internal.bootstrap_loaded", Value::Nil);
+            send_internal(&sender, "zbase.internal.bootstrap_loaded", Value::Nil);
         }
         Err(error) => {
             send_internal(
                 &sender,
-                "kbui.internal.bootstrap_failed",
+                "zbase.internal.bootstrap_failed",
                 Value::from(error.to_string()),
             );
             if !sent_cached_payload {
@@ -2223,7 +2223,7 @@ fn run_load_user_profile(
     let Some(path) = socket_path() else {
         send_internal(
             &sender,
-            "kbui.internal.profile_load_socket_path_missing",
+            "zbase.internal.profile_load_socket_path_missing",
             Value::from(user_id.0.clone()),
         );
         return;
@@ -2233,7 +2233,7 @@ fn run_load_user_profile(
         Err(error) => {
             send_internal(
                 &sender,
-                "kbui.internal.profile_load_runtime_init_failed",
+                "zbase.internal.profile_load_runtime_init_failed",
                 Value::from(error.to_string()),
             );
             return;
@@ -2267,7 +2267,7 @@ fn run_load_user_profile(
             .unwrap_or(Value::Nil);
 
         let gui_id = format!(
-            "kbui-profile-{}-{}",
+            "zbase-profile-{}-{}",
             sanitize_username(&username),
             now_unix_ms()
         );
@@ -2403,7 +2403,7 @@ fn run_load_user_profile(
         Err(error) => {
             send_internal(
                 &sender,
-                "kbui.internal.profile_load_failed",
+                "zbase.internal.profile_load_failed",
                 Value::Map(vec![
                     (Value::from("user_id"), Value::from(user_id.0)),
                     (Value::from("error"), Value::from(error.to_string())),
@@ -2425,7 +2425,7 @@ fn run_load_social_graph_list(
     let Some(path) = socket_path() else {
         send_internal(
             &sender,
-            "kbui.internal.social_graph_socket_path_missing",
+            "zbase.internal.social_graph_socket_path_missing",
             Value::from(user_id.0.clone()),
         );
         return;
@@ -2435,7 +2435,7 @@ fn run_load_social_graph_list(
         Err(error) => {
             send_internal(
                 &sender,
-                "kbui.internal.social_graph_runtime_init_failed",
+                "zbase.internal.social_graph_runtime_init_failed",
                 Value::from(error.to_string()),
             );
             return;
@@ -2524,7 +2524,7 @@ fn run_load_social_graph_list(
         Err(error) => {
             send_internal(
                 &sender,
-                "kbui.internal.social_graph_load_failed",
+                "zbase.internal.social_graph_load_failed",
                 Value::Map(vec![
                     (Value::from("user_id"), Value::from(user_id.0)),
                     (Value::from("error"), Value::from(error.to_string())),
@@ -2545,7 +2545,7 @@ fn run_refresh_profile_presence(
     if candidate_conversation_ids.is_empty() {
         send_internal(
             &sender,
-            "kbui.internal.refresh_participants_no_candidate_conversations",
+            "zbase.internal.refresh_participants_no_candidate_conversations",
             Value::from(user_id.0.clone()),
         );
         return;
@@ -2553,7 +2553,7 @@ fn run_refresh_profile_presence(
     let Some(path) = socket_path() else {
         send_internal(
             &sender,
-            "kbui.internal.refresh_participants_socket_path_missing",
+            "zbase.internal.refresh_participants_socket_path_missing",
             Value::from(user_id.0.clone()),
         );
         return;
@@ -2563,7 +2563,7 @@ fn run_refresh_profile_presence(
         Err(error) => {
             send_internal(
                 &sender,
-                "kbui.internal.refresh_participants_runtime_init_failed",
+                "zbase.internal.refresh_participants_runtime_init_failed",
                 Value::from(error.to_string()),
             );
             return;
@@ -2651,7 +2651,7 @@ fn run_refresh_profile_presence(
         Err(error) => {
             send_internal(
                 &sender,
-                "kbui.internal.refresh_participants_failed",
+                "zbase.internal.refresh_participants_failed",
                 Value::Map(vec![
                     (Value::from("user_id"), Value::from(user_id.0)),
                     (Value::from("error"), Value::from(error.to_string())),
@@ -2794,7 +2794,7 @@ fn run_follow_toggle(sender: Sender<BackendEvent>, user_id: UserId, follow: bool
     let Some(path) = socket_path() else {
         send_internal(
             &sender,
-            "kbui.internal.follow_toggle_socket_path_missing",
+            "zbase.internal.follow_toggle_socket_path_missing",
             Value::from(user_id.0.clone()),
         );
         return;
@@ -2804,7 +2804,7 @@ fn run_follow_toggle(sender: Sender<BackendEvent>, user_id: UserId, follow: bool
         Err(error) => {
             send_internal(
                 &sender,
-                "kbui.internal.follow_toggle_runtime_init_failed",
+                "zbase.internal.follow_toggle_runtime_init_failed",
                 Value::from(error.to_string()),
             );
             return;
@@ -2815,7 +2815,7 @@ fn run_follow_toggle(sender: Sender<BackendEvent>, user_id: UserId, follow: bool
         let transport = FramedMsgpackTransport::connect(&path).await?;
         let mut client = KeybaseRpcClient::new(transport);
         let gui_id = format!(
-            "kbui-follow-{}-{}",
+            "zbase-follow-{}-{}",
             sanitize_username(&username),
             now_unix_ms()
         );
@@ -2851,7 +2851,7 @@ fn run_follow_toggle(sender: Sender<BackendEvent>, user_id: UserId, follow: bool
         Err(error) => {
             send_internal(
                 &sender,
-                "kbui.internal.follow_toggle_failed",
+                "zbase.internal.follow_toggle_failed",
                 Value::Map(vec![
                     (Value::from("user_id"), Value::from(user_id.0.clone())),
                     (Value::from("follow"), Value::from(follow)),
@@ -3230,7 +3230,7 @@ fn start_background_cached_conversation_extension(
     if !scheduled {
         send_internal(
             &sender_for_stats,
-            "kbui.internal.task_runtime.deduped",
+            "zbase.internal.task_runtime.deduped",
             Value::from("cached_conversation_extension"),
         );
     }
@@ -3251,7 +3251,7 @@ fn run_cached_conversation_extension(
         Err(error) => {
             send_internal(
                 &sender,
-                "kbui.internal.cache_extension_load_failed",
+                "zbase.internal.cache_extension_load_failed",
                 Value::from(error.to_string()),
             );
             return;
@@ -3308,7 +3308,7 @@ fn run_cached_conversation_extension(
     }
     send_internal(
         &sender,
-        "kbui.internal.cache_extension_emitted",
+        "zbase.internal.cache_extension_emitted",
         Value::Map(vec![
             (Value::from("workspace_id"), Value::from(workspace_id.0)),
             (Value::from("count"), Value::from(total as i64)),
@@ -3344,7 +3344,7 @@ fn start_background_inbox_conversation_cache_refresh(
     if !scheduled {
         send_internal(
             &sender_for_stats,
-            "kbui.internal.task_runtime.deduped",
+            "zbase.internal.task_runtime.deduped",
             Value::from("inbox_conversation_cache_refresh"),
         );
     }
@@ -3363,13 +3363,13 @@ fn run_background_inbox_conversation_cache_refresh(
 ) {
     send_internal(
         &sender,
-        "kbui.internal.inbox_cache_refresh_start",
+        "zbase.internal.inbox_cache_refresh_start",
         Value::Nil,
     );
     let Some(path) = socket_path() else {
         send_internal(
             &sender,
-            "kbui.internal.inbox_cache_refresh_socket_missing",
+            "zbase.internal.inbox_cache_refresh_socket_missing",
             Value::Nil,
         );
         return;
@@ -3379,7 +3379,7 @@ fn run_background_inbox_conversation_cache_refresh(
         Err(error) => {
             send_internal(
                 &sender,
-                "kbui.internal.inbox_cache_refresh_runtime_failed",
+                "zbase.internal.inbox_cache_refresh_runtime_failed",
                 Value::from(error.to_string()),
             );
             return;
@@ -3392,7 +3392,7 @@ fn run_background_inbox_conversation_cache_refresh(
             Err(error) => {
                 send_internal(
                     &sender,
-                    "kbui.internal.inbox_cache_refresh_socket_connect_failed",
+                    "zbase.internal.inbox_cache_refresh_socket_connect_failed",
                     Value::from(error.to_string()),
                 );
                 return;
@@ -3411,7 +3411,7 @@ fn run_background_inbox_conversation_cache_refresh(
                 Err(error) => {
                     send_internal(
                         &sender,
-                        "kbui.internal.inbox_cache_refresh_status_failed",
+                        "zbase.internal.inbox_cache_refresh_status_failed",
                         Value::from(error.to_string()),
                     );
                 }
@@ -3429,7 +3429,7 @@ fn run_background_inbox_conversation_cache_refresh(
                     Err(error) => {
                         send_internal(
                             &sender,
-                            "kbui.internal.inbox_cache_refresh_fetch_failed",
+                            "zbase.internal.inbox_cache_refresh_fetch_failed",
                             Value::from(error.to_string()),
                         );
                         break;
@@ -3478,7 +3478,7 @@ fn run_background_inbox_conversation_cache_refresh(
 
         send_internal(
             &sender,
-            "kbui.internal.inbox_cache_refresh_done",
+            "zbase.internal.inbox_cache_refresh_done",
             Value::Map(vec![
                 (Value::from("upserted"), Value::from(upserted_total as i64)),
                 (
@@ -3645,7 +3645,7 @@ fn start_background_full_history_crawl(
     if !scheduled {
         send_internal(
             &sender_for_stats,
-            "kbui.internal.task_runtime.deduped",
+            "zbase.internal.task_runtime.deduped",
             Value::from("full_history_crawl"),
         );
     }
@@ -3664,7 +3664,7 @@ fn run_background_full_history_crawl(
 
     send_internal(
         &sender,
-        "kbui.internal.crawl.start",
+        "zbase.internal.crawl.start",
         Value::Map(vec![(
             Value::from("conversations"),
             Value::from(conversation_refs.len() as i64),
@@ -3674,7 +3674,7 @@ fn run_background_full_history_crawl(
     let Some(path) = socket_path() else {
         send_internal(
             &sender,
-            "kbui.internal.crawl.socket_path_missing",
+            "zbase.internal.crawl.socket_path_missing",
             Value::Nil,
         );
         return;
@@ -3685,7 +3685,7 @@ fn run_background_full_history_crawl(
         Err(error) => {
             send_internal(
                 &sender,
-                "kbui.internal.crawl.runtime_init_failed",
+                "zbase.internal.crawl.runtime_init_failed",
                 Value::from(error.to_string()),
             );
             return;
@@ -3698,7 +3698,7 @@ fn run_background_full_history_crawl(
             Err(error) => {
                 send_internal(
                     &sender,
-                    "kbui.internal.crawl.socket_connect_failed",
+                    "zbase.internal.crawl.socket_connect_failed",
                     Value::from(error.to_string()),
                 );
                 return;
@@ -3731,7 +3731,7 @@ fn run_background_full_history_crawl(
 
             send_internal(
                 &sender,
-                "kbui.internal.crawl.conversation_start",
+                "zbase.internal.crawl.conversation_start",
                 Value::Map(vec![
                     (
                         Value::from("conversation_id"),
@@ -3770,7 +3770,7 @@ fn run_background_full_history_crawl(
                     Err(error) => {
                         send_internal(
                             &sender,
-                            "kbui.internal.crawl.page_fetch_failed",
+                            "zbase.internal.crawl.page_fetch_failed",
                             Value::Map(vec![
                                 (
                                     Value::from("conversation_id"),
@@ -3797,7 +3797,7 @@ fn run_background_full_history_crawl(
                     completed_conversations = completed_conversations.saturating_add(1);
                     send_internal(
                         &sender,
-                        "kbui.internal.crawl.conversation_complete",
+                        "zbase.internal.crawl.conversation_complete",
                         Value::Map(vec![
                             (
                                 Value::from("conversation_id"),
@@ -3836,7 +3836,7 @@ fn run_background_full_history_crawl(
                 if pages_crawled.is_multiple_of(CRAWL_PROGRESS_EMIT_EVERY_PAGES) {
                     send_internal(
                         &sender,
-                        "kbui.internal.crawl.conversation_progress",
+                        "zbase.internal.crawl.conversation_progress",
                         Value::Map(vec![
                             (
                                 Value::from("conversation_id"),
@@ -3858,7 +3858,7 @@ fn run_background_full_history_crawl(
                     completed_conversations = completed_conversations.saturating_add(1);
                     send_internal(
                         &sender,
-                        "kbui.internal.crawl.conversation_complete",
+                        "zbase.internal.crawl.conversation_complete",
                         Value::Map(vec![
                             (
                                 Value::from("conversation_id"),
@@ -3880,7 +3880,7 @@ fn run_background_full_history_crawl(
                 if page.next_cursor == next_cursor {
                     send_internal(
                         &sender,
-                        "kbui.internal.crawl.cursor_stalled",
+                        "zbase.internal.crawl.cursor_stalled",
                         Value::Map(vec![(
                             Value::from("conversation_id"),
                             Value::from(conversation_id.0.clone()),
@@ -3894,7 +3894,7 @@ fn run_background_full_history_crawl(
 
         send_internal(
             &sender,
-            "kbui.internal.crawl.finished",
+            "zbase.internal.crawl.finished",
             Value::Map(vec![
                 (
                     Value::from("completed_conversations"),
@@ -3945,7 +3945,7 @@ fn run_background_thread_edge_migration(
     }
     send_internal(
         &sender,
-        "kbui.internal.thread_edge_migration.start",
+        "zbase.internal.thread_edge_migration.start",
         Value::Nil,
     );
     let conversation_ids = local_store
@@ -3969,7 +3969,7 @@ fn run_background_thread_edge_migration(
         if migrated_conversations.is_multiple_of(50) {
             send_internal(
                 &sender,
-                "kbui.internal.thread_edge_migration.progress",
+                "zbase.internal.thread_edge_migration.progress",
                 Value::Map(vec![
                     (
                         Value::from("conversations_migrated"),
@@ -3986,7 +3986,7 @@ fn run_background_thread_edge_migration(
     let _ = local_store.mark_thread_edge_migration_complete();
     send_internal(
         &sender,
-        "kbui.internal.thread_edge_migration.done",
+        "zbase.internal.thread_edge_migration.done",
         Value::Map(vec![
             (
                 Value::from("conversations_migrated"),
@@ -4012,14 +4012,14 @@ fn run_load_conversation(
     let conversation_id = canonical_conversation_id_from_provider_ref(&conversation_ref);
     send_internal(
         &sender,
-        "kbui.internal.load_conversation_starting",
+        "zbase.internal.load_conversation_starting",
         Value::from(conversation_id.0.clone()),
     );
 
     let Some(path) = socket_path() else {
         send_internal(
             &sender,
-            "kbui.internal.load_conversation_socket_path_missing",
+            "zbase.internal.load_conversation_socket_path_missing",
             Value::from(conversation_id.0.clone()),
         );
         return;
@@ -4039,7 +4039,7 @@ fn run_load_conversation(
                         LOAD_CONVERSATION_RETRY_BASE_DELAY_MS.saturating_mul(attempt as u64);
                     send_internal(
                         &sender,
-                        "kbui.internal.load_conversation_runtime_retrying",
+                        "zbase.internal.load_conversation_runtime_retrying",
                         Value::Map(vec![
                             (
                                 Value::from("conversation_id"),
@@ -4056,7 +4056,7 @@ fn run_load_conversation(
                 Err(error) => {
                     send_internal(
                         &sender,
-                        "kbui.internal.load_conversation_runtime_init_failed",
+                        "zbase.internal.load_conversation_runtime_init_failed",
                         Value::from(error.to_string()),
                     );
                     return;
@@ -4090,7 +4090,7 @@ fn run_load_conversation(
                     LOAD_CONVERSATION_RETRY_BASE_DELAY_MS.saturating_mul(attempt as u64);
                 send_internal(
                     &sender,
-                    "kbui.internal.load_conversation_retrying",
+                    "zbase.internal.load_conversation_retrying",
                     Value::Map(vec![
                         (
                             Value::from("conversation_id"),
@@ -4241,7 +4241,7 @@ fn run_load_conversation(
             let post_sync_ms = post_sync_started.elapsed().as_millis();
             send_internal(
                 &sender,
-                "kbui.internal.load_conversation_loaded",
+                "zbase.internal.load_conversation_loaded",
                 Value::from(conversation_id.0.clone()),
             );
             let total_ms = load_started.elapsed().as_millis();
@@ -4252,7 +4252,7 @@ fn run_load_conversation(
                 || ingest_ms >= 100
             {
                 warn!(
-                    target: "kbui.load_conversation.perf",
+                    target: "zbase.load_conversation.perf",
                     conversation_id = %conversation_id.0,
                     queue_wait_ms = queue_wait_ms as i64,
                     total_ms = total_ms as i64,
@@ -4279,7 +4279,7 @@ fn run_load_conversation(
             let total_ms = load_started.elapsed().as_millis();
             let service_fetch_ms = service_fetch_started.elapsed().as_millis();
             warn!(
-                target: "kbui.load_conversation.perf",
+                target: "zbase.load_conversation.perf",
                 conversation_id = %conversation_id.0,
                 queue_wait_ms = queue_wait_ms as i64,
                 total_ms = total_ms as i64,
@@ -4290,7 +4290,7 @@ fn run_load_conversation(
             );
             send_internal(
                 &sender,
-                "kbui.internal.load_conversation_failed",
+                "zbase.internal.load_conversation_failed",
                 Value::from(error.to_string()),
             );
         }
@@ -4300,7 +4300,7 @@ fn run_load_conversation(
 fn load_conversation_perf_log_all_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| {
-        std::env::var("KBUI_LOAD_CONVERSATION_PERF_LOG_ALL")
+        std::env::var("ZBASE_LOAD_CONVERSATION_PERF_LOG_ALL")
             .ok()
             .is_some_and(|raw| {
                 matches!(
@@ -4387,7 +4387,7 @@ fn run_hydrate_timeline_attachments(
         Err(error) => {
             send_internal(
                 &sender,
-                "kbui.internal.load_conversation_attachment_hydration_failed",
+                "zbase.internal.load_conversation_attachment_hydration_failed",
                 Value::Map(vec![
                     (
                         Value::from("conversation_id"),
@@ -4417,7 +4417,7 @@ fn run_hydrate_timeline_attachments(
     let elapsed_ms = hydration_started.elapsed().as_millis();
     if load_conversation_perf_log_all_enabled() || elapsed_ms >= 250 {
         warn!(
-            target: "kbui.load_conversation.perf",
+            target: "zbase.load_conversation.perf",
             conversation_id = %conversation_id.0,
             elapsed_ms = elapsed_ms as i64,
             candidate_count = candidate_count as i64,
@@ -4442,7 +4442,7 @@ fn run_load_older_messages(
         Err(error) => {
             send_internal(
                 &sender,
-                "kbui.internal.load_older_messages_runtime_init_failed",
+                "zbase.internal.load_older_messages_runtime_init_failed",
                 Value::from(error.to_string()),
             );
             let _ = sender.send(BackendEvent::MessagesPrepended {
@@ -4498,7 +4498,7 @@ fn run_load_older_messages(
         Err(error) => {
             send_internal(
                 &sender,
-                "kbui.internal.load_older_messages_fetch_failed",
+                "zbase.internal.load_older_messages_fetch_failed",
                 Value::from(error.to_string()),
             );
         }
@@ -4545,7 +4545,7 @@ fn run_backfill_thread_history(
         Err(error) => {
             send_internal(
                 &sender,
-                "kbui.internal.thread_backfill_runtime_init_failed",
+                "zbase.internal.thread_backfill_runtime_init_failed",
                 Value::from(error.to_string()),
             );
             return;
@@ -4735,12 +4735,12 @@ fn run_backfill_thread_history(
 }
 
 fn should_emit_thread_debug(root_id: &MessageId) -> bool {
-    if let Ok(flag) = std::env::var("KBUI_THREAD_DEBUG")
+    if let Ok(flag) = std::env::var("ZBASE_THREAD_DEBUG")
         && matches!(flag.trim(), "0" | "false" | "off")
     {
         return false;
     }
-    if let Ok(configured) = std::env::var("KBUI_THREAD_DEBUG_ROOT_ID") {
+    if let Ok(configured) = std::env::var("ZBASE_THREAD_DEBUG_ROOT_ID") {
         let value = configured.trim();
         if !value.is_empty() {
             return value == root_id.0;
@@ -4822,7 +4822,7 @@ fn maybe_emit_thread_debug_snapshot(
 
     send_internal(
         sender,
-        "kbui.internal.thread_debug.snapshot",
+        "zbase.internal.thread_debug.snapshot",
         Value::Map(vec![
             (Value::from("stage"), Value::from(stage.to_string())),
             (
@@ -5962,7 +5962,7 @@ fn sync_conversation_emojis(
     if cache_fresh && !cached.is_empty() && !cache_assets_complete {
         send_internal(
             sender,
-            "kbui.internal.emoji_cache_missing_assets",
+            "zbase.internal.emoji_cache_missing_assets",
             Value::Map(vec![
                 (
                     Value::from("conversation_id"),
@@ -6001,7 +6001,7 @@ fn sync_conversation_emojis(
             Err(error) => {
                 send_internal(
                     &sender,
-                    "kbui.internal.emoji_sync_transport_failed",
+                    "zbase.internal.emoji_sync_transport_failed",
                     Value::Map(vec![
                         (
                             Value::from("conversation_id"),
@@ -6019,7 +6019,7 @@ fn sync_conversation_emojis(
             Err(error) => {
                 send_internal(
                     &sender,
-                    "kbui.internal.emoji_fetch_failed",
+                    "zbase.internal.emoji_fetch_failed",
                     Value::Map(vec![
                         (
                             Value::from("conversation_id"),
@@ -6059,7 +6059,7 @@ fn sync_conversation_emojis(
                         let alias = emoji.alias.clone();
                         send_internal(
                             &sender,
-                            "kbui.internal.emoji_asset_download_failed",
+                            "zbase.internal.emoji_asset_download_failed",
                             Value::Map(vec![
                                 (
                                     Value::from("conversation_id"),
@@ -6293,7 +6293,7 @@ fn prefetch_user_profiles(
     let Some(socket) = socket_path() else {
         send_internal(
             sender,
-            "kbui.internal.profile_avatar_socket_path_missing",
+            "zbase.internal.profile_avatar_socket_path_missing",
             Value::from("prefetch_user_profiles"),
         );
         return;
@@ -6303,7 +6303,7 @@ fn prefetch_user_profiles(
         Err(error) => {
             send_internal(
                 sender,
-                "kbui.internal.profile_avatar_runtime_init_failed",
+                "zbase.internal.profile_avatar_runtime_init_failed",
                 Value::from(error.to_string()),
             );
             return;
@@ -6318,7 +6318,7 @@ fn prefetch_user_profiles(
             Err(error) => {
                 send_internal(
                     &sender,
-                    "kbui.internal.profile_avatar_transport_failed",
+                    "zbase.internal.profile_avatar_transport_failed",
                     Value::from(error.to_string()),
                 );
                 return;
@@ -6330,7 +6330,7 @@ fn prefetch_user_profiles(
             Err(error) => {
                 send_internal(
                     &sender,
-                    "kbui.internal.profile_avatar_fetch_failed",
+                    "zbase.internal.profile_avatar_fetch_failed",
                     Value::from(error.to_string()),
                 );
                 HashMap::new()
@@ -6342,7 +6342,7 @@ fn prefetch_user_profiles(
             if url.is_none() {
                 send_internal(
                     &sender,
-                    "kbui.internal.profile_avatar_missing_url",
+                    "zbase.internal.profile_avatar_missing_url",
                     Value::from(username.clone()),
                 );
             }
@@ -6351,7 +6351,7 @@ fn prefetch_user_profiles(
                 Err(error) => {
                     send_internal(
                         &sender,
-                        "kbui.internal.profile_display_name_fetch_failed",
+                        "zbase.internal.profile_display_name_fetch_failed",
                         Value::Map(vec![
                             (Value::from("username"), Value::from(username.clone())),
                             (Value::from("error"), Value::from(error.to_string())),
@@ -6382,7 +6382,7 @@ fn prefetch_user_profiles(
                     Err(error) => {
                         send_internal(
                             &sender,
-                            "kbui.internal.profile_avatar_download_failed",
+                            "zbase.internal.profile_avatar_download_failed",
                             Value::Map(vec![
                                 (Value::from("username"), Value::from(username.clone())),
                                 (Value::from("url"), Value::from(url)),
@@ -6512,7 +6512,7 @@ fn prefetch_team_avatars(
     let Some(socket) = socket_path() else {
         send_internal(
             sender,
-            "kbui.internal.team_avatar_socket_path_missing",
+            "zbase.internal.team_avatar_socket_path_missing",
             Value::from("prefetch_team_avatars"),
         );
         return;
@@ -6522,7 +6522,7 @@ fn prefetch_team_avatars(
         Err(error) => {
             send_internal(
                 sender,
-                "kbui.internal.team_avatar_runtime_init_failed",
+                "zbase.internal.team_avatar_runtime_init_failed",
                 Value::from(error.to_string()),
             );
             return;
@@ -6537,7 +6537,7 @@ fn prefetch_team_avatars(
             Err(error) => {
                 send_internal(
                     &sender,
-                    "kbui.internal.team_avatar_transport_failed",
+                    "zbase.internal.team_avatar_transport_failed",
                     Value::from(error.to_string()),
                 );
                 return;
@@ -6549,7 +6549,7 @@ fn prefetch_team_avatars(
             Err(error) => {
                 send_internal(
                     &sender,
-                    "kbui.internal.team_avatar_fetch_failed",
+                    "zbase.internal.team_avatar_fetch_failed",
                     Value::from(error.to_string()),
                 );
                 return;
@@ -6561,7 +6561,7 @@ fn prefetch_team_avatars(
             if url.is_none() {
                 send_internal(
                     &sender,
-                    "kbui.internal.team_avatar_missing_url",
+                    "zbase.internal.team_avatar_missing_url",
                     Value::from(team_name.clone()),
                 );
             }
@@ -6577,7 +6577,7 @@ fn prefetch_team_avatars(
                     Err(error) => {
                         send_internal(
                             &sender,
-                            "kbui.internal.team_avatar_download_failed",
+                            "zbase.internal.team_avatar_download_failed",
                             Value::Map(vec![
                                 (Value::from("team"), Value::from(team_name.clone())),
                                 (Value::from("url"), Value::from(url)),
@@ -8006,7 +8006,7 @@ fn run_persist_reaction_deltas_for_timeline_load(
     let elapsed_ms = started.elapsed().as_millis();
     if load_conversation_perf_log_all_enabled() || elapsed_ms >= 250 {
         warn!(
-            target: "kbui.load_conversation.perf",
+            target: "zbase.load_conversation.perf",
             conversation_id = %conversation_id.0,
             elapsed_ms = elapsed_ms as i64,
             reaction_delta_count = deltas.len() as i64,
@@ -8326,7 +8326,7 @@ fn sync_conversation_team_roles(
             canonical_team_id_if_valid(&binding.team_id).or_else(|| {
                 send_internal(
                     sender,
-                    "kbui.internal.team_roles.invalid_cached_team_id",
+                    "zbase.internal.team_roles.invalid_cached_team_id",
                     Value::Map(vec![
                         (
                             Value::from("conversation_id"),
@@ -8346,7 +8346,7 @@ fn sync_conversation_team_roles(
                 if team_id.as_ref() != Some(&local_team_id) {
                     send_internal(
                         sender,
-                        "kbui.internal.team_roles.team_id_rebound",
+                        "zbase.internal.team_roles.team_id_rebound",
                         Value::Map(vec![
                             (
                                 Value::from("conversation_id"),
@@ -8368,7 +8368,7 @@ fn sync_conversation_team_roles(
                 } else {
                     send_internal(
                         sender,
-                        "kbui.internal.team_roles.resolve_team_local_conversation",
+                        "zbase.internal.team_roles.resolve_team_local_conversation",
                         Value::Map(vec![(
                             Value::from("conversation_id"),
                             Value::from(conversation_id.0.clone()),
@@ -8382,7 +8382,7 @@ fn sync_conversation_team_roles(
         Err(error) => {
             send_internal(
                 sender,
-                "kbui.internal.team_roles.resolve_team_local_conversation_failed",
+                "zbase.internal.team_roles.resolve_team_local_conversation_failed",
                 Value::Map(vec![
                     (
                         Value::from("conversation_id"),
@@ -8402,7 +8402,7 @@ fn sync_conversation_team_roles(
                     if team_id.as_ref() != Some(&local_team_id) {
                         send_internal(
                             sender,
-                            "kbui.internal.team_roles.team_id_rebound",
+                            "zbase.internal.team_roles.team_id_rebound",
                             Value::Map(vec![
                                 (
                                     Value::from("conversation_id"),
@@ -8424,7 +8424,7 @@ fn sync_conversation_team_roles(
                     } else {
                         send_internal(
                             sender,
-                            "kbui.internal.team_roles.resolve_team_local",
+                            "zbase.internal.team_roles.resolve_team_local",
                             Value::Map(vec![(
                                 Value::from("conversation_id"),
                                 Value::from(conversation_id.0.clone()),
@@ -8438,7 +8438,7 @@ fn sync_conversation_team_roles(
             Err(error) => {
                 send_internal(
                     sender,
-                    "kbui.internal.team_roles.resolve_team_local_failed",
+                    "zbase.internal.team_roles.resolve_team_local_failed",
                     Value::Map(vec![
                         (
                             Value::from("conversation_id"),
@@ -8460,7 +8460,7 @@ fn sync_conversation_team_roles(
             Err(error) => {
                 send_internal(
                     sender,
-                    "kbui.internal.team_roles.resolve_team_failed",
+                    "zbase.internal.team_roles.resolve_team_failed",
                     Value::Map(vec![
                         (
                             Value::from("conversation_id"),
@@ -8476,7 +8476,7 @@ fn sync_conversation_team_roles(
     let Some(team_id) = team_id else {
         send_internal(
             sender,
-            "kbui.internal.team_roles.resolve_team_missing",
+            "zbase.internal.team_roles.resolve_team_missing",
             Value::Map(vec![(
                 Value::from("conversation_id"),
                 Value::from(conversation_id.0.clone()),
@@ -8515,7 +8515,7 @@ fn sync_conversation_team_roles(
         Err(error) => {
             send_internal(
                 sender,
-                "kbui.internal.team_roles.fetch_failed",
+                "zbase.internal.team_roles.fetch_failed",
                 Value::Map(vec![
                     (
                         Value::from("conversation_id"),
@@ -9818,7 +9818,7 @@ fn refresh_inbox_unread_state(sender: &Sender<BackendEvent>, local_store: &Local
     let Some(path) = socket_path() else {
         send_internal(
             sender,
-            "kbui.internal.unread_refresh_socket_missing",
+            "zbase.internal.unread_refresh_socket_missing",
             Value::Nil,
         );
         return;
@@ -9828,7 +9828,7 @@ fn refresh_inbox_unread_state(sender: &Sender<BackendEvent>, local_store: &Local
         Err(error) => {
             send_internal(
                 sender,
-                "kbui.internal.unread_refresh_runtime_failed",
+                "zbase.internal.unread_refresh_runtime_failed",
                 Value::from(error.to_string()),
             );
             return;
@@ -9850,7 +9850,7 @@ fn refresh_inbox_unread_state(sender: &Sender<BackendEvent>, local_store: &Local
         Err(error) => {
             send_internal(
                 sender,
-                "kbui.internal.unread_refresh_failed",
+                "zbase.internal.unread_refresh_failed",
                 Value::from(error.to_string()),
             );
             return;
@@ -14693,7 +14693,7 @@ fn emit_task_runtime_stats(sender: &Sender<BackendEvent>, reason: &str) {
     let stats = task_runtime::stats();
     send_internal(
         sender,
-        "kbui.internal.task_runtime.stats",
+        "zbase.internal.task_runtime.stats",
         Value::Map(vec![
             (Value::from("reason"), Value::from(reason.to_string())),
             (
@@ -14778,7 +14778,7 @@ mod tests {
     fn temp_emoji_asset_dir(label: &str) -> PathBuf {
         let mut path = std::env::temp_dir();
         path.push(format!(
-            "kbui-emoji-asset-test-{label}-{}-{}",
+            "zbase-emoji-asset-test-{label}-{}-{}",
             std::process::id(),
             now_unix_ms()
         ));
@@ -15186,7 +15186,7 @@ mod tests {
     fn load_cached_emojis_for_owner_prefers_team_scope() {
         let mut path = std::env::temp_dir();
         path.push(format!(
-            "kbui-emoji-owner-scope-team-{}-{}",
+            "zbase-emoji-owner-scope-team-{}-{}",
             std::process::id(),
             now_unix_ms()
         ));
@@ -15233,7 +15233,7 @@ mod tests {
     fn load_cached_emojis_for_owner_falls_back_to_conversation_scope() {
         let mut path = std::env::temp_dir();
         path.push(format!(
-            "kbui-emoji-owner-scope-fallback-{}-{}",
+            "zbase-emoji-owner-scope-fallback-{}-{}",
             std::process::id(),
             now_unix_ms()
         ));
@@ -15945,7 +15945,7 @@ mod tests {
     fn reaction_removed_event_for_live_delete_uses_persisted_reaction_op_mapping() {
         let mut path = std::env::temp_dir();
         path.push(format!(
-            "kbui-reaction-delete-map-{}-{}",
+            "zbase-reaction-delete-map-{}-{}",
             std::process::id(),
             now_unix_ms()
         ));
@@ -16801,7 +16801,7 @@ mod tests {
     fn reply_ancestor_chain_cached_walks_entire_parent_chain() {
         let mut path = std::env::temp_dir();
         path.push(format!(
-            "kbui-reply-chain-cached-test-{}-{}",
+            "zbase-reply-chain-cached-test-{}-{}",
             std::process::id(),
             now_unix_ms()
         ));

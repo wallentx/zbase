@@ -1549,7 +1549,7 @@ fn add_pending_message_to_state(
         timestamp_ms: Some(now_unix_ms()),
         event: None,
         link_previews: Vec::new(),
-        permalink: format!("kbui://pending/{}", client_message_id.0),
+        permalink: format!("zbase://pending/{}", client_message_id.0),
         fragments,
         source_text,
         attachments,

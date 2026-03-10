@@ -192,7 +192,7 @@ fn target_video_size(width: u32, height: u32) -> (u32, u32) {
 fn next_temp_video_path() -> PathBuf {
     let nonce = TEMP_FILE_COUNTER.fetch_add(1, Ordering::Relaxed);
     std::env::temp_dir().join(format!(
-        "kbui-link-preview-video-{}-{nonce}.bin",
+        "zbase-link-preview-video-{}-{nonce}.bin",
         std::process::id()
     ))
 }

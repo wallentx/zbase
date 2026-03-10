@@ -315,7 +315,7 @@ impl AppModels {
         let design_channel_id = ChannelId::new("design");
         let hangout_channel_id = ChannelId::new("hangout");
         let travel_channel_id = ChannelId::new("travel");
-        let kbui_channel_id = ChannelId::new("kbui");
+        let zbase_channel_id = ChannelId::new("zbase");
         let gpui_channel_id = ChannelId::new("gpui");
         let alice_dm_id = DmId::new("alice");
 
@@ -323,7 +323,7 @@ impl AppModels {
         let design_conversation_id = ConversationId::new("conv_design");
         let hangout_conversation_id = ConversationId::new("conv_hangout");
         let travel_conversation_id = ConversationId::new("conv_travel");
-        let kbui_conversation_id = ConversationId::new("conv_kbui");
+        let zbase_conversation_id = ConversationId::new("conv_zbase");
         let gpui_conversation_id = ConversationId::new("conv_gpui");
         let alice_conversation_id = ConversationId::new("conv_alice");
         let alice_id = UserId::new("user_alice");
@@ -390,9 +390,9 @@ impl AppModels {
             muted: false,
             last_activity_ms: 1_708_000_000_000,
         };
-        let kbui_conv = ConversationSummary {
-            id: kbui_conversation_id.clone(),
-            title: "kbui".to_string(),
+        let zbase_conv = ConversationSummary {
+            id: zbase_conversation_id.clone(),
+            title: "zbase".to_string(),
             kind: ConversationKind::Channel,
             topic: "Keybase UI client".to_string(),
             group: Some(oss_group.clone()),
@@ -491,7 +491,7 @@ impl AppModels {
                     design.clone(),
                     hangout.clone(),
                     travel.clone(),
-                    kbui_conv.clone(),
+                    zbase_conv.clone(),
                     gpui_conv.clone(),
                 ],
                 direct_messages: vec![alice_dm.clone()],
@@ -559,12 +559,12 @@ impl AppModels {
                         title: "Open Source".to_string(),
                         rows: vec![
                             SidebarRow {
-                                label: "kbui".to_string(),
+                                label: "zbase".to_string(),
                                 unread_count: 2,
                                 mention_count: 1,
                                 route: Route::Channel {
                                     workspace_id: oss_id.clone(),
-                                    channel_id: kbui_channel_id.clone(),
+                                    channel_id: zbase_channel_id.clone(),
                                 },
                             },
                             SidebarRow {

@@ -1,0 +1,178 @@
+name: Release
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Read version
+        id: version
+        run: |
+          VERSION=$(awk -F'"' '/^version = / { print $2; exit }' Cargo.toml)
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "tag=v${VERSION}" >> "$GITHUB_OUTPUT"
+
+      - name: Check if tag exists
+        id: check
+        run: |
+          if git ls-remote --tags origin "refs/tags/${{ steps.version.outputs.tag }}" | grep -q .; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create tag
+        if: steps.check.outputs.exists == 'false'
+        run: |
+          git tag -a "${{ steps.version.outputs.tag }}" -m "zBase ${{ steps.version.outputs.tag }}"
+          git push origin "${{ steps.version.outputs.tag }}"
+
+      - name: Create GitHub release
+        if: steps.check.outputs.exists == 'false'
+        run: |
+          gh release create "${{ steps.version.outputs.tag }}" \
+            --title "zBase ${{ steps.version.outputs.tag }}" \
+            --generate-notes \
+            --latest
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Update Homebrew formula
+        if: steps.check.outputs.exists == 'false'
+        run: |
+          TAG="${{ steps.version.outputs.tag }}"
+          VERSION="${{ steps.version.outputs.version }}"
+          REPO="${{ github.repository }}"
+          TAP_REPO="cameroncooper/homebrew-tap"
+
+          TARBALL_URL="https://github.com/${REPO}/archive/refs/tags/${TAG}.tar.gz"
+          SHA=$(curl -sL "${TARBALL_URL}" | shasum -a 256 | awk '{print $1}')
+
+          FORMULA=$(cat <<RUBY
+          class Zbase < Formula
+            desc "A fast, native chat client"
+            homepage "https://github.com/${REPO}"
+            url "${TARBALL_URL}"
+            sha256 "${SHA}"
+            license "MIT"
+
+            depends_on "rust" => :build
+            depends_on "cmake" => :build
+            depends_on "pkg-config" => :build
+            depends_on :macos
+            depends_on "ffmpeg"
+
+            def install
+              system "cargo", "build", "--release", "--locked"
+
+              bin.install "target/release/zbase"
+
+              app = prefix/"zBase.app/Contents"
+              (app/"MacOS").mkpath
+              (app/"Resources").mkpath
+
+              cp bin/"zbase", app/"MacOS/zbase"
+              cp "assets/macos/AppIcon.icns", app/"Resources/AppIcon.icns" if File.exist?("assets/macos/AppIcon.icns")
+
+              (app/"Info.plist").write <<~PLIST
+                <?xml version="1.0" encoding="UTF-8"?>
+                <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+                <plist version="1.0">
+                <dict>
+                  <key>CFBundleDevelopmentRegion</key>
+                  <string>en</string>
+                  <key>CFBundleDisplayName</key>
+                  <string>zBase</string>
+                  <key>CFBundleExecutable</key>
+                  <string>zbase</string>
+                  <key>CFBundleIconFile</key>
+                  <string>AppIcon</string>
+                  <key>CFBundleIdentifier</key>
+                  <string>com.zbase.app</string>
+                  <key>CFBundleInfoDictionaryVersion</key>
+                  <string>6.0</string>
+                  <key>CFBundleName</key>
+                  <string>zBase</string>
+                  <key>CFBundlePackageType</key>
+                  <string>APPL</string>
+                  <key>CFBundleShortVersionString</key>
+                  <string>#{version}</string>
+                  <key>CFBundleVersion</key>
+                  <string>#{version}</string>
+                  <key>LSMinimumSystemVersion</key>
+                  <string>13.0</string>
+                  <key>NSHighResolutionCapable</key>
+                  <true/>
+                </dict>
+                </plist>
+              PLIST
+            end
+
+            def caveats
+              <<~EOS
+                The zBase.app bundle has been installed to:
+                  #{prefix}/zBase.app
+
+                To add it to your Applications folder:
+                  ln -sf #{prefix}/zBase.app /Applications/zBase.app
+              EOS
+            end
+
+            test do
+              assert_predicate bin/"zbase", :executable?
+            end
+          end
+          RUBY
+          )
+
+          TMPFILE=$(mktemp)
+          echo "${FORMULA}" > "${TMPFILE}"
+          CONTENT=$(base64 < "${TMPFILE}")
+          rm -f "${TMPFILE}"
+
+          EXISTING=$(gh api "repos/${TAP_REPO}/contents/Formula/zbase.rb" --jq '.sha' 2>/dev/null || true)
+
+          if [[ -n "${EXISTING}" ]]; then
+            gh api --method PUT "repos/${TAP_REPO}/contents/Formula/zbase.rb" \
+              -f message="Update zbase formula to ${TAG}" \
+              -f content="${CONTENT}" \
+              -f sha="${EXISTING}" \
+              --silent
+          else
+            gh api --method PUT "repos/${TAP_REPO}/contents/Formula/zbase.rb" \
+              -f message="Add zbase formula ${TAG}" \
+              -f content="${CONTENT}" \
+              --silent
+          fi
+
+          echo "Formula updated to ${TAG} (sha256: ${SHA})"
+        env:
+          GH_TOKEN: ${{ secrets.TAP_TOKEN }}
+
+      - name: Bump patch version
+        if: steps.check.outputs.exists == 'false'
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          MAJOR=$(echo "${VERSION}" | cut -d. -f1)
+          MINOR=$(echo "${VERSION}" | cut -d. -f2)
+          PATCH=$(echo "${VERSION}" | cut -d. -f3)
+          NEXT="${MAJOR}.${MINOR}.$((PATCH + 1))"
+
+          sed -i '' "1,/^version = \"${VERSION}\"/ s/^version = \"${VERSION}\"/version = \"${NEXT}\"/" Cargo.toml
+          sed -i '' "/^name = \"zbase\"/{n;s/^version = \"${VERSION}\"/version = \"${NEXT}\"/;}" Cargo.lock
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Cargo.toml Cargo.lock
+          git commit -m "Bump version to ${NEXT} [skip ci]"
+          git push origin main

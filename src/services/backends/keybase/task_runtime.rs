@@ -54,7 +54,7 @@ impl TaskRuntimeState {
         let runtime = Builder::new_multi_thread()
             .worker_threads(RUNTIME_WORKER_THREADS)
             .enable_all()
-            .thread_name("kbui-keybase-task")
+            .thread_name("zbase-keybase-task")
             .build()
             .expect("failed to initialize keybase task runtime");
         Self {

@@ -1726,7 +1726,7 @@ impl TimelineList {
                     );
                     link_ranges.push(LinkRange {
                         byte_range: start..combined.len(),
-                        url: format!("kbui-mention:{}", user_id.0),
+                        url: format!("zbase-mention:{}", user_id.0),
                     });
                 }
                 MessageFragment::ChannelMention { name } => {
@@ -1741,7 +1741,7 @@ impl TimelineList {
                     );
                     link_ranges.push(LinkRange {
                         byte_range: start..combined.len(),
-                        url: format!("kbui-channel:{name}"),
+                        url: format!("zbase-channel:{name}"),
                     });
                 }
                 MessageFragment::BroadcastMention(BroadcastKind::Here) => {
@@ -1940,7 +1940,7 @@ impl TimelineList {
                     );
                     link_ranges.push(LinkRange {
                         byte_range: start..combined.len(),
-                        url: format!("kbui-mention:{}", user_id.0),
+                        url: format!("zbase-mention:{}", user_id.0),
                     });
                 }
                 MessageFragment::ChannelMention { name } => {
@@ -2279,7 +2279,7 @@ impl TimelineList {
                     message_key,
                     index,
                     &label,
-                    format!("kbui-mention:{}", user_id.0),
+                    format!("zbase-mention:{}", user_id.0),
                     foreground,
                     background,
                     compact_inline,
@@ -2293,7 +2293,7 @@ impl TimelineList {
                     message_key,
                     index,
                     &label,
-                    format!("kbui-channel:{name}"),
+                    format!("zbase-channel:{name}"),
                     accent(),
                     accent_soft(),
                     compact_inline,

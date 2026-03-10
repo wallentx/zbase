@@ -580,7 +580,7 @@ struct InlineAttachmentPaint {
 
 #[cfg(debug_assertions)]
 fn selectable_text_debug_enabled() -> bool {
-    std::env::var("KBUI_TEXT_DEBUG")
+    std::env::var("ZBASE_TEXT_DEBUG")
         .map(|v| !v.trim().is_empty() && v != "0" && !v.eq_ignore_ascii_case("false"))
         .unwrap_or(false)
 }
@@ -592,7 +592,7 @@ fn selectable_text_debug_enabled() -> bool {
 
 #[cfg(debug_assertions)]
 fn selectable_text_debug_filter_matches(label: &str) -> bool {
-    let Ok(filter) = std::env::var("KBUI_TEXT_DEBUG_FILTER") else {
+    let Ok(filter) = std::env::var("ZBASE_TEXT_DEBUG_FILTER") else {
         return true;
     };
     let filter = filter.trim();
