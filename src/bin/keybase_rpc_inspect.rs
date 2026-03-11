@@ -76,31 +76,34 @@ fn find_thread_messages_root(thread_result: &Value) -> Option<&Value> {
         }
         // Keybase getThreadLocal typically nests under "thread".
         if k.as_str() == Some("thread")
-            && let Value::Map(thread_map) = v {
-                for (tk, tv) in thread_map {
-                    if tk.as_str() == Some("messages") {
-                        return Some(tv);
-                    }
-                    // Some shapes might nest messages under "thread" -> "thread"
-                    if tk.as_str() == Some("thread")
-                        && let Value::Map(inner_thread) = tv {
-                            for (itk, itv) in inner_thread {
-                                if itk.as_str() == Some("messages") {
-                                    return Some(itv);
-                                }
-                            }
+            && let Value::Map(thread_map) = v
+        {
+            for (tk, tv) in thread_map {
+                if tk.as_str() == Some("messages") {
+                    return Some(tv);
+                }
+                // Some shapes might nest messages under "thread" -> "thread"
+                if tk.as_str() == Some("thread")
+                    && let Value::Map(inner_thread) = tv
+                {
+                    for (itk, itv) in inner_thread {
+                        if itk.as_str() == Some("messages") {
+                            return Some(itv);
                         }
+                    }
                 }
             }
+        }
         // Some shapes might nest under "result"
         if k.as_str() == Some("result")
-            && let Value::Map(inner) = v {
-                for (ik, iv) in inner {
-                    if ik.as_str() == Some("messages") {
-                        return Some(iv);
-                    }
+            && let Value::Map(inner) = v
+        {
+            for (ik, iv) in inner {
+                if ik.as_str() == Some("messages") {
+                    return Some(iv);
                 }
             }
+        }
     }
     None
 }
@@ -115,9 +118,10 @@ fn find_first_string(value: &Value, keys: &[&str]) -> Option<String> {
                 for (k, v) in entries {
                     if let Some(ks) = k.as_str()
                         && keys.iter().any(|wanted| wanted.eq_ignore_ascii_case(ks))
-                        && let Some(s) = v.as_str() {
-                            return Some(s.to_string());
-                        }
+                        && let Some(s) = v.as_str()
+                    {
+                        return Some(s.to_string());
+                    }
                     if let Some(found) = walk(v, keys, depth + 1) {
                         return Some(found);
                     }
@@ -148,9 +152,10 @@ fn find_first_binary_hex(value: &Value, keys: &[&str]) -> Option<String> {
                 for (k, v) in entries {
                     if let Some(ks) = k.as_str()
                         && keys.iter().any(|wanted| wanted.eq_ignore_ascii_case(ks))
-                        && let Value::Binary(bytes) = v {
-                            return Some(hex_encode(bytes));
-                        }
+                        && let Value::Binary(bytes) = v
+                    {
+                        return Some(hex_encode(bytes));
+                    }
                     if let Some(found) = walk(v, keys, depth + 1) {
                         return Some(found);
                     }
@@ -199,9 +204,10 @@ fn message_type_from_message_body(message_body: &Value) -> Option<i64> {
                     return Some(i);
                 }
                 if let Some(s) = v.as_str()
-                    && let Ok(i) = s.parse::<i64>() {
-                        return Some(i);
-                    }
+                    && let Ok(i) = s.parse::<i64>()
+                {
+                    return Some(i);
+                }
             }
         }
     }
@@ -383,29 +389,32 @@ fn extract_message_body_candidate(message_entry: &Value) -> Option<&Value> {
             return Some(v);
         }
         if k.as_str() == Some("msg")
-            && let Value::Map(msg_map) = v {
-                for (mk, mv) in msg_map {
-                    if mk.as_str() == Some("messageBody") {
-                        return Some(mv);
+            && let Value::Map(msg_map) = v
+        {
+            for (mk, mv) in msg_map {
+                if mk.as_str() == Some("messageBody") {
+                    return Some(mv);
+                }
+                if mk.as_str() == Some("valid")
+                    && let Value::Map(valid_map) = mv
+                {
+                    for (vk, vv) in valid_map {
+                        if vk.as_str() == Some("messageBody") {
+                            return Some(vv);
+                        }
                     }
-                    if mk.as_str() == Some("valid")
-                        && let Value::Map(valid_map) = mv {
-                            for (vk, vv) in valid_map {
-                                if vk.as_str() == Some("messageBody") {
-                                    return Some(vv);
-                                }
-                            }
+                }
+                if mk.as_str() == Some("content")
+                    && let Value::Map(content_map) = mv
+                {
+                    for (ck, cv) in content_map {
+                        if ck.as_str() == Some("messageBody") {
+                            return Some(cv);
                         }
-                    if mk.as_str() == Some("content")
-                        && let Value::Map(content_map) = mv {
-                            for (ck, cv) in content_map {
-                                if ck.as_str() == Some("messageBody") {
-                                    return Some(cv);
-                                }
-                            }
-                        }
+                    }
                 }
             }
+        }
     }
     None
 }
@@ -426,26 +435,27 @@ fn extract_message_id_candidate(message_entry: &Value) -> Option<i64> {
         if matches!(
             k.as_str(),
             Some("messageID") | Some("messageId") | Some("msgID") | Some("msgId") | Some("id")
-        )
-            && let Some(id) = as_i64(v) {
-                return Some(id);
-            }
+        ) && let Some(id) = as_i64(v)
+        {
+            return Some(id);
+        }
         if k.as_str() == Some("msg")
-            && let Value::Map(msg_map) = v {
-                for (mk, mv) in msg_map {
-                    if matches!(
-                        mk.as_str(),
-                        Some("messageID")
-                            | Some("messageId")
-                            | Some("msgID")
-                            | Some("msgId")
-                            | Some("id")
-                    )
-                        && let Some(id) = as_i64(mv) {
-                            return Some(id);
-                        }
+            && let Value::Map(msg_map) = v
+        {
+            for (mk, mv) in msg_map {
+                if matches!(
+                    mk.as_str(),
+                    Some("messageID")
+                        | Some("messageId")
+                        | Some("msgID")
+                        | Some("msgId")
+                        | Some("id")
+                ) && let Some(id) = as_i64(mv)
+                {
+                    return Some(id);
                 }
             }
+        }
     }
     None
 }

@@ -1,21 +1,101 @@
 use gpui::{
-    App, Bounds, ClipboardItem, Context, CursorStyle, Element, ElementId, ElementInputHandler,
-    Entity, EntityInputHandler, FocusHandle, Focusable, GlobalElementId, LayoutId, MouseButton,
-    MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad, Pixels, Point, Style, TextRun,
-    UTF16Selection, UnderlineStyle, Window, WrappedLine, actions, div, fill, point, prelude::*, px,
-    relative, rgb, rgba, size,
+    App, Bounds, ClipboardEntry, ClipboardItem, Context, CursorStyle, Element, ElementId,
+    ElementInputHandler, Entity, EntityInputHandler, FocusHandle, Focusable, GlobalElementId,
+    LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad, Pixels, Point,
+    Style, TextRun, UTF16Selection, UnderlineStyle, Window, WrappedLine, actions, div, fill, point,
+    prelude::*, px, relative, rgb, rgba, size,
 };
-use std::{ops::Range, sync::OnceLock, time::Instant};
+use std::{
+    collections::VecDeque,
+    ops::Range,
+    sync::OnceLock,
+    time::{Duration, Instant},
+};
 use unicode_segmentation::UnicodeSegmentation;
 
 use crate::views::{accent, selection};
 
-const TEXT_FIELD_SLOW_PATH_MS: u128 = 2;
+const DEFAULT_TEXT_FIELD_PROFILE_MIN_MS: u128 = 2;
+const ENV_INPUT_DISABLE_LAYOUT_CACHE: &str = "ZBASE_INPUT_DISABLE_LAYOUT_CACHE";
+const ENV_INPUT_PROFILE_MIN_MS: &str = "ZBASE_INPUT_PROFILE_MIN_MS";
+const ENV_INPUT_USE_LEGACY_REPLACE: &str = "ZBASE_INPUT_USE_LEGACY_REPLACE";
+const ENV_INPUT_CLEAR_BOUNDS_ON_EDIT: &str = "ZBASE_INPUT_CLEAR_BOUNDS_ON_EDIT";
+const ENV_INPUT_DISABLE_UNDO_COALESCE: &str = "ZBASE_INPUT_DISABLE_UNDO_COALESCE";
 
 fn text_field_profile_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| {
         std::env::var("ZBASE_INPUT_PROFILE")
+            .ok()
+            .map(|raw| {
+                matches!(
+                    raw.trim().to_ascii_lowercase().as_str(),
+                    "1" | "true" | "yes" | "on"
+                )
+            })
+            .unwrap_or(false)
+    })
+}
+
+fn text_field_profile_min_ms() -> u128 {
+    static MIN_MS: OnceLock<u128> = OnceLock::new();
+    *MIN_MS.get_or_init(|| {
+        std::env::var(ENV_INPUT_PROFILE_MIN_MS)
+            .ok()
+            .and_then(|raw| raw.trim().parse::<u128>().ok())
+            .unwrap_or(DEFAULT_TEXT_FIELD_PROFILE_MIN_MS)
+    })
+}
+
+fn text_field_layout_cache_disabled() -> bool {
+    static DISABLED: OnceLock<bool> = OnceLock::new();
+    *DISABLED.get_or_init(|| {
+        std::env::var(ENV_INPUT_DISABLE_LAYOUT_CACHE)
+            .ok()
+            .map(|raw| {
+                matches!(
+                    raw.trim().to_ascii_lowercase().as_str(),
+                    "1" | "true" | "yes" | "on"
+                )
+            })
+            .unwrap_or(false)
+    })
+}
+
+fn text_field_use_legacy_replace() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var(ENV_INPUT_USE_LEGACY_REPLACE)
+            .ok()
+            .map(|raw| {
+                matches!(
+                    raw.trim().to_ascii_lowercase().as_str(),
+                    "1" | "true" | "yes" | "on"
+                )
+            })
+            .unwrap_or(false)
+    })
+}
+
+fn text_field_clear_bounds_on_edit() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var(ENV_INPUT_CLEAR_BOUNDS_ON_EDIT)
+            .ok()
+            .map(|raw| {
+                matches!(
+                    raw.trim().to_ascii_lowercase().as_str(),
+                    "1" | "true" | "yes" | "on"
+                )
+            })
+            .unwrap_or(false)
+    })
+}
+
+fn text_field_undo_coalesce_disabled() -> bool {
+    static DISABLED: OnceLock<bool> = OnceLock::new();
+    *DISABLED.get_or_init(|| {
+        std::env::var(ENV_INPUT_DISABLE_UNDO_COALESCE)
             .ok()
             .map(|raw| {
                 matches!(
@@ -43,11 +123,15 @@ actions!(
         SelectAll,
         Home,
         End,
+        SelectHome,
+        SelectEnd,
         InsertNewline,
         ShowCharacterPalette,
         Paste,
         Cut,
         Copy,
+        Undo,
+        Redo,
     ]
 );
 
@@ -81,6 +165,22 @@ impl TextFieldKind {
     }
 }
 
+struct UndoEntry {
+    content: String,
+    selected_range: Range<usize>,
+    selection_reversed: bool,
+}
+
+const UNDO_STACK_MAX: usize = 200;
+const UNDO_COALESCE_WINDOW: Duration = Duration::from_millis(220);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum UndoEditKind {
+    Insert,
+    Delete,
+    Replace,
+}
+
 pub struct TextField {
     focus_handle: FocusHandle,
     content: String,
@@ -94,7 +194,13 @@ pub struct TextField {
     field_kind: TextFieldKind,
     scroll_y: Pixels,
     pub up_at_top_triggered: bool,
+    pub pasted_image: Option<Vec<u8>>,
     last_content_height: Pixels,
+    undo_stack: VecDeque<UndoEntry>,
+    redo_stack: VecDeque<UndoEntry>,
+    last_undo_snapshot_at: Option<Instant>,
+    last_undo_edit_kind: Option<UndoEditKind>,
+    pending_height_edit_at: Option<Instant>,
 }
 
 impl TextField {
@@ -179,12 +285,22 @@ impl TextField {
             field_kind,
             scroll_y: px(0.),
             up_at_top_triggered: false,
+            pasted_image: None,
             last_content_height: px(0.),
+            undo_stack: VecDeque::new(),
+            redo_stack: VecDeque::new(),
+            last_undo_snapshot_at: None,
+            last_undo_edit_kind: None,
+            pending_height_edit_at: None,
         }
     }
 
     pub fn text(&self) -> String {
         self.content.clone()
+    }
+
+    pub fn text_if_different(&self, current: &str) -> Option<String> {
+        (self.content != current).then(|| self.content.clone())
     }
 
     pub fn is_multiline(&self) -> bool {
@@ -203,11 +319,14 @@ impl TextField {
         self.selection_reversed = false;
         self.marked_range = None;
         self.scroll_y = px(0.);
+        self.mark_content_edited();
         self.clear_layout_cache();
         cx.notify();
     }
 
     pub fn insert_text(&mut self, text: &str, cx: &mut Context<Self>) {
+        let profile_enabled = text_field_profile_enabled();
+        let started_at = profile_enabled.then(Instant::now);
         let text = if self.is_multiline() {
             text.to_string()
         } else {
@@ -218,18 +337,119 @@ impl TextField {
             .marked_range
             .clone()
             .unwrap_or(self.selected_range.clone());
-        self.content = self.content[0..range.start].to_owned() + &text + &self.content[range.end..];
+        let replaced_len = range.end.saturating_sub(range.start);
+        let inserted_len = text.len();
+        self.push_undo_snapshot(
+            undo_edit_kind(replaced_len, inserted_len),
+            self.marked_range.is_none() && inserted_len <= 1 && replaced_len <= 1,
+        );
+        self.replace_content_range(range.clone(), &text);
         let cursor = range.start + text.len();
         self.selected_range = cursor..cursor;
         self.selection_reversed = false;
         self.marked_range = None;
+        self.mark_content_edited();
+        self.clear_layout_cache();
+        cx.notify();
+        if let Some(started_at) = started_at {
+            let elapsed = started_at.elapsed();
+            if elapsed.as_millis() >= text_field_profile_min_ms() {
+                tracing::warn!(
+                    target: "zbase.input.perf",
+                    phase = "insert_text",
+                    elapsed_ms = elapsed.as_millis(),
+                    elapsed_us = elapsed.as_micros(),
+                    content_len = self.content.len(),
+                    replacement_len = text.len(),
+                    is_multiline = self.is_multiline(),
+                    "slow_text_field_path"
+                );
+            }
+        }
+    }
+
+    fn push_undo_snapshot(&mut self, kind: UndoEditKind, coalesce: bool) {
+        if coalesce
+            && !text_field_undo_coalesce_disabled()
+            && let (Some(last_snapshot_at), Some(last_kind)) =
+                (self.last_undo_snapshot_at, self.last_undo_edit_kind)
+            && last_kind == kind
+            && last_snapshot_at.elapsed() <= UNDO_COALESCE_WINDOW
+        {
+            return;
+        }
+        self.undo_stack.push_back(UndoEntry {
+            content: self.content.clone(),
+            selected_range: self.selected_range.clone(),
+            selection_reversed: self.selection_reversed,
+        });
+        if self.undo_stack.len() > UNDO_STACK_MAX {
+            let _ = self.undo_stack.pop_front();
+        }
+        self.redo_stack.clear();
+        self.last_undo_snapshot_at = Some(Instant::now());
+        self.last_undo_edit_kind = Some(kind);
+    }
+
+    fn undo(&mut self, _: &Undo, _: &mut Window, cx: &mut Context<Self>) {
+        let Some(entry) = self.undo_stack.pop_back() else {
+            return;
+        };
+        self.redo_stack.push_back(UndoEntry {
+            content: self.content.clone(),
+            selected_range: self.selected_range.clone(),
+            selection_reversed: self.selection_reversed,
+        });
+        self.content = entry.content;
+        self.selected_range = entry.selected_range;
+        self.selection_reversed = entry.selection_reversed;
+        self.marked_range = None;
+        self.last_undo_snapshot_at = None;
+        self.last_undo_edit_kind = None;
+        self.mark_content_edited();
+        self.clear_layout_cache();
+        cx.notify();
+    }
+
+    fn redo(&mut self, _: &Redo, _: &mut Window, cx: &mut Context<Self>) {
+        let Some(entry) = self.redo_stack.pop_back() else {
+            return;
+        };
+        self.undo_stack.push_back(UndoEntry {
+            content: self.content.clone(),
+            selected_range: self.selected_range.clone(),
+            selection_reversed: self.selection_reversed,
+        });
+        self.content = entry.content;
+        self.selected_range = entry.selected_range;
+        self.selection_reversed = entry.selection_reversed;
+        self.marked_range = None;
+        self.last_undo_snapshot_at = None;
+        self.last_undo_edit_kind = None;
+        self.mark_content_edited();
         self.clear_layout_cache();
         cx.notify();
     }
 
     fn clear_layout_cache(&mut self) {
         self.last_layout = None;
-        self.last_bounds = None;
+        if text_field_clear_bounds_on_edit() {
+            self.last_bounds = None;
+        }
+    }
+
+    fn mark_content_edited(&mut self) {
+        self.pending_height_edit_at = Some(Instant::now());
+    }
+
+    fn replace_content_range(&mut self, range: Range<usize>, replacement: &str) {
+        if text_field_use_legacy_replace() {
+            self.content = self.content[0..range.start].to_owned()
+                + replacement
+                + &self.content[range.end..];
+        } else {
+            self.content.replace_range(range, replacement);
+        }
     }
 
     fn left(&mut self, _: &Left, _: &mut Window, cx: &mut Context<Self>) {
@@ -293,6 +513,14 @@ impl TextField {
 
     fn end(&mut self, _: &End, _: &mut Window, cx: &mut Context<Self>) {
         self.move_to(self.content.len(), cx);
+    }
+
+    fn select_home(&mut self, _: &SelectHome, _: &mut Window, cx: &mut Context<Self>) {
+        self.select_to(0, cx);
+    }
+
+    fn select_end(&mut self, _: &SelectEnd, _: &mut Window, cx: &mut Context<Self>) {
+        self.select_to(self.content.len(), cx);
     }
 
     fn insert_newline(&mut self, _: &InsertNewline, window: &mut Window, cx: &mut Context<Self>) {
@@ -366,13 +594,27 @@ impl TextField {
     }
 
     fn paste(&mut self, _: &Paste, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
+        let Some(item) = cx.read_from_clipboard() else {
+            return;
+        };
+        if let Some(text) = item.text() {
             let normalized = if self.is_multiline() {
                 text
             } else {
                 text.replace('\n', " ")
             };
             self.replace_text_in_range(None, &normalized, window, cx);
+            return;
+        }
+        for entry in item.entries() {
+            if let ClipboardEntry::Image(image) = entry {
+                let bytes = image.bytes().to_vec();
+                if !bytes.is_empty() {
+                    self.pasted_image = Some(bytes);
+                    cx.notify();
+                    return;
+                }
+            }
         }
     }
 
@@ -570,8 +812,11 @@ impl EntityInputHandler for TextField {
             .map(|range| self.range_to_utf16(range))
     }
 
-    fn unmark_text(&mut self, _window: &mut Window, _cx: &mut Context<Self>) {
-        self.marked_range = None;
+    fn unmark_text(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.marked_range.take().is_some() {
+            self.clear_layout_cache();
+            cx.notify();
+        }
     }
 
     fn replace_text_in_range(
@@ -594,21 +839,28 @@ impl EntityInputHandler for TextField {
             .or(self.marked_range.clone())
             .unwrap_or(self.selected_range.clone());
 
-        self.content =
-            self.content[0..range.start].to_owned() + &replacement + &self.content[range.end..];
+        let replaced_len = range.end.saturating_sub(range.start);
+        let inserted_len = replacement.len();
+        self.push_undo_snapshot(
+            undo_edit_kind(replaced_len, inserted_len),
+            self.marked_range.is_none() && inserted_len <= 1 && replaced_len <= 1,
+        );
+        self.replace_content_range(range.clone(), &replacement);
         let cursor = range.start + replacement.len();
         self.selected_range = cursor..cursor;
         self.selection_reversed = false;
         self.marked_range.take();
+        self.mark_content_edited();
         self.clear_layout_cache();
         cx.notify();
         if let Some(started_at) = started_at {
             let elapsed = started_at.elapsed();
-            if elapsed.as_millis() >= TEXT_FIELD_SLOW_PATH_MS {
+            if elapsed.as_millis() >= text_field_profile_min_ms() {
                 tracing::warn!(
                     target: "zbase.input.perf",
                     phase = "replace_text_in_range",
                     elapsed_ms = elapsed.as_millis(),
+                    elapsed_us = elapsed.as_micros(),
                     content_len = self.content.len(),
                     replacement_len = replacement.len(),
                     is_multiline = self.is_multiline(),
@@ -637,8 +889,10 @@ impl EntityInputHandler for TextField {
             .or(self.marked_range.clone())
             .unwrap_or(self.selected_range.clone());
 
-        self.content =
-            self.content[0..range.start].to_owned() + &replacement + &self.content[range.end..];
+        let replaced_len = range.end.saturating_sub(range.start);
+        let inserted_len = replacement.len();
+        self.push_undo_snapshot(undo_edit_kind(replaced_len, inserted_len), false);
+        self.replace_content_range(range.clone(), &replacement);
         if !replacement.is_empty() {
             self.marked_range = Some(range.start..range.start + replacement.len());
         } else {
@@ -649,6 +903,7 @@ impl EntityInputHandler for TextField {
             .map(|range_utf16| self.range_from_utf16(range_utf16))
             .map(|new_range| range.start + new_range.start..range.start + new_range.end)
             .unwrap_or_else(|| range.start + replacement.len()..range.start + replacement.len());
+        self.mark_content_edited();
         self.clear_layout_cache();
         cx.notify();
     }
@@ -736,52 +991,69 @@ impl Element for TextLineElement {
                     .as_ref()
                     .map(|b| b.size.width.max(px(1.0)));
                 let profile_enabled = text_field_profile_enabled();
+                let profile_min_ms = text_field_profile_min_ms();
                 let content_height = if let Some(wrap_width) = wrap_width {
                     let text_style = window.text_style();
+                    let is_placeholder = input.content.is_empty();
                     let display_text = if input.content.is_empty() {
                         &input.placeholder
                     } else {
                         &input.content
                     };
                     let font_size = text_style.font_size.to_pixels(window.rem_size());
-                    let run = TextRun {
-                        len: display_text.len(),
-                        font: text_style.font(),
-                        color: text_style.color,
-                        background_color: None,
-                        underline: None,
-                        strikethrough: None,
-                    };
-                    let shape_started_at = profile_enabled.then(Instant::now);
-                    let shaped_height = window
-                        .text_system()
-                        .shape_text(
-                            display_text.clone().into(),
-                            font_size,
-                            &[run],
-                            Some(wrap_width),
-                            None,
-                        )
-                        .map(|lines| {
-                            lines
-                                .iter()
-                                .fold(px(0.), |h, line| h + line.size(line_height).height)
+                    if !text_field_layout_cache_disabled()
+                        && let Some(cached_layout) = input.last_layout.as_ref().filter(|layout| {
+                            layout.matches_shape_state(
+                                is_placeholder,
+                                input.marked_range.as_ref(),
+                                Some(wrap_width),
+                                font_size,
+                                line_height,
+                            )
                         })
-                        .unwrap_or(line_height);
-                    if let Some(shape_started_at) = shape_started_at {
-                        let elapsed = shape_started_at.elapsed();
-                        if elapsed.as_millis() >= TEXT_FIELD_SLOW_PATH_MS {
-                            tracing::warn!(
-                                target: "zbase.input.perf",
-                                phase = "request_layout.shape_text",
-                                elapsed_ms = elapsed.as_millis(),
-                                content_len = display_text.len(),
-                                wrap_width = ?wrap_width,
-                                "slow_text_field_path"
-                            );
+                    {
+                        cached_layout.total_height()
+                    } else {
+                        let run = TextRun {
+                            len: display_text.len(),
+                            font: text_style.font(),
+                            color: text_style.color,
+                            background_color: None,
+                            underline: None,
+                            strikethrough: None,
+                        };
+                        let shape_started_at = profile_enabled.then(Instant::now);
+                        let shaped_height = window
+                            .text_system()
+                            .shape_text(
+                                display_text.clone().into(),
+                                font_size,
+                                &[run],
+                                Some(wrap_width),
+                                None,
+                            )
+                            .map(|lines| {
+                                lines
+                                    .iter()
+                                    .fold(px(0.), |h, line| h + line.size(line_height).height)
+                            })
+                            .unwrap_or(line_height);
+                        if let Some(shape_started_at) = shape_started_at {
+                            let elapsed = shape_started_at.elapsed();
+                            if elapsed.as_millis() >= profile_min_ms {
+                                tracing::warn!(
+                                    target: "zbase.input.perf",
+                                    phase = "request_layout.shape_text",
+                                    elapsed_ms = elapsed.as_millis(),
+                                    elapsed_us = elapsed.as_micros(),
+                                    content_len = display_text.len(),
+                                    wrap_width = ?wrap_width,
+                                    "slow_text_field_path"
+                                );
+                            }
                         }
+                        shaped_height
                     }
-                    shaped_height
                 } else {
                     input.last_content_height.max(line_height)
                 };
@@ -815,73 +1087,93 @@ impl Element for TextLineElement {
             (content.clone(), style.color, false)
         };
 
-        let run = TextRun {
-            len: display_text.len(),
-            font: style.font(),
-            color: text_color,
-            background_color: None,
-            underline: None,
-            strikethrough: None,
-        };
-        let runs = if let Some(marked_range) = input.marked_range.as_ref() {
-            vec![
-                TextRun {
-                    len: marked_range.start,
-                    ..run.clone()
-                },
-                TextRun {
-                    len: marked_range.end - marked_range.start,
-                    underline: Some(UnderlineStyle {
-                        color: Some(run.color),
-                        thickness: px(1.0),
-                        wavy: false,
-                    }),
-                    ..run.clone()
-                },
-                TextRun {
-                    len: display_text.len() - marked_range.end,
-                    ..run
-                },
-            ]
-            .into_iter()
-            .filter(|run| run.len > 0)
-            .collect()
-        } else {
-            vec![run]
-        };
-
         let font_size = style.font_size.to_pixels(window.rem_size());
         let wrap_width = input
             .is_multiline()
             .then_some(bounds.size.width.max(px(1.0)));
-        let profile_enabled = text_field_profile_enabled();
-        let shape_started_at = profile_enabled.then(Instant::now);
-        let lines = window
-            .text_system()
-            .shape_text(display_text.into(), font_size, &runs, wrap_width, None)
-            .map(|lines| lines.into_vec())
-            .unwrap_or_default();
-        if let Some(shape_started_at) = shape_started_at {
-            let elapsed = shape_started_at.elapsed();
-            if elapsed.as_millis() >= TEXT_FIELD_SLOW_PATH_MS {
-                tracing::warn!(
-                    target: "zbase.input.perf",
-                    phase = "prepaint.shape_text",
-                    elapsed_ms = elapsed.as_millis(),
-                    content_len = content.len(),
-                    wrap_width = ?wrap_width,
+        let line_height = window.line_height();
+        let layout = if !text_field_layout_cache_disabled()
+            && let Some(cached_layout) = input.last_layout.as_ref().filter(|layout| {
+                layout.matches_shape_state(
                     is_placeholder,
-                    "slow_text_field_path"
-                );
-            }
-        }
+                    input.marked_range.as_ref(),
+                    wrap_width,
+                    font_size,
+                    line_height,
+                )
+            })
+        {
+            cached_layout.clone()
+        } else {
+            let run = TextRun {
+                len: display_text.len(),
+                font: style.font(),
+                color: text_color,
+                background_color: None,
+                underline: None,
+                strikethrough: None,
+            };
+            let runs = if let Some(marked_range) = input.marked_range.as_ref() {
+                vec![
+                    TextRun {
+                        len: marked_range.start,
+                        ..run.clone()
+                    },
+                    TextRun {
+                        len: marked_range.end - marked_range.start,
+                        underline: Some(UnderlineStyle {
+                            color: Some(run.color),
+                            thickness: px(1.0),
+                            wavy: false,
+                        }),
+                        ..run.clone()
+                    },
+                    TextRun {
+                        len: display_text.len() - marked_range.end,
+                        ..run
+                    },
+                ]
+                .into_iter()
+                .filter(|run| run.len > 0)
+                .collect()
+            } else {
+                vec![run]
+            };
 
-        let layout = TextLayoutSnapshot {
-            lines,
-            line_height: window.line_height(),
-            is_placeholder,
-            text_len: content.len(),
-            content,
+            let profile_enabled = text_field_profile_enabled();
+            let profile_min_ms = text_field_profile_min_ms();
+            let shape_started_at = profile_enabled.then(Instant::now);
+            let lines = window
+                .text_system()
+                .shape_text(display_text.into(), font_size, &runs, wrap_width, None)
+                .map(|lines| lines.into_vec())
+                .unwrap_or_default();
+            if let Some(shape_started_at) = shape_started_at {
+                let elapsed = shape_started_at.elapsed();
+                if elapsed.as_millis() >= profile_min_ms {
+                    tracing::warn!(
+                        target: "zbase.input.perf",
+                        phase = "prepaint.shape_text",
+                        elapsed_ms = elapsed.as_millis(),
+                        elapsed_us = elapsed.as_micros(),
+                        content_len = content.len(),
+                        wrap_width = ?wrap_width,
+                        is_placeholder,
+                        "slow_text_field_path"
+                    );
+                }
+            }
+
+            TextLayoutSnapshot {
+                lines,
+                line_height,
+                is_placeholder,
+                text_len: content.len(),
+                content,
+                wrap_width,
+                font_size,
+                marked_range: input.marked_range.clone(),
+            }
         };
         let scroll_y = if input.is_multiline() {
             visible_scroll_offset(&layout, input.scroll_y, bounds.size.height, cursor)
@@ -965,10 +1257,27 @@ impl Element for TextLineElement {
         let layout = std::mem::take(&mut prepaint.layout);
         let scroll_y = prepaint.scroll_y;
         self.input.update(cx, |input, _cx| {
+            let previous_content_height = input.last_content_height;
             input.last_content_height = content_height;
             input.last_layout = Some(layout);
             input.last_bounds = Some(bounds);
             input.scroll_y = scroll_y;
+            if !pixels_match(previous_content_height, content_height)
+                && let Some(started_at) = input.pending_height_edit_at.take()
+            {
+                let elapsed = started_at.elapsed();
+                if text_field_profile_enabled() && elapsed.as_millis() >= text_field_profile_min_ms() {
+                    tracing::warn!(
+                        target: "zbase.input.perf",
+                        phase = "content_height_update_lag",
+                        elapsed_ms = elapsed.as_millis(),
+                        elapsed_us = elapsed.as_micros(),
+                        previous_height = f32::from(previous_content_height),
+                        next_height = f32::from(content_height),
+                        "slow_text_field_path"
+                    );
+                }
+            }
         });
     }
 }
@@ -994,11 +1303,15 @@ impl Render for TextField {
             .on_action(cx.listener(Self::select_all))
             .on_action(cx.listener(Self::home))
             .on_action(cx.listener(Self::end))
+            .on_action(cx.listener(Self::select_home))
+            .on_action(cx.listener(Self::select_end))
             .on_action(cx.listener(Self::insert_newline))
             .on_action(cx.listener(Self::show_character_palette))
             .on_action(cx.listener(Self::paste))
             .on_action(cx.listener(Self::cut))
             .on_action(cx.listener(Self::copy))
+            .on_action(cx.listener(Self::undo))
+            .on_action(cx.listener(Self::redo))
             .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
             .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_mouse_up))
@@ -1013,12 +1326,16 @@ impl Focusable for TextField {
     }
 }
 
+#[derive(Clone)]
 struct TextLayoutSnapshot {
     lines: Vec<WrappedLine>,
     line_height: Pixels,
     is_placeholder: bool,
     text_len: usize,
     content: String,
+    wrap_width: Option<Pixels>,
+    font_size: Pixels,
+    marked_range: Option<Range<usize>>,
 }
 
 impl Default for TextLayoutSnapshot {
@@ -1029,11 +1346,29 @@ impl Default for TextLayoutSnapshot {
             is_placeholder: false,
             text_len: 0,
             content: String::new(),
+            wrap_width: None,
+            font_size: px(0.),
+            marked_range: None,
         }
     }
 }
 
 impl TextLayoutSnapshot {
+    fn matches_shape_state(
+        &self,
+        is_placeholder: bool,
+        marked_range: Option<&Range<usize>>,
+        wrap_width: Option<Pixels>,
+        font_size: Pixels,
+        line_height: Pixels,
+    ) -> bool {
+        self.is_placeholder == is_placeholder
+            && self.marked_range.as_ref() == marked_range
+            && optional_pixels_match(self.wrap_width, wrap_width)
+            && pixels_match(self.font_size, font_size)
+            && pixels_match(self.line_height, line_height)
+    }
+
     fn next_line_start(&self, line_start_ix: usize, line_len: usize) -> usize {
         let mut next = line_start_ix.saturating_add(line_len);
         if self.content.as_bytes().get(next) == Some(&b'\n') {
@@ -1175,6 +1510,28 @@ impl TextLayoutSnapshot {
         }
 
         quads
+    }
+}
+
+fn pixels_match(left: Pixels, right: Pixels) -> bool {
+    (f32::from(left) - f32::from(right)).abs() <= 0.5
+}
+
+fn optional_pixels_match(left: Option<Pixels>, right: Option<Pixels>) -> bool {
+    match (left, right) {
+        (Some(left), Some(right)) => pixels_match(left, right),
+        (None, None) => true,
+        _ => false,
+    }
+}
+
+fn undo_edit_kind(replaced_len: usize, inserted_len: usize) -> UndoEditKind {
+    if replaced_len == 0 && inserted_len > 0 {
+        UndoEditKind::Insert
+    } else if replaced_len > 0 && inserted_len == 0 {
+        UndoEditKind::Delete
+    } else {
+        UndoEditKind::Replace
     }
 }
 

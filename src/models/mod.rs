@@ -69,7 +69,7 @@ use self::{
     profile_panel_model::ProfilePanelModel,
     quick_switcher_model::{QuickSwitcherModel, QuickSwitcherResult, QuickSwitcherResultKind},
     search_model::SearchModel,
-    settings_model::{Density, SettingsModel, ThemeMode},
+    settings_model::{SettingsModel, ThemeMode},
     sidebar_model::{SidebarModel, SidebarRow, SidebarSection},
     thread_pane_model::ThreadPaneModel,
     timeline_model::{MessageRow, TimelineModel, TimelineRow},
@@ -633,9 +633,13 @@ impl AppModels {
                 hovered_message_id: None,
                 hovered_message_is_thread: None,
                 hovered_message_anchor_x: None,
+                hovered_message_anchor_y: None,
                 hovered_message_window_left: None,
+                hovered_message_window_top: None,
                 hovered_message_window_width: None,
+                hover_toolbar_settled: false,
                 typing_text: Some("Sam is typing…".to_string()),
+                quick_react_recent: None,
             },
             composer,
             quick_switcher: QuickSwitcherModel::default(),
@@ -914,9 +918,7 @@ impl AppModels {
                         &self.quick_switcher_profile_names,
                     ),
                     sublabel: Some("Last visited".to_string()),
-                    kind: quick_switcher_result_kind_for_conversation_kind(
-                        summary.kind.clone(),
-                    ),
+                    kind: quick_switcher_result_kind_for_conversation_kind(summary.kind.clone()),
                     route: route.clone(),
                     conversation_id: summary.id.clone(),
                     message_id: None,
@@ -947,6 +949,58 @@ impl AppModels {
                             summary.kind.clone(),
                         ),
                         route: current.clone(),
+                        conversation_id: summary.id.clone(),
+                        message_id: None,
+                        match_ranges: Vec::new(),
+                    });
+                }
+            }
+
+            if recent_results.len() < QUICK_SWITCHER_RECENT_LIMIT {
+                let mut persisted_affinity = self
+                    .settings
+                    .quick_switcher_affinity
+                    .iter()
+                    .map(|(conversation_id, (affinity, last_updated_ms))| {
+                        (conversation_id.as_str(), *affinity, *last_updated_ms)
+                    })
+                    .collect::<Vec<_>>();
+                persisted_affinity.sort_by(|left, right| {
+                    right
+                        .2
+                        .cmp(&left.2)
+                        .then_with(|| right.1.total_cmp(&left.1))
+                        .then_with(|| left.0.cmp(right.0))
+                });
+                for (conversation_id, _affinity, _last_updated_ms) in persisted_affinity {
+                    if recent_results.len() >= QUICK_SWITCHER_RECENT_LIMIT {
+                        break;
+                    }
+                    let Some(summary) = self
+                        .workspace
+                        .channels
+                        .iter()
+                        .chain(self.workspace.direct_messages.iter())
+                        .find(|summary| summary.id.0 == conversation_id)
+                    else {
+                        continue;
+                    };
+                    if !seen_conversation_ids.insert(summary.id.clone()) {
+                        continue;
+                    }
+                    recent_results.push(QuickSwitcherResult {
+                        label: quick_switcher_label_for_summary(
+                            summary,
+                            &self.quick_switcher_profile_names,
+                        ),
+                        sublabel: Some("Recent".to_string()),
+                        kind: quick_switcher_result_kind_for_conversation_kind(
+                            summary.kind.clone(),
+                        ),
+                        route: quick_switcher_route_for_summary(
+                            summary,
+                            &self.app.active_workspace_id,
+                        ),
                         conversation_id: summary.id.clone(),
                         message_id: None,
                         match_ranges: Vec::new(),
@@ -1067,16 +1121,23 @@ impl AppModels {
 
     pub fn resolve_deep_link(&self, deep_link: &str) -> Option<(Route, MessageId)> {
         let parsed = parse_keybase_chat_link(deep_link)?;
-        let summary = self.workspace.channels.iter().find(|summary| {
-            let Some(group) = summary.group.as_ref() else {
-                return false;
-            };
-            if !group.id.eq_ignore_ascii_case(&parsed.team) {
-                return false;
-            }
-            summary.title.eq_ignore_ascii_case(&parsed.channel)
-                || summary.topic.eq_ignore_ascii_case(&parsed.channel)
-        })?;
+        let summary = match &parsed.channel {
+            Some(channel) => self.workspace.channels.iter().find(|summary| {
+                let Some(group) = summary.group.as_ref() else {
+                    return false;
+                };
+                if !group.id.eq_ignore_ascii_case(&parsed.team) {
+                    return false;
+                }
+                summary.title.eq_ignore_ascii_case(channel)
+                    || summary.topic.eq_ignore_ascii_case(channel)
+            }),
+            None => self
+                .workspace
+                .direct_messages
+                .iter()
+                .find(|summary| normalize_tlf_name(&summary.topic) == normalize_tlf_name(&parsed.team)),
+        }?;
         let route = quick_switcher_route_for_summary(summary, &self.app.active_workspace_id);
         Some((route, MessageId::new(parsed.message_id)))
     }
@@ -1603,6 +1664,74 @@ impl AppModels {
     pub fn add_recent_emoji_alias(&mut self, alias: String) {
         push_recent_alias(&mut self.emoji_picker.recent_aliases, alias, 32);
         self.settings.emoji_recents = self.emoji_picker.recent_aliases.clone();
+        self.refresh_quick_react_recent();
+    }
+
+    pub fn refresh_quick_react_recent(&mut self) {
+        use crate::models::timeline_model::QuickReactRecent;
+        use crate::views::timeline::QUICK_REACT_EMOJI;
+
+        let mut builtin: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for (alias, unicode) in QUICK_REACT_EMOJI {
+            builtin.insert(alias.to_ascii_lowercase());
+            builtin.insert(unicode.to_string());
+        }
+
+        let is_builtin = |alias: &str| {
+            let bare = alias
+                .strip_prefix(':')
+                .and_then(|s| s.strip_suffix(':'))
+                .unwrap_or(alias);
+            let lower = bare.to_ascii_lowercase();
+            if builtin.contains(&lower) {
+                return true;
+            }
+            if builtin.contains(alias) {
+                return true;
+            }
+            if let Some(stock) = emojis::get_by_shortcode(&lower) {
+                builtin.contains(&stock.to_string())
+            } else {
+                false
+            }
+        };
+
+        self.timeline.quick_react_recent = self
+            .emoji_picker
+            .recent_aliases
+            .iter()
+            .find(|alias| !is_builtin(alias))
+            .and_then(|alias| {
+                let bare = alias
+                    .strip_prefix(':')
+                    .and_then(|s| s.strip_suffix(':'))
+                    .unwrap_or(alias);
+                if let Some(render) = self.timeline.emoji_index.get(&bare.to_ascii_lowercase()) {
+                    Some(QuickReactRecent {
+                        alias: alias.clone(),
+                        unicode: render.unicode.clone(),
+                        asset_path: render.asset_path.clone(),
+                    })
+                } else if let Some(stock) = emojis::get_by_shortcode(bare) {
+                    Some(QuickReactRecent {
+                        alias: bare.to_string(),
+                        unicode: Some(stock.to_string()),
+                        asset_path: None,
+                    })
+                } else if emojis::get(alias).is_some() {
+                    Some(QuickReactRecent {
+                        alias: alias.clone(),
+                        unicode: Some(alias.clone()),
+                        asset_path: None,
+                    })
+                } else {
+                    Some(QuickReactRecent {
+                        alias: alias.clone(),
+                        unicode: None,
+                        asset_path: None,
+                    })
+                }
+            });
     }
 
     pub fn react_to_message(&mut self, message_id: &MessageId, emoji: &str) {
@@ -1942,24 +2071,6 @@ impl AppModels {
         };
     }
 
-    pub fn cycle_density(&mut self) {
-        self.settings.density = match self.settings.density {
-            Density::Comfortable => Density::Compact,
-            Density::Compact => Density::Comfortable,
-        };
-    }
-
-    pub fn toggle_reduced_motion(&mut self) {
-        self.settings.reduced_motion = !self.settings.reduced_motion;
-    }
-
-    pub fn toggle_right_pane_setting(&mut self) {
-        self.settings.show_right_pane = !self.settings.show_right_pane;
-        if !self.settings.show_right_pane {
-            self.set_right_pane(RightPaneMode::Hidden);
-        }
-    }
-
     pub fn dismiss_current_pinned_banner(&mut self) -> bool {
         let conversation_id = self.conversation.summary.id.0.clone();
         let Some(pinned_item_id) = self
@@ -2069,6 +2180,7 @@ impl AppModels {
     }
 
     fn sync_route_models(&mut self, route: &Route) {
+        self.find_in_chat.close();
         match route {
             Route::Channel {
                 channel_id,
@@ -2665,9 +2777,13 @@ fn general_timeline() -> TimelineModel {
         hovered_message_id: None,
         hovered_message_is_thread: None,
         hovered_message_anchor_x: None,
+        hovered_message_anchor_y: None,
         hovered_message_window_left: None,
+        hovered_message_window_top: None,
         hovered_message_window_width: None,
+        hover_toolbar_settled: false,
         typing_text: Some("Sam is typing…".to_string()),
+        quick_react_recent: None,
     }
 }
 
@@ -2748,9 +2864,13 @@ fn design_timeline() -> TimelineModel {
         hovered_message_id: None,
         hovered_message_is_thread: None,
         hovered_message_anchor_x: None,
+        hovered_message_anchor_y: None,
         hovered_message_window_left: None,
+        hovered_message_window_top: None,
         hovered_message_window_width: None,
+        hover_toolbar_settled: false,
         typing_text: None,
+        quick_react_recent: None,
     }
 }
 
@@ -2801,9 +2921,13 @@ fn dm_timeline() -> TimelineModel {
         hovered_message_id: None,
         hovered_message_is_thread: None,
         hovered_message_anchor_x: None,
+        hovered_message_anchor_y: None,
         hovered_message_window_left: None,
+        hovered_message_window_top: None,
         hovered_message_window_width: None,
+        hover_toolbar_settled: false,
         typing_text: None,
+        quick_react_recent: None,
     }
 }
 
@@ -3061,6 +3185,12 @@ fn quick_switcher_sublabel_for_summary(summary: &ConversationSummary) -> Option<
             (!summary.topic.trim().is_empty()).then(|| summary.topic.clone())
         }
     }
+}
+
+fn normalize_tlf_name(tlf: &str) -> String {
+    let mut parts: Vec<&str> = tlf.split(',').map(str::trim).filter(|s| !s.is_empty()).collect();
+    parts.sort_unstable_by(|a, b| a.to_ascii_lowercase().cmp(&b.to_ascii_lowercase()));
+    parts.join(",")
 }
 
 fn quick_switcher_route_for_summary(
@@ -3576,6 +3706,41 @@ mod tests {
                 "conv_chan_1",
             ]
         );
+    }
+
+    #[test]
+    fn quick_switcher_uses_persisted_affinity_for_recent_conversations() {
+        let mut settings = SettingsModel::default();
+        settings
+            .quick_switcher_affinity
+            .insert("conv_chan_2".to_string(), (2.0, 2_000));
+        settings
+            .quick_switcher_affinity
+            .insert("conv_dm_1".to_string(), (1.0, 1_000));
+        let mut models = AppModels::empty_with_settings(settings);
+        let workspace_id = models.workspace.workspace_id.clone();
+        models.workspace.channels = vec![
+            channel_summary("conv_chan_1", "general"),
+            channel_summary("conv_chan_2", "design"),
+        ];
+        models.workspace.direct_messages = vec![dm_summary(
+            "conv_dm_1",
+            "alice",
+            ConversationKind::DirectMessage,
+        )];
+        models.navigation.current = Route::WorkspaceHome { workspace_id };
+        models.navigation.back_stack.clear();
+
+        models.update_quick_switcher_query(String::new());
+
+        let recent_ids = models
+            .quick_switcher
+            .results
+            .iter()
+            .filter(|result| result.kind != QuickSwitcherResultKind::UnreadChannel)
+            .map(|result| result.conversation_id.0.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(recent_ids, vec!["conv_chan_2", "conv_dm_1"]);
     }
 
     fn quick_switcher_dm_corpus(entries: &[(&str, &str)]) -> QuickSwitcherSearchCorpus {

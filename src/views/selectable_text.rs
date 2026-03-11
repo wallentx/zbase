@@ -357,15 +357,33 @@ impl SelectableText {
         }
     }
 
-    fn on_mouse_move(&mut self, event: &MouseMoveEvent, _: &mut Window, cx: &mut Context<Self>) {
+    fn on_mouse_move(
+        &mut self,
+        event: &MouseMoveEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if self.is_selecting {
             self.select_to(self.index_for_mouse_position(event.position), cx);
         }
         if !self.link_ranges.is_empty() {
-            let index = self.index_for_mouse_position(event.position);
-            let over_link = self.link_at_index(index).is_some();
+            let in_bounds = self
+                .last_bounds
+                .map_or(false, |b| b.contains(&event.position));
+            let over_link = if in_bounds {
+                let index = self.index_for_mouse_position(event.position);
+                self.link_at_index(index).is_some()
+            } else {
+                false
+            };
             if over_link != self.hovering_link {
                 self.hovering_link = over_link;
+                if over_link {
+                    window.dispatch_action(
+                        Box::new(commands::DismissHoverToolbar),
+                        cx,
+                    );
+                }
                 cx.notify();
             }
         }
@@ -389,6 +407,28 @@ impl SelectableText {
 
     pub fn is_selecting(&self) -> bool {
         self.is_selecting
+    }
+
+    pub fn has_selection(&self) -> bool {
+        !self.selected_range.is_empty()
+    }
+
+    pub fn is_hovering_link(&self) -> bool {
+        self.hovering_link
+    }
+
+    pub fn is_position_over_link(&self, position: Point<Pixels>) -> bool {
+        if self.link_ranges.is_empty() {
+            return false;
+        }
+        let in_bounds = self
+            .last_bounds
+            .map_or(false, |b| b.contains(&position));
+        if !in_bounds {
+            return false;
+        }
+        let index = self.index_for_mouse_position(position);
+        self.link_at_index(index).is_some()
     }
 
     fn select_word_at(&mut self, offset: usize, cx: &mut Context<Self>) {

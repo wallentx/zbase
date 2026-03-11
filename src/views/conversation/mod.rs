@@ -57,6 +57,10 @@ impl ConversationView {
         let jump_pill = div()
             .id("conversation-jump-latest")
             .on_click(cx.listener(AppWindow::scroll_timeline_to_bottom))
+            .on_mouse_move(cx.listener(|this, _, _, cx| {
+                this.clear_hovered_message(cx);
+                cx.stop_propagation();
+            }))
             .rounded_full()
             .bg(glass_surface_dark().opacity(0.92))
             .border_1()
@@ -72,12 +76,18 @@ impl ConversationView {
             .child(chevron_down_icon(text_primary()))
             .child(jump_label);
         div()
+            .id("conversation-view")
             .flex_1()
             .h_full()
             .min_h(px(0.))
             .flex()
             .flex_col()
             .overflow_hidden()
+            .on_click(cx.listener(|this, _, window, cx| {
+                if !this.any_text_selected(cx) {
+                    this.restore_chat_focus(window, cx);
+                }
+            }))
             .drag_over::<ExternalPaths>(|style, _, _, _| {
                 style
                     .bg(if is_dark_theme() {

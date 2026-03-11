@@ -367,10 +367,11 @@ fn collect_protected_ranges(
     let mut merged: Vec<Range<usize>> = Vec::with_capacity(ranges.len());
     for range in ranges {
         if let Some(last) = merged.last_mut()
-            && range.start <= last.end {
-                last.end = last.end.max(range.end);
-                continue;
-            }
+            && range.start <= last.end
+        {
+            last.end = last.end.max(range.end);
+            continue;
+        }
         merged.push(range);
     }
     merged

@@ -30,25 +30,21 @@ impl MainPanelHost {
         cx: &mut Context<AppWindow>,
     ) -> AnyElement {
         let content = match &models.navigation.current {
-            Route::WorkspaceHome { .. } => WorkspaceHomeView.render(
-                &models.app,
-                &models.workspace,
-                &models.notifications,
+            Route::WorkspaceHome { .. } => {
+                WorkspaceHomeView.render(&models.app, &models.workspace, &models.notifications, cx)
+            }
+            Route::Channel { .. } | Route::DirectMessage { .. } => ConversationView.render(
+                &models.conversation,
+                &models.timeline,
+                &models.find_in_chat,
+                find_in_chat_input,
+                &models.composer,
+                composer_input,
+                timeline_list_state,
+                timeline_unseen_count,
+                show_timeline_jump_to_bottom,
                 cx,
             ),
-            Route::Channel { .. } | Route::DirectMessage { .. } => ConversationView
-                .render(
-                    &models.conversation,
-                    &models.timeline,
-                    &models.find_in_chat,
-                    find_in_chat_input,
-                    &models.composer,
-                    composer_input,
-                    timeline_list_state,
-                    timeline_unseen_count,
-                    show_timeline_jump_to_bottom,
-                    cx,
-                ),
             Route::Search { .. } => {
                 SearchView.render(&models.search, video_render_cache, search_input, cx)
             }

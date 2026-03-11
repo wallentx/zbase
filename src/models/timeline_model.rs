@@ -95,11 +95,25 @@ pub struct TimelineModel {
     pub hovered_message_is_thread: Option<bool>,
     /// Cursor X position (window coords) captured on hover.
     pub hovered_message_anchor_x: Option<f32>,
+    /// Cursor Y position (window coords) captured when the hover settled.
+    pub hovered_message_anchor_y: Option<f32>,
     /// Hovered message container left edge in window coords.
     pub hovered_message_window_left: Option<f32>,
+    /// Hovered message container top edge in window coords.
+    pub hovered_message_window_top: Option<f32>,
     /// Hovered message container width in window coords.
     pub hovered_message_window_width: Option<f32>,
+    /// Whether the hover toolbar is settled (mouse was still long enough).
+    pub hover_toolbar_settled: bool,
     pub typing_text: Option<String>,
+    pub quick_react_recent: Option<QuickReactRecent>,
+}
+
+#[derive(Clone, Debug)]
+pub struct QuickReactRecent {
+    pub alias: String,
+    pub unicode: Option<String>,
+    pub asset_path: Option<String>,
 }
 
 impl TimelineModel {

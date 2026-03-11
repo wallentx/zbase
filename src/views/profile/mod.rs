@@ -10,19 +10,21 @@ use crate::{
         accent,
         app_window::AppWindow,
         avatar::{Avatar, default_avatar_background},
-        badge, border, close_icon, danger, danger_soft, panel_alt_bg, panel_alt_surface,
-        panel_surface, subtle_surface, success, success_soft, text_primary, text_secondary,
-        warning, warning_soft,
+        badge, border, close_icon, danger, panel_alt_bg, panel_alt_surface, panel_surface,
+        subtle_surface, success, text_primary, text_secondary, warning,
     },
 };
 use gpui::prelude::FluentBuilder;
 use gpui::{
     AnyElement, Context, CursorStyle, FontWeight, InteractiveElement, IntoElement, ParentElement,
-    StatefulInteractiveElement, Styled, div, px, rgb,
+    ScrollHandle, StatefulInteractiveElement, Styled, div, px, rgb,
 };
+
+const ENV_PROFILE_DISABLE_VIRTUALIZATION: &str = "ZBASE_PROFILE_DISABLE_VIRTUALIZATION";
 
 pub fn render_profile_panel(
     profile_panel: &ProfilePanelModel,
+    profile_scroll: &ScrollHandle,
     cx: &mut Context<AppWindow>,
 ) -> AnyElement {
     let Some(user_id) = profile_panel.user_id.as_ref() else {
@@ -63,15 +65,24 @@ pub fn render_profile_panel(
         .filter(|value| !value.is_empty());
     let has_bio_block = bio.is_some() || location.is_some();
 
-    let identity_proofs = profile.map(profile_identity_proofs).unwrap_or_default();
-    let team_showcase = profile.map(profile_team_showcase).unwrap_or_default();
-    let custom_fields = profile.map(profile_custom_fields).unwrap_or_default();
+    let identity_proofs = profile.map(profile_identity_proofs).unwrap_or(&[]);
+    let team_showcase = profile.map(profile_team_showcase).unwrap_or(&[]);
+    let custom_fields = profile.map(profile_custom_fields).unwrap_or(&[]);
     let social_entries = social_graph_entries(social_graph, profile_panel.active_social_tab);
+    let (
+        social_start_index,
+        social_end_index,
+        social_top_spacer_px,
+        social_bottom_spacer_px,
+    ) = social_entry_window(social_entries.len(), profile_scroll);
+    let visible_social_entries = &social_entries[social_start_index..social_end_index];
 
     div()
         .size_full()
         .id("right-pane-profile-scroll")
         .overflow_y_scroll()
+        .track_scroll(profile_scroll)
+        .on_scroll_wheel(cx.listener(AppWindow::profile_scrolled))
         .scrollbar_width(px(8.))
         .p_4()
         .flex()
@@ -168,20 +179,25 @@ pub fn render_profile_panel(
                                 ))
                         }),
                 )
-                // Loading state
-                .when(profile_panel.loading && profile.is_none(), |container| {
+                // Refreshing indicator (stale data visible underneath)
+                .when(profile_panel.loading && profile.is_some(), |container| {
                     container.child(
                         div()
                             .w_full()
-                            .rounded_md()
-                            .bg(panel_alt_surface())
-                            .p_3()
-                            .text_sm()
+                            .text_xs()
                             .text_color(rgb(text_secondary()))
-                            .child("Loading profile\u{2026}"),
+                            .flex()
+                            .justify_center()
+                            .child("Updating\u{2026}"),
                     )
                 }),
         )
+        // Skeleton placeholders for first load
+        .when(profile_panel.loading && profile.is_none(), |container| {
+            container
+                .child(skeleton_section(vec![px(180.), px(120.)]))
+                .child(skeleton_section(vec![px(140.), px(100.), px(160.)]))
+        })
         // Bio + location block
         .when(has_bio_block, |container| {
             container.child(
@@ -274,57 +290,66 @@ pub fn render_profile_panel(
                             )
                         },
                     )
-                    .children(
-                        social_entries
-                            .into_iter()
-                            .enumerate()
-                            .map(|(index, entry)| {
-                                let entry_user_id = entry.user_id.clone();
-                                let entry_name = if entry.display_name.trim().is_empty() {
-                                    entry.user_id.0.clone()
-                                } else {
-                                    entry.display_name.clone()
-                                };
-                                div()
-                                    .id(("profile-social-entry", index))
-                                    .rounded_md()
-                                    .bg(panel_alt_surface())
-                                    .px_2()
-                                    .py_2()
-                                    .flex()
-                                    .items_center()
-                                    .justify_between()
-                                    .cursor(CursorStyle::PointingHand)
-                                    .hover(|s| s.bg(subtle_surface()))
-                                    .on_click(cx.listener(move |this, _, window, cx| {
-                                        this.open_user_profile_panel(
-                                            entry_user_id.clone(),
-                                            window,
-                                            cx,
-                                        );
-                                    }))
-                                    .child(
-                                        div()
-                                            .flex()
-                                            .items_center()
-                                            .gap_2()
-                                            .child(Avatar::render(
-                                                &entry_name,
-                                                entry.avatar_asset.as_deref(),
-                                                28.,
-                                                default_avatar_background(&entry_name),
-                                                text_primary(),
-                                            ))
-                                            .child(
-                                                div()
-                                                    .text_sm()
-                                                    .text_color(rgb(profile_name_color(
-                                                        entry.affinity,
-                                                    )))
-                                                    .child(entry_name),
-                                            ),
-                                    )
-                                    .into_any_element()
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .when(social_top_spacer_px > 0.0, |list| {
+                                list.child(div().h(px(social_top_spacer_px)))
+                            })
+                            .children(visible_social_entries.iter().enumerate().map(
+                                |(visible_offset, entry)| {
+                                    let index = social_start_index + visible_offset;
+                                    let entry_user_id = entry.user_id.clone();
+                                    let entry_name = if entry.display_name.trim().is_empty() {
+                                        entry.user_id.0.clone()
+                                    } else {
+                                        entry.display_name.clone()
+                                    };
+                                    div()
+                                        .id(("profile-social-entry", index))
+                                        .rounded_md()
+                                        .bg(panel_alt_surface())
+                                        .px_2()
+                                        .py_2()
+                                        .flex()
+                                        .items_center()
+                                        .justify_between()
+                                        .cursor(CursorStyle::PointingHand)
+                                        .hover(|s| s.bg(subtle_surface()))
+                                        .on_click(cx.listener(move |this, _, window, cx| {
+                                            this.open_user_profile_panel(
+                                                entry_user_id.clone(),
+                                                window,
+                                                cx,
+                                            );
+                                        }))
+                                        .child(
+                                            div()
+                                                .flex()
+                                                .items_center()
+                                                .gap_2()
+                                                .child(Avatar::render(
+                                                    &entry_name,
+                                                    entry.avatar_asset.as_deref(),
+                                                    28.,
+                                                    default_avatar_background(&entry_name),
+                                                    text_primary(),
+                                                ))
+                                                .child(
+                                                    div()
+                                                        .text_sm()
+                                                        .text_color(rgb(profile_name_color(
+                                                            entry.affinity,
+                                                        )))
+                                                        .child(entry_name),
+                                                ),
+                                        )
+                                        .into_any_element()
+                                },
+                            ))
+                            .when(social_bottom_spacer_px > 0.0, |list| {
+                                list.child(div().h(px(social_bottom_spacer_px)))
                             }),
                     ),
             )
@@ -552,6 +577,27 @@ fn empty_profile_panel(cx: &mut Context<AppWindow>) -> AnyElement {
         .into_any_element()
 }
 
+fn skeleton_section(widths: Vec<gpui::Pixels>) -> AnyElement {
+    div()
+        .rounded_lg()
+        .bg(panel_surface())
+        .border_1()
+        .border_color(rgb(border()))
+        .p_3()
+        .flex()
+        .flex_col()
+        .gap_2()
+        .children(widths.into_iter().map(|w| {
+            div()
+                .h(px(12.))
+                .w(w)
+                .rounded_md()
+                .bg(panel_alt_surface())
+                .into_any_element()
+        }))
+        .into_any_element()
+}
+
 fn section_header(title: &str) -> AnyElement {
     div()
         .font_weight(FontWeight::MEDIUM)
@@ -632,7 +678,7 @@ fn presence_dot_color(availability: &Availability) -> u32 {
     }
 }
 
-fn render_proofs_section(proofs: Vec<crate::domain::profile::IdentityProof>) -> AnyElement {
+fn render_proofs_section(proofs: &[crate::domain::profile::IdentityProof]) -> AnyElement {
     div()
         .rounded_lg()
         .bg(panel_surface())
@@ -643,37 +689,31 @@ fn render_proofs_section(proofs: Vec<crate::domain::profile::IdentityProof>) -> 
         .flex_col()
         .gap_2()
         .child(section_header("Identity proofs"))
-        .children(proofs.into_iter().map(|proof| {
-            let (label, state_bg, state_fg) = match proof.state {
-                ProofState::Verified => ("verified", success_soft(), success()),
-                ProofState::Broken => ("broken", danger_soft(), danger()),
-                ProofState::Pending => ("pending", warning_soft(), warning()),
-                ProofState::Unknown => ("unknown", panel_alt_bg(), text_secondary()),
+        .children(proofs.iter().map(|proof| {
+            let color = match proof.state {
+                ProofState::Verified => success(),
+                ProofState::Broken => danger(),
+                ProofState::Pending => warning(),
+                ProofState::Unknown => text_secondary(),
             };
             div()
                 .rounded_md()
                 .bg(panel_alt_surface())
                 .px_2()
                 .py_2()
-                .flex()
-                .items_center()
-                .justify_between()
-                .child(
-                    div()
-                        .text_sm()
-                        .text_color(rgb(text_primary()))
-                        .child(format!(
-                            "{} \u{00B7} {}",
-                            proof.service_name, proof.service_username
-                        )),
-                )
-                .child(badge(label, state_bg, state_fg))
+                .overflow_hidden()
+                .text_sm()
+                .text_color(rgb(color))
+                .child(format!(
+                    "{} \u{00B7} {}",
+                    proof.service_name, proof.service_username
+                ))
                 .into_any_element()
         }))
         .into_any_element()
 }
 
-fn render_teams_section(teams: Vec<crate::domain::profile::TeamShowcaseEntry>) -> AnyElement {
+fn render_teams_section(teams: &[crate::domain::profile::TeamShowcaseEntry]) -> AnyElement {
     div()
         .rounded_lg()
         .bg(panel_surface())
@@ -684,7 +724,7 @@ fn render_teams_section(teams: Vec<crate::domain::profile::TeamShowcaseEntry>) -
         .flex_col()
         .gap_2()
         .child(section_header("Teams"))
-        .children(teams.into_iter().map(|team| {
+        .children(teams.iter().map(|team| {
             div()
                 .rounded_md()
                 .bg(panel_alt_surface())
@@ -697,14 +737,14 @@ fn render_teams_section(teams: Vec<crate::domain::profile::TeamShowcaseEntry>) -
                     div()
                         .text_sm()
                         .text_color(rgb(text_primary()))
-                        .child(team.name),
+                        .child(team.name.clone()),
                 )
                 .when(!team.description.trim().is_empty(), |card| {
                     card.child(
                         div()
                             .text_xs()
                             .text_color(rgb(text_secondary()))
-                            .child(team.description),
+                            .child(team.description.clone()),
                     )
                 })
                 .child(
@@ -718,7 +758,7 @@ fn render_teams_section(teams: Vec<crate::domain::profile::TeamShowcaseEntry>) -
         .into_any_element()
 }
 
-fn render_custom_fields_section(fields: Vec<crate::domain::profile::CustomField>) -> AnyElement {
+fn render_custom_fields_section(fields: &[crate::domain::profile::CustomField]) -> AnyElement {
     div()
         .rounded_lg()
         .bg(panel_surface())
@@ -729,7 +769,7 @@ fn render_custom_fields_section(fields: Vec<crate::domain::profile::CustomField>
         .flex_col()
         .gap_2()
         .child(section_header("Details"))
-        .children(fields.into_iter().map(|field| {
+        .children(fields.iter().map(|field| {
             div()
                 .rounded_md()
                 .bg(panel_alt_surface())
@@ -742,13 +782,13 @@ fn render_custom_fields_section(fields: Vec<crate::domain::profile::CustomField>
                     div()
                         .text_xs()
                         .text_color(rgb(text_secondary()))
-                        .child(field.label),
+                        .child(field.label.clone()),
                 )
                 .child(
                     div()
                         .text_sm()
                         .text_color(rgb(text_primary()))
-                        .child(field.value),
+                        .child(field.value.clone()),
                 )
                 .into_any_element()
         }))
@@ -762,48 +802,82 @@ fn profile_social_graph(profile: &UserProfile) -> Option<&SocialGraph> {
     })
 }
 
-fn social_graph_entries(
-    social_graph: Option<&SocialGraph>,
+const SOCIAL_ENTRY_ESTIMATED_HEIGHT_PX: f32 = 44.0;
+const SOCIAL_ENTRY_OVERSCAN_ROWS: usize = 8;
+const SOCIAL_ENTRY_VISIBLE_ROWS: usize = 30;
+
+fn social_entry_window(total_entries: usize, profile_scroll: &ScrollHandle) -> (usize, usize, f32, f32) {
+    if total_entries == 0 {
+        return (0, 0, 0.0, 0.0);
+    }
+    if profile_virtualization_disabled() {
+        return (0, total_entries, 0.0, 0.0);
+    }
+    let scroll_top_px = f32::from(profile_scroll.offset().y.abs());
+    let estimated_row = (scroll_top_px / SOCIAL_ENTRY_ESTIMATED_HEIGHT_PX).floor() as usize;
+    let mut start = estimated_row.saturating_sub(SOCIAL_ENTRY_OVERSCAN_ROWS);
+    start = start.min(total_entries.saturating_sub(1));
+    let target_rows = SOCIAL_ENTRY_VISIBLE_ROWS + (SOCIAL_ENTRY_OVERSCAN_ROWS * 2);
+    let end = (start + target_rows).min(total_entries);
+    let top_spacer_px = (start as f32) * SOCIAL_ENTRY_ESTIMATED_HEIGHT_PX;
+    let bottom_spacer_px = ((total_entries.saturating_sub(end)) as f32) * SOCIAL_ENTRY_ESTIMATED_HEIGHT_PX;
+    (start, end, top_spacer_px, bottom_spacer_px)
+}
+
+fn profile_virtualization_disabled() -> bool {
+    std::env::var(ENV_PROFILE_DISABLE_VIRTUALIZATION)
+        .ok()
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
+}
+
+fn social_graph_entries<'a>(
+    social_graph: Option<&'a SocialGraph>,
     tab: SocialTab,
-) -> Vec<crate::domain::profile::SocialGraphEntry> {
+) -> &'a [crate::domain::profile::SocialGraphEntry] {
     match (social_graph, tab) {
-        (Some(graph), SocialTab::Followers) => graph.followers.clone().unwrap_or_default(),
-        (Some(graph), SocialTab::Following) => graph.following.clone().unwrap_or_default(),
-        (None, _) => Vec::new(),
+        (Some(graph), SocialTab::Followers) => graph.followers.as_deref().unwrap_or(&[]),
+        (Some(graph), SocialTab::Following) => graph.following.as_deref().unwrap_or(&[]),
+        (None, _) => &[],
     }
 }
 
-fn profile_identity_proofs(profile: &UserProfile) -> Vec<crate::domain::profile::IdentityProof> {
+fn profile_identity_proofs(profile: &UserProfile) -> &[crate::domain::profile::IdentityProof] {
     profile
         .sections
         .iter()
         .find_map(|section| match section {
-            ProfileSection::IdentityProofs(items) => Some(items.clone()),
+            ProfileSection::IdentityProofs(items) => Some(items.as_slice()),
             _ => None,
         })
-        .unwrap_or_default()
+        .unwrap_or(&[])
 }
 
-fn profile_team_showcase(profile: &UserProfile) -> Vec<crate::domain::profile::TeamShowcaseEntry> {
+fn profile_team_showcase(profile: &UserProfile) -> &[crate::domain::profile::TeamShowcaseEntry] {
     profile
         .sections
         .iter()
         .find_map(|section| match section {
-            ProfileSection::TeamShowcase(items) => Some(items.clone()),
+            ProfileSection::TeamShowcase(items) => Some(items.as_slice()),
             _ => None,
         })
-        .unwrap_or_default()
+        .unwrap_or(&[])
 }
 
-fn profile_custom_fields(profile: &UserProfile) -> Vec<crate::domain::profile::CustomField> {
+fn profile_custom_fields(profile: &UserProfile) -> &[crate::domain::profile::CustomField] {
     profile
         .sections
         .iter()
         .find_map(|section| match section {
-            ProfileSection::CustomFields(items) => Some(items.clone()),
+            ProfileSection::CustomFields(items) => Some(items.as_slice()),
             _ => None,
         })
-        .unwrap_or_default()
+        .unwrap_or(&[])
 }
 
 fn presence_label(presence: &Presence) -> String {

@@ -601,6 +601,9 @@ fn attachment_source_to_open_target(source: &AttachmentSource) -> Option<String>
 
 fn is_unrenderable_keybase_asset_url(url: &str) -> bool {
     let lower = url.to_ascii_lowercase();
+    if lower.starts_with("http://127.0.0.1:") || lower.starts_with("http://localhost:") {
+        return true;
+    }
     let prefix = if lower.starts_with("https://s3.amazonaws.com/") {
         "https://s3.amazonaws.com/"
     } else if lower.starts_with("http://s3.amazonaws.com/") {
@@ -639,12 +642,14 @@ fn percent_decode(value: &str) -> String {
     let mut out = String::with_capacity(value.len());
     let mut index = 0usize;
     while index < bytes.len() {
-        if bytes[index] == b'%' && index + 2 < bytes.len()
-            && let (Some(hi), Some(lo)) = (hex(bytes[index + 1]), hex(bytes[index + 2])) {
-                out.push((hi << 4 | lo) as char);
-                index += 3;
-                continue;
-            }
+        if bytes[index] == b'%'
+            && index + 2 < bytes.len()
+            && let (Some(hi), Some(lo)) = (hex(bytes[index + 1]), hex(bytes[index + 2]))
+        {
+            out.push((hi << 4 | lo) as char);
+            index += 3;
+            continue;
+        }
         out.push(bytes[index] as char);
         index += 1;
     }
@@ -716,6 +721,18 @@ pub fn link_icon(color: u32) -> AnyElement {
     icon_asset("assets/icons/link.svg", 18., color)
 }
 
+pub fn copy_icon(color: u32) -> AnyElement {
+    icon_asset("assets/icons/copy.svg", 18., color)
+}
+
+pub fn clipboard_icon(color: u32) -> AnyElement {
+    icon_asset("assets/icons/clipboard.svg", 18., color)
+}
+
+pub fn trash_icon(color: u32) -> AnyElement {
+    icon_asset("assets/icons/trash.svg", 18., color)
+}
+
 pub fn video_icon(color: u32) -> AnyElement {
     icon_asset("assets/icons/video.svg", 18., color)
 }
@@ -778,6 +795,23 @@ pub fn crown_icon(color: u32) -> AnyElement {
 
 pub fn send_icon(color: u32) -> AnyElement {
     icon_asset("assets/icons/send.svg", 16., color)
+}
+
+pub fn play_icon(color: u32) -> AnyElement {
+    icon_asset("assets/icons/play.svg", 24., color)
+}
+
+pub fn format_duration_ms(ms: u64) -> String {
+    let total_seconds = ms / 1000;
+    let minutes = total_seconds / 60;
+    let seconds = total_seconds % 60;
+    if minutes >= 60 {
+        let hours = minutes / 60;
+        let mins = minutes % 60;
+        format!("{hours}:{mins:02}:{seconds:02}")
+    } else {
+        format!("{minutes}:{seconds:02}")
+    }
 }
 
 pub fn composer_tool(icon: AnyElement, color: u32) -> AnyElement {

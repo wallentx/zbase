@@ -6,9 +6,10 @@ const DATA_DIR_ENV: &str = "ZBASE_DATA_DIR";
 
 pub fn data_root() -> PathBuf {
     if let Ok(override_dir) = env::var(DATA_DIR_ENV)
-        && !override_dir.trim().is_empty() {
-            return PathBuf::from(override_dir);
-        }
+        && !override_dir.trim().is_empty()
+    {
+        return PathBuf::from(override_dir);
+    }
 
     if let Some(project_dirs) = ProjectDirs::from("io", "zbase", "zbase") {
         return project_dirs.data_local_dir().to_path_buf();

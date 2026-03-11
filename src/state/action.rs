@@ -18,6 +18,9 @@ pub enum DraftKey {
 pub enum UiAction {
     StartApp,
     Navigate(Route),
+    /// Like Navigate but without triggering LoadConversation.
+    /// Used by navigate_to_message to avoid a background load race with JumpToMessage.
+    NavigateQuiet(Route),
     NavigateBack,
     OpenThread {
         root_id: MessageId,
