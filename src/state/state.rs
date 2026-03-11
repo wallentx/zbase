@@ -49,6 +49,7 @@ pub enum TimelineKey {
 #[derive(Clone, Debug)]
 pub struct AppState {
     pub boot_phase: BootPhase,
+    pub boot_status: String,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -247,6 +248,7 @@ impl Default for UiState {
         Self {
             app: AppState {
                 boot_phase: BootPhase::Launching,
+                boot_status: String::new(),
             },
             navigation: NavigationState::default(),
             drafts: HashMap::new(),

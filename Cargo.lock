@@ -6539,6 +6539,7 @@ dependencies = [
  "rmp-serde",
  "rmpv",
  "rocksdb",
+ "rust-embed",
  "serde",
  "serde_json",
  "sha2",

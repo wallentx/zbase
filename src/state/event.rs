@@ -254,6 +254,7 @@ pub enum BackendEvent {
         conversation_binding: ConversationBinding,
     },
     CallUpdated(CallPatch),
+    BootStatus(String),
     KeybaseNotifyStub {
         method: String,
         payload_preview: Option<String>,
