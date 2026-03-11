@@ -997,6 +997,13 @@ impl OverlayHost {
                         "⌘⇧A",
                         "activity",
                         cx,
+                    ))
+                    .child(Self::command_palette_row(
+                        "overlay-command-mark-all-read",
+                        "Mark all as read",
+                        "",
+                        "mark-all-read",
+                        cx,
                     )),
             )
             .into_any_element()

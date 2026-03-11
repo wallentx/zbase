@@ -15,8 +15,8 @@ use crate::{
         CUSTOM_EMOJI_REACTION_SIZE_PX, accent, accent_soft, activity_icon, affinity_broken,
         affinity_positive,
         app_window::{AppWindow, video_preview_cache_key},
-        arrow_left_icon, arrow_right_icon, attachment_display_label, attachment_image_source,
-        attachment_lightbox_source,
+        arrow_left_icon, arrow_right_icon, attachment_display_label, attachment_header_row,
+        attachment_image_source, attachment_lightbox_source,
         avatar::{Avatar, default_avatar_background},
         badge, crown_icon, danger, format_duration_ms, glass_surface_dark, hash_icon,
         inline_markdown::{InlineMarkdownConfig, apply_inline_markdown, remap_source_byte_range},
@@ -276,6 +276,7 @@ impl TimelineList {
             true,
             false,
             None,
+            None,
             video_render_cache,
             selectable_texts,
             cx,
@@ -285,6 +286,7 @@ impl TimelineList {
     pub(crate) fn render_thread_row(
         timeline: &TimelineModel,
         row: &TimelineRow,
+        thread_media_max_width: f32,
         video_render_cache: &HashMap<String, Arc<RenderImage>>,
         selectable_texts: &mut HashMap<String, Entity<SelectableText>>,
         cx: &mut Context<AppWindow>,
@@ -295,6 +297,7 @@ impl TimelineList {
             None,
             false,
             true,
+            Some(thread_media_max_width),
             None,
             video_render_cache,
             selectable_texts,
@@ -321,6 +324,7 @@ impl TimelineList {
                 Some(message_memo),
                 true,
                 false,
+                None,
                 find_query,
                 video_render_cache,
                 selectable_texts,
@@ -335,6 +339,7 @@ impl TimelineList {
             None,
             true,
             false,
+            None,
             find_query,
             video_render_cache,
             selectable_texts,
@@ -348,6 +353,7 @@ impl TimelineList {
         message_memo: Option<&MessageRenderMemo>,
         show_thread_reply_badge: bool,
         is_thread: bool,
+        thread_media_max_width: Option<f32>,
         find_query: Option<&str>,
         video_render_cache: &HashMap<String, Arc<RenderImage>>,
         selectable_texts: &mut HashMap<String, Entity<SelectableText>>,
@@ -445,6 +451,7 @@ impl TimelineList {
                     message_memo,
                     show_thread_reply_badge,
                     is_thread,
+                    thread_media_max_width,
                     is_last_message,
                     find_query,
                     video_render_cache,
@@ -467,6 +474,7 @@ impl TimelineList {
         message_memo: Option<&MessageRenderMemo>,
         show_thread_reply_badge: bool,
         is_thread: bool,
+        thread_media_max_width: Option<f32>,
         is_last_message: bool,
         find_query: Option<&str>,
         video_render_cache: &HashMap<String, Arc<RenderImage>>,
@@ -616,6 +624,7 @@ impl TimelineList {
                 &timeline.reaction_index,
                 show_thread_reply_badge,
                 is_thread,
+                thread_media_max_width,
                 is_last_message,
                 hover_anchor_x,
                 hover_anchor_y,
@@ -769,7 +778,8 @@ impl TimelineList {
         emoji_source_index: &HashMap<String, InlineEmojiRender>,
         reaction_index: &HashMap<crate::domain::ids::MessageId, Vec<MessageReactionRender>>,
         show_thread_reply_badge: bool,
-        _is_thread: bool,
+        is_thread: bool,
+        thread_media_max_width: Option<f32>,
         _is_last_message: bool,
         hover_anchor_x: Option<f32>,
         hover_anchor_y: Option<f32>,
@@ -789,6 +799,9 @@ impl TimelineList {
                 .attachments
                 .iter()
                 .all(|attachment| attachment.kind == AttachmentKind::Image);
+
+        let media_link_only_message = !image_attachment_message
+            && crate::views::is_media_link_only_message(&message.fragments, &message.link_previews);
 
         div()
             .id(SharedString::from(format!(
@@ -814,11 +827,11 @@ impl TimelineList {
                     .child(HoveredMessageBoundsReporter {
                         owner,
                         message_id: message_id_for_bounds,
-                        is_thread: _is_thread,
+                        is_thread,
                     })
             })
             .child({
-                if image_attachment_message {
+                if image_attachment_message || media_link_only_message {
                     div().into_any_element()
                 } else {
                     Self::render_message_fragments(
@@ -835,15 +848,28 @@ impl TimelineList {
                 }
             })
             .when(!message.link_previews.is_empty(), |container| {
+                let link_preview_max_width = thread_media_max_width.unwrap_or(360.0);
+                let link_preview_max_height = if thread_media_max_width.is_some() {
+                    220.0
+                } else {
+                    300.0
+                };
                 container.child(Self::render_link_previews(
                     &message.id.0,
                     &message.link_previews,
                     message.attachments.is_empty() && message.thread_reply_count == 0,
+                    link_preview_max_width,
+                    link_preview_max_height,
                     video_render_cache,
                     cx,
                 ))
             })
             .when(!message.attachments.is_empty(), |container| {
+                let caption_text = if image_attachment_message && !message.fragments.is_empty() {
+                    Self::message_caption_text(message)
+                } else {
+                    None
+                };
                 container.child(
                     div().flex().flex_col().gap_1().children(
                         message
@@ -852,14 +878,20 @@ impl TimelineList {
                             .enumerate()
                             .map(|(index, attachment)| {
                                 let attachment_label = attachment_display_label(attachment);
+                                let header = attachment_header_row(attachment);
+                                let mut card = div().flex().flex_col().gap_0p5().child(header);
+
                                 if attachment.kind == AttachmentKind::Image
                                     && let Some(media_source) = attachment_image_source(attachment)
                                 {
-                                    let (max_width, max_height) = if show_thread_reply_badge {
-                                        (360.0, 300.0)
-                                    } else {
-                                        (280.0, 240.0)
-                                    };
+                                    let (max_width, max_height) =
+                                        if let Some(thread_max_width) = thread_media_max_width {
+                                            (thread_max_width, 220.0)
+                                        } else if show_thread_reply_badge {
+                                            (360.0, 300.0)
+                                        } else {
+                                            (280.0, 240.0)
+                                        };
                                     let preview_width = attachment
                                         .preview
                                         .as_ref()
@@ -877,101 +909,105 @@ impl TimelineList {
                                         max_height,
                                     );
                                     let lightbox_source = attachment_lightbox_source(attachment);
-                                    let caption_text = Self::message_caption_text(message);
+                                    let lightbox_caption = caption_text.clone();
                                     let lightbox_width = preview_width;
                                     let lightbox_height = preview_height;
-                                    return div()
-                                        .flex()
-                                        .flex_col()
-                                        .gap_1()
-                                        .child(
+                                    card = card.child(
+                                        div()
+                                            .id(SharedString::from(format!(
+                                                "timeline-attachment-image-{}-{index}",
+                                                message.id.0
+                                            )))
+                                            .w(px(media_width))
+                                            .h(px(media_height))
+                                            .when_some(
+                                                lightbox_source,
+                                                |thumb, lightbox_source| {
+                                                    let caption_text = lightbox_caption.clone();
+                                                    thumb
+                                                        .cursor(gpui::CursorStyle::PointingHand)
+                                                        .on_mouse_move(cx.listener(|this, _, _, cx| {
+                                                            this.clear_hovered_message(cx);
+                                                            cx.stop_propagation();
+                                                        }))
+                                                        .on_click(cx.listener(
+                                                            move |this, _, _, cx| {
+                                                                this.open_image_lightbox(
+                                                                    lightbox_source.clone(),
+                                                                    caption_text.clone(),
+                                                                    lightbox_width,
+                                                                    lightbox_height,
+                                                                    cx,
+                                                                );
+                                                            },
+                                                        ))
+                                                },
+                                            )
+                                            .child(
+                                                img(media_source)
+                                                    .w(px(media_width))
+                                                    .h(px(media_height))
+                                                    .rounded_md()
+                                                    .object_fit(ObjectFit::Contain)
+                                                    .flex_shrink_0()
+                                                    .min_w(px(16.))
+                                                    .min_h(px(16.))
+                                                    .with_fallback({
+                                                        let label = attachment_label.clone();
+                                                        move || {
+                                                            div()
+                                                                .text_xs()
+                                                                .text_color(rgb(text_secondary()))
+                                                                .child(label.clone())
+                                                                .into_any_element()
+                                                        }
+                                                    }),
+                                            ),
+                                    );
+                                    if let Some(ref caption) = caption_text {
+                                        card = card.child(
                                             div()
-                                                .id(SharedString::from(format!(
-                                                    "timeline-attachment-image-{}-{index}",
-                                                    message.id.0
-                                                )))
-                                                .w(px(media_width))
-                                                .h(px(media_height))
-                                                .when_some(
-                                                    lightbox_source,
-                                                    |thumb, lightbox_source| {
-                                                        let caption_text = caption_text.clone();
-                                                        thumb
-                                                            .cursor(gpui::CursorStyle::PointingHand)
-                                                            .on_mouse_move(cx.listener(|this, _, _, cx| {
-                                                                this.clear_hovered_message(cx);
-                                                                cx.stop_propagation();
-                                                            }))
-                                                            .on_click(cx.listener(
-                                                                move |this, _, _, cx| {
-                                                                    this.open_image_lightbox(
-                                                                        lightbox_source.clone(),
-                                                                        caption_text.clone(),
-                                                                        lightbox_width,
-                                                                        lightbox_height,
-                                                                        cx,
-                                                                    );
-                                                                },
-                                                            ))
-                                                    },
-                                                )
-                                                .child(
-                                                    img(media_source)
-                                                        .w(px(media_width))
-                                                        .h(px(media_height))
-                                                        .rounded_md()
-                                                        .object_fit(ObjectFit::Contain)
-                                                        .flex_shrink_0()
-                                                        .min_w(px(16.))
-                                                        .min_h(px(16.))
-                                                        .with_fallback({
-                                                            let label = attachment_label.clone();
-                                                            move || {
-                                                                div()
-                                                                    .text_xs()
-                                                                    .text_color(rgb(
-                                                                        text_secondary(),
-                                                                    ))
-                                                                    .child(label.clone())
-                                                                    .into_any_element()
-                                                            }
-                                                        }),
-                                                ),
-                                        )
-                                        .into_any_element();
-                                }
-                                if attachment.kind == AttachmentKind::Video {
-                                    if let Some(thumb_source) = attachment_image_source(attachment)
-                                    {
-                                        let (max_width, max_height) = if show_thread_reply_badge {
+                                                .text_xs()
+                                                .text_color(rgb(text_secondary()))
+                                                .child(caption.clone()),
+                                        );
+                                    }
+                                } else if attachment.kind == AttachmentKind::Video
+                                    && let Some(thumb_source) = attachment_image_source(attachment)
+                                {
+                                    let (max_width, max_height) =
+                                        if let Some(thread_max_width) = thread_media_max_width {
+                                            (thread_max_width, 220.0)
+                                        } else if show_thread_reply_badge {
                                             (360.0, 300.0)
                                         } else {
                                             (280.0, 240.0)
                                         };
-                                        let preview_width = attachment
-                                            .preview
-                                            .as_ref()
-                                            .and_then(|p| p.width)
-                                            .or(attachment.width);
-                                        let preview_height = attachment
-                                            .preview
-                                            .as_ref()
-                                            .and_then(|p| p.height)
-                                            .or(attachment.height);
-                                        let (media_width, media_height) = Self::media_frame_size(
-                                            preview_width,
-                                            preview_height,
-                                            max_width,
-                                            max_height,
-                                        );
-                                        let video_path =
-                                            attachment.source.as_ref().and_then(|s| match s {
-                                                AttachmentSource::LocalPath(p) => Some(p.clone()),
-                                                _ => None,
-                                            });
-                                        let duration_label =
-                                            attachment.duration_ms.map(format_duration_ms);
-                                        return div()
+                                    let preview_width = attachment
+                                        .preview
+                                        .as_ref()
+                                        .and_then(|p| p.width)
+                                        .or(attachment.width);
+                                    let preview_height = attachment
+                                        .preview
+                                        .as_ref()
+                                        .and_then(|p| p.height)
+                                        .or(attachment.height);
+                                    let (media_width, media_height) = Self::media_frame_size(
+                                        preview_width,
+                                        preview_height,
+                                        max_width,
+                                        max_height,
+                                    );
+                                    let video_path =
+                                        attachment.source.as_ref().and_then(|s| match s {
+                                            AttachmentSource::LocalPath(p) => Some(p.clone()),
+                                            _ => None,
+                                        });
+                                    let duration_label =
+                                        attachment.duration_ms.map(format_duration_ms);
+                                    card = card.child(
+                                        div()
                                             .id(SharedString::from(format!(
                                                 "timeline-attachment-video-{}-{index}",
                                                 message.id.0
@@ -1031,63 +1067,15 @@ impl TimelineList {
                                                         .text_color(rgb(0xFFFFFF))
                                                         .child(label),
                                                 )
-                                            })
-                                            .into_any_element();
-                                    }
-                                    let video_path =
-                                        attachment.source.as_ref().and_then(|s| match s {
-                                            AttachmentSource::LocalPath(p) => Some(p.clone()),
-                                            _ => None,
-                                        });
-                                    return div()
-                                        .id(SharedString::from(format!(
-                                            "timeline-attachment-video-label-{}-{index}",
-                                            message.id.0
-                                        )))
-                                        .cursor(gpui::CursorStyle::PointingHand)
-                                        .on_mouse_move(cx.listener(|this, _, _, cx| {
-                                            this.clear_hovered_message(cx);
-                                            cx.stop_propagation();
-                                        }))
-                                        .when_some(video_path, |el, path| {
-                                            el.on_click(cx.listener(move |_, _, _, _| {
-                                                AppWindow::open_video_in_native_player(&path);
-                                            }))
-                                        })
-                                        .text_xs()
-                                        .text_color(rgb(accent()))
-                                        .child(attachment_label)
-                                        .into_any_element();
+                                            }),
+                                    );
                                 }
-                                div()
-                                    .id(("timeline-file-open", index))
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.open_files_pane(cx);
-                                    }))
-                                    .text_xs()
-                                    .text_color(rgb(accent()))
-                                    .child(attachment_label)
-                                    .into_any_element()
+
+                                card.into_any_element()
                             }),
                     ),
                 )
             })
-            .when(
-                image_attachment_message && !message.fragments.is_empty(),
-                |container| {
-                    container.child(Self::render_message_fragments(
-                        message,
-                        find_query,
-                        affinity_index,
-                        current_user_id,
-                        emoji_index,
-                        emoji_source_index,
-                        message_memo,
-                        selectable_texts,
-                        cx,
-                    ))
-                },
-            )
             .when(show_edited_badge, |container| {
                 container.child(
                     div()
@@ -1676,6 +1664,8 @@ impl TimelineList {
         message_key: &str,
         previews: &[LinkPreview],
         tight_bottom_spacing: bool,
+        media_max_width: f32,
+        media_max_height: f32,
         video_render_cache: &HashMap<String, Arc<RenderImage>>,
         cx: &mut Context<AppWindow>,
     ) -> AnyElement {
@@ -1689,6 +1679,7 @@ impl TimelineList {
         div()
             .flex()
             .flex_col()
+            .items_start()
             .gap_1()
             .pt_1()
             .when(!tight_bottom_spacing, |container| container.pb_0p5())
@@ -1699,6 +1690,10 @@ impl TimelineList {
                 let image_element_id = SharedString::from(format!(
                     "timeline-link-preview-image-{message_key}-{index}"
                 ));
+                let is_giphy = {
+                    let lower = preview.url.to_ascii_lowercase();
+                    lower.contains("giphy.com") || lower.contains("gph.is")
+                };
 
                 if preview.is_media {
                     let media_source = preview
@@ -1708,8 +1703,8 @@ impl TimelineList {
                     let (media_width, media_height) = Self::media_frame_size(
                         preview.media_width,
                         preview.media_height,
-                        360.0,
-                        300.0,
+                        media_max_width,
+                        media_max_height,
                     );
                     return div()
                         .id(element_id)
@@ -1799,7 +1794,17 @@ impl TimelineList {
                 }
 
                 let site = preview.site.clone().unwrap_or_else(|| "link".to_string());
-                let title = preview.title.unwrap_or_else(|| preview.url.clone());
+                let has_title = preview.title.is_some();
+                let title = if is_giphy {
+                    preview
+                        .title
+                        .clone()
+                        .filter(|value| !value.trim().is_empty())
+                        .unwrap_or_else(|| "GIPHY".to_string())
+                } else {
+                    preview.title.unwrap_or_else(|| preview.url.clone())
+                };
+                let thumbnail = preview.thumbnail_asset.clone();
                 div()
                     .id(element_id)
                     .on_click(cx.listener(move |this, _, window, cx| {
@@ -1824,6 +1829,32 @@ impl TimelineList {
                             .child(site),
                     )
                     .child(div().text_sm().text_color(rgb(text_primary())).child(title))
+                    .when(has_title && !is_giphy, |container| {
+                        container.child(div().text_xs().text_color(rgb(accent())).child(preview.url.clone()))
+                    })
+                    .when_some(thumbnail, |container, thumb_path| {
+                        let max_thumb_height = media_max_height.min(200.0);
+                        let (tw, th) = if let (Some(w), Some(h)) = (preview.media_width, preview.media_height)
+                            && w > 0
+                            && h > 0
+                        {
+                            let w = w as f32;
+                            let h = h as f32;
+                            let scale = (media_max_width / w).min(max_thumb_height / h).min(1.0);
+                            (w * scale, h * scale)
+                        } else {
+                            (media_max_width, max_thumb_height)
+                        };
+                        container.child(
+                            img(ImageSource::from(std::path::PathBuf::from(thumb_path)))
+                                .id(image_element_id)
+                                .mt_0p5()
+                                .w(px(tw))
+                                .h(px(th))
+                                .rounded_md()
+                                .object_fit(ObjectFit::Contain),
+                        )
+                    })
                     .into_any_element()
             }))
             .when(hidden > 0, |container| {
@@ -1851,7 +1882,9 @@ impl TimelineList {
         let scale = (max_width / width).min(max_height / height).min(1.0);
         width *= scale;
         height *= scale;
-        (width.max(120.0), height.max(90.0))
+        let min_width = max_width.min(120.0).max(1.0);
+        let min_height = max_height.min(90.0).max(1.0);
+        (width.max(min_width), height.max(min_height))
     }
 
     fn toolbar_icon_button(

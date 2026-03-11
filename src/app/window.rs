@@ -9,6 +9,7 @@ use crate::{
     models::AppModels,
     services::{
         backends::{keybase::KeybaseBackend, router::BackendRouter},
+        local_store::LocalStore,
         settings_store::SettingsStore,
     },
     state::{
@@ -22,6 +23,7 @@ use gpui::{
     WindowOptions, point, px, size,
 };
 use std::env;
+use std::sync::Arc;
 
 const ENV_BENCH_USE_DEMO: &str = "ZBASE_BENCH_USE_DEMO";
 const ENV_BENCH_SKIP_BACKEND: &str = "ZBASE_BENCH_SKIP_BACKEND";
@@ -52,7 +54,10 @@ pub fn open_main_window(cx: &mut App) {
             AppModels::empty_with_settings(settings)
         };
         let app_store = build_app_store(&models);
-        let backend_router = build_backend_router(&models);
+        let local_store = Arc::new(LocalStore::open().unwrap_or_else(|error| {
+            panic!("failed to initialize local RocksDB store: {error}")
+        }));
+        let backend_router = build_backend_router(&models, Arc::clone(&local_store));
         let search_text = models.search.query.clone();
         let emoji_picker_text = models.emoji_picker.query.clone();
         let find_in_chat_text = models.find_in_chat.query.clone();
@@ -125,6 +130,7 @@ pub fn open_main_window(cx: &mut App) {
                 models,
                 app_store,
                 backend_router,
+                local_store,
                 cx.focus_handle(),
                 quick_switcher_input,
                 new_chat_input,
@@ -206,7 +212,7 @@ fn build_app_store(models: &AppModels) -> AppStore {
     store
 }
 
-fn build_backend_router(models: &AppModels) -> BackendRouter {
+fn build_backend_router(models: &AppModels, local_store: Arc<LocalStore>) -> BackendRouter {
     if env_flag(ENV_BENCH_SKIP_BACKEND) {
         tracing::warn!("bench.backend.skip enabled at router setup");
         return BackendRouter::default();
@@ -216,7 +222,7 @@ fn build_backend_router(models: &AppModels) -> BackendRouter {
     let account_id = AccountId::new("account_demo_keybase");
     let backend_id = BackendId::new("keybase");
 
-    router.register_backend(Box::new(KeybaseBackend::new()));
+    router.register_backend(Box::new(KeybaseBackend::new(local_store)));
     router.register_account(account_id.clone(), backend_id.clone());
 
     for ws_id in &models.app.open_workspaces {

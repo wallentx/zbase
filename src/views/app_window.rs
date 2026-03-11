@@ -1,3 +1,4 @@
+use crate::services::og_service::{OgFetchResult, OgService};
 use crate::state::state::{BootPhase, TimelineKey};
 use crate::{
     app::{commands, theme::resolve_theme},
@@ -25,7 +26,7 @@ use crate::{
         sidebar_model::SidebarModel,
         timeline_model::TeamAuthorRole,
     },
-    services::{backends::router::BackendRouter, settings_store::SettingsStore},
+    services::{backends::router::BackendRouter, local_store::LocalStore, settings_store::SettingsStore},
     state::{
         AppStore, ConnectionState, DraftKey, UiAction, bindings::MessageBinding,
         event::BackendEvent,
@@ -209,6 +210,9 @@ pub struct AppWindow {
     video_pending_urls: HashSet<String>,
     video_result_sender: Sender<VideoDecodeOutcome>,
     video_result_receiver: Receiver<VideoDecodeOutcome>,
+    og_service: OgService,
+    og_result_sender: Sender<OgFetchResult>,
+    og_result_receiver: Receiver<OgFetchResult>,
     last_mark_read_attempt: HashMap<String, (String, Instant)>,
     hover_settle_seq: u64,
     quick_switcher_query_seq: u64,
@@ -528,6 +532,7 @@ impl AppWindow {
         models: AppModels,
         app_store: AppStore,
         backend_router: BackendRouter,
+        local_store: Arc<LocalStore>,
         focus_handle: FocusHandle,
         quick_switcher_input: Entity<TextField>,
         new_chat_input: Entity<TextField>,
@@ -546,6 +551,7 @@ impl AppWindow {
         let bench_script = BenchScriptConfig::from_env();
         let bench_profile_user_id = env_nonempty(ENV_BENCH_PROFILE_USER).map(UserId::new);
         let (video_result_sender, video_result_receiver) = mpsc::channel();
+        let (og_result_sender, og_result_receiver) = mpsc::channel();
 
         Self {
             models,
@@ -604,6 +610,9 @@ impl AppWindow {
             video_pending_urls: HashSet::new(),
             video_result_sender,
             video_result_receiver,
+            og_service: OgService::new(local_store),
+            og_result_sender,
+            og_result_receiver,
             last_mark_read_attempt: HashMap::new(),
             hover_settle_seq: 0,
             quick_switcher_query_seq: 0,
@@ -974,6 +983,7 @@ impl AppWindow {
             events.push(event);
         }
         let mut needs_refresh = self.drain_video_decode_results();
+        needs_refresh |= self.drain_og_fetch_results();
         let quick_switcher_typing = self.models.overlay.quick_switcher_open
             && !self.models.quick_switcher.query.trim().is_empty();
         if events.is_empty() {
@@ -1383,6 +1393,57 @@ impl AppWindow {
             .cloned()
             .collect::<Vec<_>>();
         self.schedule_video_preview_decodes_for_previews(&previews);
+    }
+
+    fn drain_og_fetch_results(&mut self) -> bool {
+        let mut changed = false;
+        loop {
+            match self.og_result_receiver.try_recv() {
+                Ok(result) => {
+                    if result.preview.is_some() {
+                        changed = true;
+                    }
+                    self.og_service.apply_result(result);
+                }
+                Err(TryRecvError::Empty) | Err(TryRecvError::Disconnected) => break,
+            }
+        }
+        if changed {
+            self.apply_og_previews_to_timeline();
+            self.timeline_row_render_cache.invalidate();
+        }
+        changed
+    }
+
+    fn apply_og_previews_to_timeline(&mut self) {
+        apply_og_previews_to_messages(
+            &self.og_service,
+            self.models
+                .timeline
+                .rows
+                .iter_mut()
+                .filter_map(|row| {
+                    if let crate::models::timeline_model::TimelineRow::Message(message_row) = row {
+                        Some(&mut message_row.message)
+                    } else {
+                        None
+                    }
+                })
+                .collect::<Vec<_>>(),
+        );
+        apply_og_previews_to_messages(
+            &self.og_service,
+            self.models.thread_pane.replies.iter_mut().collect(),
+        );
+    }
+
+    fn schedule_og_fetches_for_messages(&mut self, messages: &[MessageRecord]) {
+        for message in messages {
+            let urls = extract_link_urls_from_fragments(&message.fragments);
+            for url in &urls {
+                self.og_service.schedule_fetch(url, &self.og_result_sender);
+            }
+        }
     }
 
     fn schedule_video_preview_decodes_for_previews(&mut self, previews: &[LinkPreview]) {
@@ -2083,6 +2144,7 @@ fn bench_composer_paste_payload(step: u64) -> String {
                 message.link_previews.clear();
             }
         }
+        self.apply_og_previews_to_timeline();
     }
 
     fn dispatch_ui_action(&mut self, action: UiAction) {
@@ -2943,6 +3005,7 @@ fn bench_composer_paste_payload(step: u64) -> String {
                     offset_in_item: px(0.),
                 });
             }
+            self.apply_og_previews_to_timeline();
             self.sync_cache.timeline_rows_sig = Some(timeline_rows_sig);
             self.sync_cache.timeline_link_previews_sig = Some(timeline_link_previews_sig);
         } else if timeline_link_previews_changed {
@@ -2961,6 +3024,8 @@ fn bench_composer_paste_payload(step: u64) -> String {
         }
         self.schedule_video_preview_decodes_for_messages(&timeline_messages);
         self.schedule_video_preview_decodes_for_search_results();
+        self.schedule_og_fetches_for_messages(&timeline_messages);
+        self.schedule_og_fetches_for_messages(&self.models.thread_pane.replies.clone());
         self.apply_pending_timeline_scroll_target();
         if (timeline_reactions_changed || timeline_rows_changed)
             && was_near_bottom_before_sync
@@ -3619,6 +3684,37 @@ fn bench_composer_paste_payload(step: u64) -> String {
         true
     }
 
+    fn mark_all_conversations_read(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let unread: Vec<_> = self
+            .models
+            .workspace
+            .channels
+            .iter()
+            .chain(self.models.workspace.direct_messages.iter())
+            .filter(|c| c.unread_count > 0)
+            .map(|c| c.id.clone())
+            .collect();
+        let count = unread.len();
+        for conversation_id in unread {
+            self.dispatch_ui_action(UiAction::MarkConversationRead {
+                conversation_id,
+                message_id: None,
+            });
+        }
+        if count > 0 {
+            self.models.push_toast(
+                &format!(
+                    "Marked {} conversation{} as read",
+                    count,
+                    if count == 1 { "" } else { "s" }
+                ),
+                None,
+            );
+        }
+        self.restore_chat_focus(window, cx);
+        self.refresh(cx);
+    }
+
     pub(crate) fn scroll_timeline_to_bottom(
         &mut self,
         _: &ClickEvent,
@@ -3862,6 +3958,7 @@ fn bench_composer_paste_payload(step: u64) -> String {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        cx.stop_propagation();
         window.focus(&self.composer_input.focus_handle(cx));
     }
 
@@ -3887,7 +3984,13 @@ fn bench_composer_paste_payload(step: u64) -> String {
             return;
         }
         if self.models.navigation.right_pane == RightPaneMode::Thread {
-            window.focus(&self.thread_input.focus_handle(cx));
+            let composer_focused = self.composer_input.focus_handle(cx).is_focused(window);
+            let thread_focused = self.thread_input.focus_handle(cx).is_focused(window);
+            if composer_focused && !thread_focused {
+                window.focus(&self.composer_input.focus_handle(cx));
+            } else {
+                window.focus(&self.thread_input.focus_handle(cx));
+            }
         } else {
             window.focus(&self.composer_input.focus_handle(cx));
         }
@@ -3899,6 +4002,7 @@ fn bench_composer_paste_payload(step: u64) -> String {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        cx.stop_propagation();
         window.focus(&self.thread_input.focus_handle(cx));
     }
 
@@ -5799,6 +5903,7 @@ fn bench_composer_paste_payload(step: u64) -> String {
             "activity" => self.navigate_to(self.activity_route(), window, cx),
             "thread" => self.toggle_pane(RightPaneMode::Thread, window, cx),
             "call" => self.start_or_open_call(window, cx),
+            "mark-all-read" => self.mark_all_conversations_read(window, cx),
             _ => self.refresh(cx),
         }
     }
@@ -6231,6 +6336,24 @@ fn bench_composer_paste_payload(step: u64) -> String {
         self.toggle_splash_screen(cx);
     }
 
+    fn close_window_action(
+        &mut self,
+        _: &commands::CloseWindow,
+        window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) {
+        window.remove_window();
+    }
+
+    fn quit_app_action(
+        &mut self,
+        _: &commands::QuitApp,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        cx.quit();
+    }
+
     fn toggle_benchmark_capture_action(
         &mut self,
         _: &commands::ToggleBenchmarkCapture,
@@ -6379,6 +6502,8 @@ impl Render for AppWindow {
                 .on_action(cx.listener(Self::toggle_command_palette_action))
                 .on_action(cx.listener(Self::toggle_keybase_inspector_action))
                 .on_action(cx.listener(Self::toggle_splash_screen_action))
+                .on_action(cx.listener(Self::close_window_action))
+                .on_action(cx.listener(Self::quit_app_action))
                 .on_action(cx.listener(Self::toggle_benchmark_capture_action))
                 .on_action(cx.listener(Self::dismiss_overlays_action))
                 .on_action(cx.listener(Self::dismiss_hover_toolbar_action))
@@ -7717,6 +7842,99 @@ fn link_preview_video_url(preview: &LinkPreview) -> Option<String> {
         return None;
     }
     Some(fallback.to_string())
+}
+
+fn apply_og_previews_to_messages(og_service: &OgService, messages: Vec<&mut MessageRecord>) {
+    for message in messages {
+        let urls = extract_link_urls_from_fragments(&message.fragments);
+        if urls.is_empty() {
+            continue;
+        }
+        for url in &urls {
+            let Some(Some(og)) = og_service.lookup(url) else {
+                continue;
+            };
+            if let Some(existing) = message
+                .link_previews
+                .iter_mut()
+                .find(|p| urls_match(&p.url, url))
+            {
+                if existing.title.is_none() {
+                    existing.title = og.title.clone();
+                }
+                if existing.site.is_none() {
+                    existing.site = og.site.clone();
+                }
+                if existing.description.is_none() {
+                    existing.description = og.description.clone();
+                }
+                if existing.thumbnail_asset.is_none() {
+                    existing.thumbnail_asset = og.thumbnail_asset.clone();
+                }
+            } else {
+                message.link_previews.push(og.clone());
+            }
+        }
+    }
+}
+
+pub(crate) fn urls_match(a: &str, b: &str) -> bool {
+    let normalize = |url: &str| {
+        let trimmed = url.trim();
+        let base = trimmed.split('#').next().unwrap_or(trimmed);
+        base.to_ascii_lowercase().trim_end_matches('/').to_string()
+    };
+    normalize(a) == normalize(b)
+}
+
+fn extract_link_urls_from_fragments(fragments: &[MessageFragment]) -> Vec<String> {
+    let mut urls = Vec::new();
+    for fragment in fragments {
+        match fragment {
+            MessageFragment::Link { url, .. } => {
+                let lower = url.to_ascii_lowercase();
+                if lower.starts_with("http://")
+                    || lower.starts_with("https://")
+                    || (!lower.starts_with("zbase-") && lower.contains('.'))
+                {
+                    urls.push(url.clone());
+                }
+            }
+            MessageFragment::Text(text) => {
+                extract_urls_from_text(text, &mut urls);
+            }
+            _ => {}
+        }
+    }
+    urls
+}
+
+fn extract_urls_from_text(text: &str, out: &mut Vec<String>) {
+    let mut search_from = 0;
+    while search_from < text.len() {
+        let remaining = &text[search_from..];
+        let prefix_pos = remaining
+            .find("https://")
+            .or_else(|| remaining.find("http://"));
+        let Some(pos) = prefix_pos else {
+            break;
+        };
+        let url_start = search_from + pos;
+        let mut url_end = url_start;
+        for ch in text[url_start..].chars() {
+            if ch.is_whitespace() {
+                break;
+            }
+            url_end += ch.len_utf8();
+        }
+        while url_end > url_start && matches!(text.as_bytes()[url_end - 1], b'.' | b',' | b')' | b']' | b';') {
+            url_end -= 1;
+        }
+        if url_end > url_start + 8 {
+            out.push(text[url_start..url_end].to_string());
+        }
+        search_from = url_end;
+    }
 }
 
 pub(crate) fn video_preview_cache_key(url: &str) -> String {

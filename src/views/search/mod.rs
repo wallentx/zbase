@@ -267,6 +267,7 @@ fn render_link_previews(
     div()
         .flex()
         .flex_col()
+        .items_start()
         .gap_1()
         .children(visible.into_iter().enumerate().map(|(index, preview)| {
             let url = preview.url.clone();
@@ -274,6 +275,10 @@ fn render_link_previews(
                 SharedString::from(format!("search-link-preview-{result_index}-{index}"));
             let image_element_id =
                 SharedString::from(format!("search-link-preview-image-{result_index}-{index}"));
+            let is_giphy = {
+                let lower = preview.url.to_ascii_lowercase();
+                lower.contains("giphy.com") || lower.contains("gph.is")
+            };
             if preview.is_media {
                 let media_source = preview
                     .thumbnail_asset
@@ -346,7 +351,7 @@ fn render_link_previews(
                                     .border_color(rgb(border()))
                                     .text_xs()
                                     .text_color(rgb(text_primary()))
-                                    .child("video"),
+                                .child("video"),
                             )
                         }
                     })
@@ -354,7 +359,16 @@ fn render_link_previews(
             }
             let site = preview.site.clone().unwrap_or_else(|| "link".to_string());
             let has_title = preview.title.is_some();
-            let title = preview.title.unwrap_or_else(|| preview.url.clone());
+            let title = if is_giphy {
+                preview
+                    .title
+                    .clone()
+                    .filter(|value| !value.trim().is_empty())
+                    .unwrap_or_else(|| "GIPHY".to_string())
+            } else {
+                preview.title.unwrap_or_else(|| preview.url.clone())
+            };
+            let thumbnail = preview.thumbnail_asset.clone();
             div()
                 .id(element_id)
                 .on_click(cx.listener(move |this, _, window, cx| {
@@ -377,8 +391,30 @@ fn render_link_previews(
                         .child(site),
                 )
                 .child(div().text_sm().child(title))
-                .when(has_title, |container| {
-                    container.child(div().text_xs().text_color(rgb(accent())).child(preview.url))
+                .when(has_title && !is_giphy, |container| {
+                    container.child(div().text_xs().text_color(rgb(accent())).child(preview.url.clone()))
+                })
+                .when_some(thumbnail, |container, thumb_path| {
+                    let (tw, th) = if let (Some(w), Some(h)) = (preview.media_width, preview.media_height)
+                        && w > 0
+                        && h > 0
+                    {
+                        let w = w as f32;
+                        let h = h as f32;
+                        let scale = (260.0 / w).min(150.0 / h).min(1.0);
+                        (w * scale, h * scale)
+                    } else {
+                        (260.0, 150.0)
+                    };
+                    container.child(
+                        img(ImageSource::from(std::path::PathBuf::from(thumb_path)))
+                            .id(image_element_id)
+                            .mt_0p5()
+                            .w(px(tw))
+                            .h(px(th))
+                            .rounded_md()
+                            .object_fit(ObjectFit::Contain),
+                    )
                 })
                 .into_any_element()
         }))

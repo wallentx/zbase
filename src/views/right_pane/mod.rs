@@ -21,14 +21,15 @@ use crate::{
         CUSTOM_EMOJI_EMOJI_ONLY_SIZE_PX, CUSTOM_EMOJI_INLINE_SIZE_PX,
         RIGHT_PANE_RESIZE_HANDLE_WIDTH_PX, accent, accent_soft,
         app_window::{AppWindow, video_preview_cache_key},
-        attachment_display_label, attachment_image_source, attachment_lightbox_source,
+        attachment_display_label, attachment_header_row, attachment_image_source,
+        attachment_lightbox_source,
         avatar::{Avatar, default_avatar_background},
         badge, border, chevron_down_icon, close_icon, danger, danger_soft, emoji_icon,
         format_duration_ms, glass_surface_strong,
         inline_markdown::{InlineMarkdownConfig, apply_inline_markdown, remap_source_byte_range},
         input::TextField,
         is_dark_theme, mention_colors_for_user, mention_soft, panel_alt_bg, panel_alt_surface,
-        panel_bg, play_icon,
+        play_icon,
         selectable_text::{
             InlineAttachment, LinkRange, SelectableText, StyledRange, resolve_selectable_text,
             resolve_selectable_text_inline, resolve_selectable_text_with_attachments,
@@ -170,6 +171,11 @@ impl ThreadPane {
         cx: &mut Context<AppWindow>,
     ) -> AnyElement {
         let thread_rows = build_thread_message_rows(thread, timeline);
+        let thread_content_width =
+            (thread.width_px - RIGHT_PANE_RESIZE_HANDLE_WIDTH_PX).max(0.0);
+        // Keep media within the usable message-content column in the thread pane:
+        // row padding (32) + avatar/gap (44) + scrollbar gutter/right padding (32) + guard (8).
+        let thread_media_max_width = (thread_content_width - 116.0).clamp(72.0, 280.0);
 
         div()
             .size_full()
@@ -238,6 +244,7 @@ impl ThreadPane {
                             TimelineList::render_thread_row(
                                 timeline,
                                 &timeline_row,
+                                thread_media_max_width,
                                 video_render_cache,
                                 selectable_texts,
                                 cx,
@@ -400,7 +407,12 @@ fn render_parent_message(
                             .attachments
                             .iter()
                             .all(|attachment| attachment.kind == AttachmentKind::Image);
-                    if image_attachment_message {
+                    let media_link_only_message = !image_attachment_message
+                        && crate::views::is_media_link_only_message(
+                            &message.fragments,
+                            &message.link_previews,
+                        );
+                    if image_attachment_message || media_link_only_message {
                         div().into_any_element()
                     } else {
                         render_message_fragments(
@@ -423,6 +435,16 @@ fn render_parent_message(
                     ))
                 })
                 .when(!message.attachments.is_empty(), |container| {
+                    let image_attachment_message = !message.attachments.is_empty()
+                        && message
+                            .attachments
+                            .iter()
+                            .all(|attachment| attachment.kind == AttachmentKind::Image);
+                    let caption_text = if image_attachment_message && !message.fragments.is_empty() {
+                        message_caption_text(&message)
+                    } else {
+                        None
+                    };
                     container.child(
                         div().flex().flex_col().gap_1().children(
                             message
@@ -431,6 +453,9 @@ fn render_parent_message(
                                 .enumerate()
                                 .map(|(index, attachment)| {
                                     let attachment_label = attachment_display_label(attachment);
+                                    let header = attachment_header_row(attachment);
+                                    let mut card = div().flex().flex_col().gap_0p5().child(header);
+
                                     if attachment.kind == AttachmentKind::Image
                                         && let Some(media_source) =
                                             attachment_image_source(attachment)
@@ -453,85 +478,93 @@ fn render_parent_message(
                                         );
                                         let lightbox_source =
                                             attachment_lightbox_source(attachment);
-                                        let caption_text = message_caption_text(&message);
+                                        let lightbox_caption = caption_text.clone();
                                         let lightbox_width = preview_width;
                                         let lightbox_height = preview_height;
-                                        return div()
-                                            .id(SharedString::from(format!(
-                                                "right-pane-attachment-image-{}-{index}",
-                                                message.id.0
-                                            )))
-                                            .flex()
-                                            .flex_col()
-                                            .gap_1()
-                                            .when_some(lightbox_source, |image, lightbox_source| {
-                                                let caption_text = caption_text.clone();
-                                                image
-                                                    .cursor(gpui::CursorStyle::PointingHand)
-                                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                                        this.open_image_lightbox(
-                                                            lightbox_source.clone(),
-                                                            caption_text.clone(),
-                                                            lightbox_width,
-                                                            lightbox_height,
-                                                            cx,
-                                                        );
-                                                    }))
-                                            })
-                                            .child(
-                                                img(media_source)
-                                                    .w(px(media_width))
-                                                    .h(px(media_height))
-                                                    .rounded_md()
-                                                    .object_fit(ObjectFit::Contain)
-                                                    .flex_shrink_0()
-                                                    .min_w(px(16.))
-                                                    .min_h(px(16.))
-                                                    .with_fallback({
-                                                        let label = attachment_label.clone();
-                                                        move || {
-                                                            div()
-                                                                .text_xs()
-                                                                .text_color(rgb(text_secondary()))
-                                                                .child(label.clone())
-                                                                .into_any_element()
-                                                        }
-                                                    }),
-                                            )
-                                            .into_any_element();
-                                    }
-                                    if attachment.kind == AttachmentKind::Video {
-                                        if let Some(thumb_source) =
-                                            attachment_image_source(attachment)
-                                        {
-                                            let preview_width = attachment
-                                                .preview
-                                                .as_ref()
-                                                .and_then(|p| p.width)
-                                                .or(attachment.width);
-                                            let preview_height = attachment
-                                                .preview
-                                                .as_ref()
-                                                .and_then(|p| p.height)
-                                                .or(attachment.height);
-                                            let (media_width, media_height) = media_frame_size(
-                                                preview_width,
-                                                preview_height,
-                                                260.0,
-                                                220.0,
+                                        card = card.child(
+                                            div()
+                                                .id(SharedString::from(format!(
+                                                    "right-pane-attachment-image-{}-{index}",
+                                                    message.id.0
+                                                )))
+                                                .w(px(media_width))
+                                                .h(px(media_height))
+                                                .when_some(lightbox_source, |thumb, lightbox_source| {
+                                                    let caption_text = lightbox_caption.clone();
+                                                    thumb
+                                                        .cursor(CursorStyle::PointingHand)
+                                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                                            this.open_image_lightbox(
+                                                                lightbox_source.clone(),
+                                                                caption_text.clone(),
+                                                                lightbox_width,
+                                                                lightbox_height,
+                                                                cx,
+                                                            );
+                                                        }))
+                                                })
+                                                .child(
+                                                    img(media_source)
+                                                        .w(px(media_width))
+                                                        .h(px(media_height))
+                                                        .rounded_md()
+                                                        .object_fit(ObjectFit::Contain)
+                                                        .flex_shrink_0()
+                                                        .min_w(px(16.))
+                                                        .min_h(px(16.))
+                                                        .with_fallback({
+                                                            let label = attachment_label.clone();
+                                                            move || {
+                                                                div()
+                                                                    .text_xs()
+                                                                    .text_color(rgb(text_secondary()))
+                                                                    .child(label.clone())
+                                                                    .into_any_element()
+                                                            }
+                                                        }),
+                                                ),
+                                        );
+                                        if let Some(ref caption) = caption_text {
+                                            card = card.child(
+                                                div()
+                                                    .text_xs()
+                                                    .text_color(rgb(text_secondary()))
+                                                    .child(caption.clone()),
                                             );
-                                            let video_path = attachment
-                                                .source
-                                                .as_ref()
-                                                .and_then(|s| match s {
-                                                    AttachmentSource::LocalPath(p) => {
-                                                        Some(p.clone())
-                                                    }
-                                                    _ => None,
-                                                });
-                                            let duration_label =
-                                                attachment.duration_ms.map(format_duration_ms);
-                                            return div()
+                                        }
+                                    } else if attachment.kind == AttachmentKind::Video
+                                        && let Some(thumb_source) =
+                                            attachment_image_source(attachment)
+                                    {
+                                        let preview_width = attachment
+                                            .preview
+                                            .as_ref()
+                                            .and_then(|p| p.width)
+                                            .or(attachment.width);
+                                        let preview_height = attachment
+                                            .preview
+                                            .as_ref()
+                                            .and_then(|p| p.height)
+                                            .or(attachment.height);
+                                        let (media_width, media_height) = media_frame_size(
+                                            preview_width,
+                                            preview_height,
+                                            260.0,
+                                            220.0,
+                                        );
+                                        let video_path = attachment
+                                            .source
+                                            .as_ref()
+                                            .and_then(|s| match s {
+                                                AttachmentSource::LocalPath(p) => {
+                                                    Some(p.clone())
+                                                }
+                                                _ => None,
+                                            });
+                                        let duration_label =
+                                            attachment.duration_ms.map(format_duration_ms);
+                                        card = card.child(
+                                            div()
                                                 .id(SharedString::from(format!(
                                                     "right-pane-attachment-video-{}-{index}",
                                                     message.id.0
@@ -591,56 +624,15 @@ fn render_parent_message(
                                                             .text_color(rgb(0xFFFFFF))
                                                             .child(label),
                                                     )
-                                                })
-                                                .into_any_element();
-                                        }
-                                        let video_path = attachment
-                                            .source
-                                            .as_ref()
-                                            .and_then(|s| match s {
-                                                AttachmentSource::LocalPath(p) => Some(p.clone()),
-                                                _ => None,
-                                            });
-                                        return div()
-                                            .id(SharedString::from(format!(
-                                                "right-pane-attachment-video-label-{}-{index}",
-                                                message.id.0
-                                            )))
-                                            .cursor(CursorStyle::PointingHand)
-                                            .when_some(video_path, |el, path| {
-                                                el.on_click(cx.listener(move |_, _, _, _| {
-                                                    AppWindow::open_video_in_native_player(&path);
-                                                }))
-                                            })
-                                            .text_xs()
-                                            .text_color(rgb(accent()))
-                                            .child(attachment_label)
-                                            .into_any_element();
+                                                }),
+                                        );
                                     }
-                                    badge(attachment_label, panel_bg(), text_primary())
+
+                                    card.into_any_element()
                                 }),
                         ),
                     )
-                })
-                .when(
-                    !message.attachments.is_empty()
-                        && message
-                            .attachments
-                            .iter()
-                            .all(|attachment| attachment.kind == AttachmentKind::Image)
-                        && !message.fragments.is_empty(),
-                    |container| {
-                        container.child(render_message_fragments(
-                            &message,
-                            affinity_index,
-                            current_user_id,
-                            emoji_index,
-                            emoji_source_index,
-                            selectable_texts,
-                            cx,
-                        ))
-                    },
-                ),
+                }),
         )
         .into_any_element()
 }
@@ -801,6 +793,9 @@ fn render_link_previews(
     div()
         .flex()
         .flex_col()
+        .w_full()
+        .min_w(px(0.))
+        .items_start()
         .gap_1()
         .children(visible.into_iter().enumerate().map(|(index, preview)| {
             let url = preview.url.clone();
@@ -808,6 +803,10 @@ fn render_link_previews(
                 SharedString::from(format!("thread-link-preview-{message_key}-{index}"));
             let image_element_id =
                 SharedString::from(format!("thread-link-preview-image-{message_key}-{index}"));
+            let is_giphy = {
+                let lower = preview.url.to_ascii_lowercase();
+                lower.contains("giphy.com") || lower.contains("gph.is")
+            };
 
             if preview.is_media {
                 let media_source = preview
@@ -824,7 +823,9 @@ fn render_link_previews(
                     .cursor(CursorStyle::PointingHand)
                     .rounded_md()
                     .overflow_hidden()
-                    .w(px(media_width))
+                    .w_full()
+                    .min_w(px(0.))
+                    .max_w(px(media_width))
                     .h(px(media_height))
                     .relative()
                     .child({
@@ -839,8 +840,7 @@ fn render_link_previews(
                         if let Some(render_image) = decoded_video {
                             img(ImageSource::Render(render_image))
                                 .id(image_element_id.clone())
-                                .w(px(media_width))
-                                .h(px(media_height))
+                                .size_full()
                                 .rounded_md()
                                 .object_fit(ObjectFit::Contain)
                                 .flex_shrink_0()
@@ -849,8 +849,7 @@ fn render_link_previews(
                         } else {
                             img(SharedString::from(media_source))
                                 .id(image_element_id.clone())
-                                .w(px(media_width))
-                                .h(px(media_height))
+                                .size_full()
                                 .rounded_md()
                                 .object_fit(ObjectFit::Contain)
                                 .flex_shrink_0()
@@ -889,7 +888,7 @@ fn render_link_previews(
                                     .border_color(rgb(border()))
                                     .text_xs()
                                     .text_color(rgb(text_primary()))
-                                    .child("video"),
+                                .child("video"),
                             )
                         }
                     })
@@ -898,7 +897,16 @@ fn render_link_previews(
 
             let site = preview.site.clone().unwrap_or_else(|| "link".to_string());
             let has_title = preview.title.is_some();
-            let title = preview.title.unwrap_or_else(|| preview.url.clone());
+            let title = if is_giphy {
+                preview
+                    .title
+                    .clone()
+                    .filter(|value| !value.trim().is_empty())
+                    .unwrap_or_else(|| "GIPHY".to_string())
+            } else {
+                preview.title.unwrap_or_else(|| preview.url.clone())
+            };
+            let thumbnail = preview.thumbnail_asset.clone();
             div()
                 .id(element_id)
                 .on_click(cx.listener(move |this, _, window, cx| {
@@ -909,6 +917,8 @@ fn render_link_previews(
                 .border_1()
                 .border_color(rgb(border()))
                 .bg(panel_alt_surface())
+                .w_full()
+                .min_w(px(0.))
                 .px_2()
                 .py_1()
                 .flex()
@@ -921,8 +931,31 @@ fn render_link_previews(
                         .child(site),
                 )
                 .child(div().text_sm().text_color(rgb(text_primary())).child(title))
-                .when(has_title, |container| {
-                    container.child(div().text_xs().text_color(rgb(accent())).child(preview.url))
+                .when(has_title && !is_giphy, |container| {
+                    container.child(div().text_xs().text_color(rgb(accent())).child(preview.url.clone()))
+                })
+                .when_some(thumbnail, |container, thumb_path| {
+                    let (tw, th) = if let (Some(w), Some(h)) = (preview.media_width, preview.media_height)
+                        && w > 0
+                        && h > 0
+                    {
+                        let w = w as f32;
+                        let h = h as f32;
+                        let scale = (280.0 / w).min(160.0 / h).min(1.0);
+                        (w * scale, h * scale)
+                    } else {
+                        (280.0, 160.0)
+                    };
+                    container.child(
+                        img(ImageSource::from(std::path::PathBuf::from(thumb_path)))
+                            .id(image_element_id)
+                            .mt_0p5()
+                            .w_full()
+                            .max_w(px(tw))
+                            .h(px(th))
+                            .rounded_md()
+                            .object_fit(ObjectFit::Contain),
+                    )
                 })
                 .into_any_element()
         }))

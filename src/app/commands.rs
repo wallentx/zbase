@@ -38,6 +38,8 @@ actions!(
         EditLastMessage,
         CancelEdit,
         ToggleSplashScreen,
+        CloseWindow,
+        QuitApp,
     ]
 );
 

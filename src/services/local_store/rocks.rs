@@ -17,7 +17,7 @@ use crate::{
         backend::{ProviderConversationRef, ProviderMessageRef},
         conversation::{ConversationKind, ConversationSummary},
         ids::{ConversationId, MessageId, UserId, WorkspaceId},
-        message::{EmojiSourceRef, MessageReaction, MessageRecord},
+        message::{EmojiSourceRef, LinkPreview, MessageReaction, MessageRecord},
     },
     state::event::BootstrapPayload,
 };
@@ -27,7 +27,7 @@ use super::{
     schema::{
         CachedConversationBinding, CachedConversationEmoji, CachedConversationSummary,
         CachedConversationTeamBinding, CachedEmojiSourceRef, CachedMessageBinding,
-        CachedMessageReaction, CachedMessageRecord, CachedMeta, CachedReactionOp,
+        CachedLinkPreview, CachedMessageReaction, CachedMessageRecord, CachedMeta, CachedReactionOp,
         CachedTeamRoleEntry, CachedTeamRoleMap, CachedUserProfile, SCHEMA_VERSION,
     },
 };
@@ -42,6 +42,7 @@ const CF_EMOJIS: &str = "emojis";
 const CF_REACTIONS: &str = "reactions";
 const CF_REACTION_OPS: &str = "reaction_ops";
 const CF_TEAMS: &str = "teams";
+const CF_OG: &str = "og";
 
 const META_KEY: &[u8] = b"bootstrap_meta";
 const USER_PROFILE_PREFIX: &str = "user:";
@@ -159,6 +160,7 @@ impl LocalStore {
             CF_REACTIONS,
             CF_REACTION_OPS,
             CF_TEAMS,
+            CF_OG,
         ]
         .iter()
         .map(|name| (*name).to_string())
@@ -954,6 +956,27 @@ impl LocalStore {
             .map_err(io::Error::other)
     }
 
+    pub fn get_og_preview(&self, url: &str) -> io::Result<Option<LinkPreview>> {
+        let og_cf = self.cf(CF_OG)?;
+        let Some(bytes) = self
+            .db
+            .get_cf(&og_cf, url.as_bytes())
+            .map_err(io::Error::other)?
+        else {
+            return Ok(None);
+        };
+        let cached: CachedLinkPreview = decode(&bytes)?;
+        Ok(Some(cached.to_domain()))
+    }
+
+    pub fn upsert_og_preview(&self, url: &str, preview: &LinkPreview) -> io::Result<()> {
+        let og_cf = self.cf(CF_OG)?;
+        let cached = CachedLinkPreview::from_domain(preview);
+        self.db
+            .put_cf(&og_cf, url.as_bytes(), encode(&cached)?)
+            .map_err(io::Error::other)
+    }
+
     pub fn load_conversation_emojis(
         &self,
         conversation_id: &ConversationId,
@@ -1445,6 +1468,7 @@ impl LocalStore {
             CF_REACTIONS,
             CF_REACTION_OPS,
             CF_TEAMS,
+            CF_OG,
         ] {
             let cf = self.cf(cf_name)?;
             let iter = self.db.iterator_cf(&cf, IteratorMode::Start);
