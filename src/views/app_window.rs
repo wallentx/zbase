@@ -6564,7 +6564,20 @@ impl Render for AppWindow {
                     div.child(self.render_keybase_inspector_modal(cx))
                 })
                 .when(self.splash_open, |div| {
-                    div.child(crate::views::splash::SplashView.render(cx))
+                    let snapshot = self.app_store.snapshot();
+                    let status = if !snapshot.app.boot_status.is_empty() {
+                        snapshot.app.boot_status.clone()
+                    } else {
+                        match snapshot.app.boot_phase {
+                            BootPhase::Launching => "Starting up…".to_string(),
+                            BootPhase::HydratingLocalState => "Loading local data…".to_string(),
+                            BootPhase::ConnectingBackend => "Connecting to Keybase…".to_string(),
+                            BootPhase::Ready => String::new(),
+                            BootPhase::Degraded => "Connection degraded".to_string(),
+                            BootPhase::FatalError => "Failed to connect".to_string(),
+                        }
+                    };
+                    div.child(crate::views::splash::SplashView.render(&status, cx))
                 })
         });
 

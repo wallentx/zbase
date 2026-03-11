@@ -10,7 +10,7 @@ const APP_ICON_ASSET: &str = "assets/icons/app-icon.png";
 pub struct SplashView;
 
 impl SplashView {
-    pub fn render(&self, _cx: &mut Context<AppWindow>) -> AnyElement {
+    pub fn render(&self, status: &str, _cx: &mut Context<AppWindow>) -> AnyElement {
         let kbd_bg = if is_dark_theme() {
             tint(0x283543, 0.85)
         } else {
@@ -27,6 +27,7 @@ impl SplashView {
             tint(0x7a8a9a, 0.18)
         };
         let subtitle_color = if is_dark_theme() { 0x7a8fa3 } else { 0x8a97a5 };
+        let status_color = if is_dark_theme() { 0x5a6f83 } else { 0x9aa5b0 };
 
         div()
             .id("splash-screen")
@@ -71,6 +72,14 @@ impl SplashView {
                                     .font_weight(FontWeight::NORMAL)
                                     .text_color(rgb(subtitle_color))
                                     .child("conversations · people · messages"),
+                            )
+                            .child(
+                                div()
+                                    .h(px(18.))
+                                    .text_xs()
+                                    .font_weight(FontWeight::NORMAL)
+                                    .text_color(rgb(status_color))
+                                    .child(status.to_string()),
                             ),
                     ),
             )

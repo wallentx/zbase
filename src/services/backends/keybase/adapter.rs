@@ -2103,6 +2103,7 @@ fn run_bootstrap(
     search_index: Arc<SearchIndex>,
 ) {
     send_internal(&sender, "zbase.internal.bootstrap_starting", Value::Nil);
+    let _ = sender.send(BackendEvent::BootStatus("Loading local data…".to_string()));
 
     let mut sent_cached_payload = false;
     match local_store.load_bootstrap_seed(
@@ -2163,6 +2164,10 @@ fn run_bootstrap(
         return;
     };
 
+    let _ = sender.send(BackendEvent::BootStatus(
+        "Connecting to Keybase…".to_string(),
+    ));
+
     let runtime = match Builder::new_current_thread().enable_all().build() {
         Ok(runtime) => runtime,
         Err(error) => {
@@ -2178,6 +2183,10 @@ fn run_bootstrap(
     if let Ok(affinities) = runtime.block_on(fetch_tracking_affinities_from_service(&path)) {
         let _ = sender.send(BackendEvent::AffinitySynced { affinities });
     }
+
+    let _ = sender.send(BackendEvent::BootStatus(
+        "Loading conversations…".to_string(),
+    ));
 
     let account_for_bootstrap = account_id.clone();
     let backend_for_bootstrap = backend_id.clone();
