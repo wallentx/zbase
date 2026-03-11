@@ -191,7 +191,12 @@ impl BackendRouter {
                 let reply_ref = reply_to
                     .as_ref()
                     .and_then(|message_id| self.message_bindings.get(message_id))
-                    .map(|binding| binding.provider_message_ref.clone());
+                    .map(|binding| binding.provider_message_ref.clone())
+                    .or_else(|| {
+                        reply_to
+                            .as_ref()
+                            .map(|message_id| ProviderMessageRef::new(message_id.0.clone()))
+                    });
                 let backend = self.backend_for_binding(&binding.backend_id)?;
                 backend.execute(RoutedBackendCommand::SendMessage {
                     op_id,

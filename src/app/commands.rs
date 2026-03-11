@@ -34,6 +34,7 @@ actions!(
         ToggleKeybaseInspector,
         ToggleBenchmarkCapture,
         DismissOverlays,
+        DismissHoverToolbar,
         EditLastMessage,
         CancelEdit,
         ToggleSplashScreen,

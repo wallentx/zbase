@@ -1,7 +1,7 @@
 use crate::{
     domain::{
         affinity::Affinity,
-        attachment::AttachmentKind,
+        attachment::{AttachmentKind, AttachmentSource},
         ids::{MessageId, UserId},
         message::{BroadcastKind, LinkPreview, MessageFragment, MessageRecord, MessageSendState},
         presence::{Availability, Presence},
@@ -24,11 +24,11 @@ use crate::{
         attachment_display_label, attachment_image_source, attachment_lightbox_source,
         avatar::{Avatar, default_avatar_background},
         badge, border, chevron_down_icon, close_icon, danger, danger_soft, emoji_icon,
-        glass_surface_strong,
+        format_duration_ms, glass_surface_strong,
         inline_markdown::{InlineMarkdownConfig, apply_inline_markdown, remap_source_byte_range},
         input::TextField,
         is_dark_theme, mention_colors_for_user, mention_soft, panel_alt_bg, panel_alt_surface,
-        panel_bg,
+        panel_bg, play_icon,
         selectable_text::{
             InlineAttachment, LinkRange, SelectableText, StyledRange, resolve_selectable_text,
             resolve_selectable_text_inline, resolve_selectable_text_with_attachments,
@@ -81,6 +81,7 @@ impl RightPaneHost {
         selectable_texts: &mut HashMap<String, Entity<SelectableText>>,
         reply_input: &Entity<TextField>,
         thread_scroll: &ScrollHandle,
+        profile_scroll: &ScrollHandle,
         unseen_reply_count: usize,
         cx: &mut Context<AppWindow>,
     ) -> AnyElement {
@@ -103,7 +104,7 @@ impl RightPaneHost {
                 render_search_panel(conversation, search, video_render_cache, cx)
             }
             RightPaneMode::Profile(_) => {
-                crate::views::profile::render_profile_panel(profile_panel, cx)
+                crate::views::profile::render_profile_panel(profile_panel, profile_scroll, cx)
             }
         };
 
@@ -497,6 +498,123 @@ fn render_parent_message(
                                                         }
                                                     }),
                                             )
+                                            .into_any_element();
+                                    }
+                                    if attachment.kind == AttachmentKind::Video {
+                                        if let Some(thumb_source) =
+                                            attachment_image_source(attachment)
+                                        {
+                                            let preview_width = attachment
+                                                .preview
+                                                .as_ref()
+                                                .and_then(|p| p.width)
+                                                .or(attachment.width);
+                                            let preview_height = attachment
+                                                .preview
+                                                .as_ref()
+                                                .and_then(|p| p.height)
+                                                .or(attachment.height);
+                                            let (media_width, media_height) = media_frame_size(
+                                                preview_width,
+                                                preview_height,
+                                                260.0,
+                                                220.0,
+                                            );
+                                            let video_path = attachment
+                                                .source
+                                                .as_ref()
+                                                .and_then(|s| match s {
+                                                    AttachmentSource::LocalPath(p) => {
+                                                        Some(p.clone())
+                                                    }
+                                                    _ => None,
+                                                });
+                                            let duration_label =
+                                                attachment.duration_ms.map(format_duration_ms);
+                                            return div()
+                                                .id(SharedString::from(format!(
+                                                    "right-pane-attachment-video-{}-{index}",
+                                                    message.id.0
+                                                )))
+                                                .relative()
+                                                .w(px(media_width))
+                                                .h(px(media_height))
+                                                .rounded_md()
+                                                .overflow_hidden()
+                                                .flex_shrink_0()
+                                                .cursor(CursorStyle::PointingHand)
+                                                .when_some(video_path, |el, path| {
+                                                    el.on_click(
+                                                        cx.listener(move |_, _, _, _| {
+                                                            AppWindow::open_video_in_native_player(
+                                                                &path,
+                                                            );
+                                                        }),
+                                                    )
+                                                })
+                                                .child(
+                                                    img(thumb_source)
+                                                        .size_full()
+                                                        .object_fit(ObjectFit::Cover),
+                                                )
+                                                .child(
+                                                    div()
+                                                        .absolute()
+                                                        .inset_0()
+                                                        .flex()
+                                                        .items_center()
+                                                        .justify_center()
+                                                        .bg(tint(0x000000, 0.3))
+                                                        .child(
+                                                            div()
+                                                                .w(px(40.))
+                                                                .h(px(40.))
+                                                                .rounded_full()
+                                                                .bg(tint(0x000000, 0.5))
+                                                                .flex()
+                                                                .items_center()
+                                                                .justify_center()
+                                                                .child(play_icon(0xFFFFFF)),
+                                                        ),
+                                                )
+                                                .when_some(duration_label, |el, label| {
+                                                    el.child(
+                                                        div()
+                                                            .absolute()
+                                                            .bottom_1()
+                                                            .right_1()
+                                                            .px_1p5()
+                                                            .py_0p5()
+                                                            .rounded_sm()
+                                                            .bg(tint(0x000000, 0.6))
+                                                            .text_xs()
+                                                            .text_color(rgb(0xFFFFFF))
+                                                            .child(label),
+                                                    )
+                                                })
+                                                .into_any_element();
+                                        }
+                                        let video_path = attachment
+                                            .source
+                                            .as_ref()
+                                            .and_then(|s| match s {
+                                                AttachmentSource::LocalPath(p) => Some(p.clone()),
+                                                _ => None,
+                                            });
+                                        return div()
+                                            .id(SharedString::from(format!(
+                                                "right-pane-attachment-video-label-{}-{index}",
+                                                message.id.0
+                                            )))
+                                            .cursor(CursorStyle::PointingHand)
+                                            .when_some(video_path, |el, path| {
+                                                el.on_click(cx.listener(move |_, _, _, _| {
+                                                    AppWindow::open_video_in_native_player(&path);
+                                                }))
+                                            })
+                                            .text_xs()
+                                            .text_color(rgb(accent()))
+                                            .child(attachment_label)
                                             .into_any_element();
                                     }
                                     badge(attachment_label, panel_bg(), text_primary())
@@ -1289,35 +1407,36 @@ fn render_inline_fragments_with_asset_emojis(
             };
             if let Some(render) =
                 resolved_emoji_render(alias, source_ref.as_ref(), emoji_index, emoji_source_index)
-                && let Some(asset_path) = render.asset_path.as_ref() {
-                    let size = custom_emoji_size_px(emoji_only);
-                    asset_emojis.push(
-                        div()
+                && let Some(asset_path) = render.asset_path.as_ref()
+            {
+                let size = custom_emoji_size_px(emoji_only);
+                asset_emojis.push(
+                    div()
+                        .w(px(size))
+                        .h(px(size))
+                        .flex_shrink_0()
+                        .overflow_hidden()
+                        .child(
+                            img(ImageSource::from(std::path::PathBuf::from(
+                                crate::views::normalize_local_source_path(asset_path),
+                            )))
                             .w(px(size))
                             .h(px(size))
-                            .flex_shrink_0()
-                            .overflow_hidden()
-                            .child(
-                                img(ImageSource::from(std::path::PathBuf::from(
-                                    crate::views::normalize_local_source_path(asset_path),
-                                )))
-                                .w(px(size))
-                                .h(px(size))
-                                .object_fit(ObjectFit::Contain)
-                                .with_fallback({
-                                    let alias = alias.clone();
-                                    move || {
-                                        div()
-                                            .text_sm()
-                                            .line_height(px(22.))
-                                            .child(format!(":{alias}:"))
-                                            .into_any_element()
-                                    }
-                                }),
-                            )
-                            .into_any_element(),
-                    );
-                }
+                            .object_fit(ObjectFit::Contain)
+                            .with_fallback({
+                                let alias = alias.clone();
+                                move || {
+                                    div()
+                                        .text_sm()
+                                        .line_height(px(22.))
+                                        .child(format!(":{alias}:"))
+                                        .into_any_element()
+                                }
+                            }),
+                        )
+                        .into_any_element(),
+                );
+            }
             continue;
         }
 
@@ -2211,23 +2330,24 @@ fn build_thread_message_rows(
     let mut rows = Vec::with_capacity(messages.len());
     let mut previous_message: Option<(UserId, Option<i64>)> = None;
     for message in messages {
-        let show_header = previous_message.as_ref().is_none_or(
-            |(previous_author_id, previous_timestamp_ms)| {
-                if previous_author_id != &message.author_id {
-                    return true;
-                }
-                let (Some(previous_timestamp_ms), Some(current_timestamp_ms)) =
-                    (*previous_timestamp_ms, message.timestamp_ms)
-                else {
-                    return true;
-                };
-                if current_timestamp_ms <= previous_timestamp_ms {
-                    return true;
-                }
-                const GROUP_WINDOW_MS: i64 = 15 * 60 * 1000;
-                current_timestamp_ms.saturating_sub(previous_timestamp_ms) > GROUP_WINDOW_MS
-            },
-        );
+        let show_header =
+            previous_message
+                .as_ref()
+                .is_none_or(|(previous_author_id, previous_timestamp_ms)| {
+                    if previous_author_id != &message.author_id {
+                        return true;
+                    }
+                    let (Some(previous_timestamp_ms), Some(current_timestamp_ms)) =
+                        (*previous_timestamp_ms, message.timestamp_ms)
+                    else {
+                        return true;
+                    };
+                    if current_timestamp_ms <= previous_timestamp_ms {
+                        return true;
+                    }
+                    const GROUP_WINDOW_MS: i64 = 15 * 60 * 1000;
+                    current_timestamp_ms.saturating_sub(previous_timestamp_ms) > GROUP_WINDOW_MS
+                });
 
         rows.push(MessageRow {
             author: resolve_thread_author_summary(timeline, &message.author_id),

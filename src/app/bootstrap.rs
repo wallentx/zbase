@@ -2,8 +2,9 @@ use crate::app::assets::KbuiAssets;
 use crate::app::commands;
 use crate::app::window::open_main_window;
 use crate::views::input::{
-    Backspace, Copy, Cut, Delete, Down, End, Home, InsertNewline, Left, Paste, Right, SelectAll,
-    SelectDown, SelectLeft, SelectRight, SelectUp, ShowCharacterPalette, Up,
+    Backspace, Copy, Cut, Delete, Down, End, Home, InsertNewline, Left, Paste, Redo, Right,
+    SelectAll, SelectDown, SelectEnd, SelectHome, SelectLeft, SelectRight, SelectUp,
+    ShowCharacterPalette, Undo, Up,
 };
 use gpui::{Application, KeyBinding};
 
@@ -97,10 +98,15 @@ pub fn run() {
             KeyBinding::new("cmd-v", Paste, Some("QuickSwitcherTextField")),
             KeyBinding::new("cmd-c", Copy, Some("QuickSwitcherTextField")),
             KeyBinding::new("cmd-x", Cut, Some("QuickSwitcherTextField")),
+            KeyBinding::new("cmd-z", Undo, Some("QuickSwitcherTextField")),
+            KeyBinding::new("cmd-shift-z", Redo, Some("QuickSwitcherTextField")),
             KeyBinding::new("home", Home, Some("QuickSwitcherTextField")),
             KeyBinding::new("end", End, Some("QuickSwitcherTextField")),
+            KeyBinding::new("shift-home", SelectHome, Some("QuickSwitcherTextField")),
+            KeyBinding::new("shift-end", SelectEnd, Some("QuickSwitcherTextField")),
             KeyBinding::new("ctrl-a", Home, Some("QuickSwitcherTextField")),
             KeyBinding::new("ctrl-e", End, Some("QuickSwitcherTextField")),
+            KeyBinding::new("ctrl-d", Delete, Some("QuickSwitcherTextField")),
             KeyBinding::new(
                 "ctrl-cmd-space",
                 ShowCharacterPalette,
@@ -156,10 +162,15 @@ pub fn run() {
             KeyBinding::new("cmd-v", Paste, Some("TextField")),
             KeyBinding::new("cmd-c", Copy, Some("TextField")),
             KeyBinding::new("cmd-x", Cut, Some("TextField")),
+            KeyBinding::new("cmd-z", Undo, Some("TextField")),
+            KeyBinding::new("cmd-shift-z", Redo, Some("TextField")),
             KeyBinding::new("home", Home, Some("TextField")),
             KeyBinding::new("end", End, Some("TextField")),
+            KeyBinding::new("shift-home", SelectHome, Some("TextField")),
+            KeyBinding::new("shift-end", SelectEnd, Some("TextField")),
             KeyBinding::new("ctrl-a", Home, Some("TextField")),
             KeyBinding::new("ctrl-e", End, Some("TextField")),
+            KeyBinding::new("ctrl-d", Delete, Some("TextField")),
             KeyBinding::new("ctrl-cmd-space", ShowCharacterPalette, Some("TextField")),
             KeyBinding::new("backspace", Backspace, Some("MultilineTextField")),
             KeyBinding::new("delete", Delete, Some("MultilineTextField")),
@@ -175,10 +186,15 @@ pub fn run() {
             KeyBinding::new("cmd-v", Paste, Some("MultilineTextField")),
             KeyBinding::new("cmd-c", Copy, Some("MultilineTextField")),
             KeyBinding::new("cmd-x", Cut, Some("MultilineTextField")),
+            KeyBinding::new("cmd-z", Undo, Some("MultilineTextField")),
+            KeyBinding::new("cmd-shift-z", Redo, Some("MultilineTextField")),
             KeyBinding::new("home", Home, Some("MultilineTextField")),
             KeyBinding::new("end", End, Some("MultilineTextField")),
+            KeyBinding::new("shift-home", SelectHome, Some("MultilineTextField")),
+            KeyBinding::new("shift-end", SelectEnd, Some("MultilineTextField")),
             KeyBinding::new("ctrl-a", Home, Some("MultilineTextField")),
             KeyBinding::new("ctrl-e", End, Some("MultilineTextField")),
+            KeyBinding::new("ctrl-d", Delete, Some("MultilineTextField")),
             KeyBinding::new("shift-enter", InsertNewline, Some("MultilineTextField")),
             KeyBinding::new(
                 "ctrl-cmd-space",
@@ -197,6 +213,8 @@ pub fn run() {
             KeyBinding::new("cmd-c", Copy, Some("SelectableText")),
             KeyBinding::new("home", Home, Some("SelectableText")),
             KeyBinding::new("end", End, Some("SelectableText")),
+            KeyBinding::new("shift-home", SelectHome, Some("SelectableText")),
+            KeyBinding::new("shift-end", SelectEnd, Some("SelectableText")),
         ]);
         open_main_window(cx);
     });

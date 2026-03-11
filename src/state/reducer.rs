@@ -89,6 +89,33 @@ fn reduce_ui_action(state: &mut UiState, action: UiAction) -> ReducerOutput {
                 })],
             }
         }
+        UiAction::NavigateQuiet(route) => {
+            state.navigation.current_route = Some(route.clone());
+            state.sidebar.highlighted_route = Some(route.clone());
+
+            let Some(conversation_id) = conversation_id_from_route(&route) else {
+                return ReducerOutput::default();
+            };
+
+            let changed = state.timeline.conversation_id.as_ref() != Some(&conversation_id);
+            state.timeline.conversation_id = Some(conversation_id);
+            state.navigation.active_thread_root = None;
+            state.thread.open = false;
+            state.thread.root_message_id = None;
+            state.thread.replies.clear();
+            state.thread.reply_draft.clear();
+            state.thread.loading = false;
+            if changed {
+                state.timeline.messages.clear();
+                state.timeline.typing_text = None;
+                state.timeline.highlighted_message_id = None;
+                state.timeline.older_cursor = None;
+                state.timeline.newer_cursor = None;
+                state.timeline.loading_older = false;
+            }
+
+            ReducerOutput::default()
+        }
         UiAction::NavigateBack => ReducerOutput::default(),
         UiAction::OpenThread { root_id } => {
             state.navigation.active_thread_root = Some(root_id.clone());
@@ -265,11 +292,7 @@ fn reduce_ui_action(state: &mut UiState, action: UiAction) -> ReducerOutput {
             if let DraftKey::Thread(_) = &key {
                 state.thread.reply_draft = text.clone();
             }
-            state
-                .drafts
-                .entry(key.clone())
-                .or_default()
-                .text = text;
+            state.drafts.entry(key.clone()).or_default().text = text;
             ReducerOutput {
                 effects: vec![Effect::PersistDraft { key }],
             }
@@ -362,13 +385,19 @@ fn reduce_ui_action(state: &mut UiState, action: UiAction) -> ReducerOutput {
         UiAction::DeleteMessage {
             conversation_id,
             message_id,
-        } => ReducerOutput {
-            effects: vec![Effect::Backend(BackendCommand::DeleteMessage {
-                op_id: next_op_id(state, "delete"),
-                conversation_id,
-                message_id,
-            })],
-        },
+        } => {
+            state
+                .timeline
+                .messages
+                .retain(|m| m.id != message_id);
+            ReducerOutput {
+                effects: vec![Effect::Backend(BackendCommand::DeleteMessage {
+                    op_id: next_op_id(state, "delete"),
+                    conversation_id,
+                    message_id,
+                })],
+            }
+        }
         UiAction::SendAttachment {
             key,
             local_path,
@@ -637,9 +666,10 @@ fn reduce_backend_event(state: &mut UiState, event: BackendEvent) -> ReducerOutp
             state.backend.conversation_team_ids.clear();
             state.backend.team_roles.clear();
             if let Some(account) = state.backend.accounts.get_mut(&account_id)
-                && let Some(display_name) = payload.account_display_name {
-                    account.display_name = display_name;
-                }
+                && let Some(display_name) = payload.account_display_name
+            {
+                account.display_name = display_name;
+            }
 
             state.workspace.active_workspace_id = payload.active_workspace_id.clone();
             state.workspace.workspace_name = payload.workspace_name;
@@ -1671,10 +1701,18 @@ fn merge_pending_message_attachment_sources(
         let Some(pending_attachment) = pending_attachment else {
             continue;
         };
-        if server_attachment.source.is_none() {
+        let pending_has_local_source = matches!(
+            &pending_attachment.source,
+            Some(AttachmentSource::LocalPath(p)) if !p.is_empty()
+        );
+        if server_attachment.source.is_none() || pending_has_local_source {
             server_attachment.source = pending_attachment.source.clone();
         }
-        if server_attachment.preview.is_none() {
+        let pending_has_local_preview = matches!(
+            &pending_attachment.preview,
+            Some(preview) if matches!(&preview.source, AttachmentSource::LocalPath(p) if !p.is_empty())
+        );
+        if server_attachment.preview.is_none() || pending_has_local_preview {
             server_attachment.preview = pending_attachment.preview.clone();
         }
         if server_attachment.width.is_none() {
@@ -1997,7 +2035,7 @@ fn build_sidebar_sections(
             summary.kind,
             ConversationKind::DirectMessage | ConversationKind::GroupDirectMessage
         );
-        let include_in_unread = (is_dm && summary.unread_count > 0) || summary.mention_count > 0;
+        let include_in_unread = summary.unread_count > 0 || summary.mention_count > 0;
         if !include_in_unread {
             continue;
         }
@@ -2272,6 +2310,20 @@ mod tests {
         }
     }
 
+    fn channel_summary(id: &str, title: &str) -> ConversationSummary {
+        ConversationSummary {
+            id: ConversationId::new(id),
+            title: title.to_string(),
+            kind: ConversationKind::Channel,
+            topic: String::new(),
+            group: None,
+            unread_count: 0,
+            mention_count: 0,
+            muted: false,
+            last_activity_ms: 0,
+        }
+    }
+
     fn profile_with_follow_status(user_id: &str, you_are_following: bool) -> UserProfile {
         UserProfile {
             user_id: UserId::new(user_id),
@@ -2310,6 +2362,44 @@ mod tests {
                 _ => None,
             })
             .unwrap_or(false)
+    }
+
+    #[test]
+    fn unread_section_includes_channels_with_unread_messages() {
+        let workspace_id = WorkspaceId::new("ws");
+        let mut channel = channel_summary("kb_conv:general", "general");
+        channel.unread_count = 2;
+        channel.last_activity_ms = 2_000;
+
+        let mut dm = dm_summary("kb_conv:dm_alice", "alice");
+        dm.unread_count = 1;
+        dm.last_activity_ms = 1_000;
+
+        let sections =
+            build_sidebar_sections(&[channel], &[dm], &workspace_id, &HashMap::new());
+        let unread = sections
+            .iter()
+            .find(|section| section.id.as_ref().is_some_and(|id| id.0 == "unread"))
+            .expect("unread section should exist");
+
+        assert!(
+            unread.rows.iter().any(|row| {
+                matches!(
+                    row.route,
+                    Some(Route::Channel { ref channel_id, .. }) if channel_id.0 == "kb_conv:general"
+                )
+            }),
+            "unread section should include channels with unread_count > 0"
+        );
+        assert!(
+            unread.rows.iter().any(|row| {
+                matches!(
+                    row.route,
+                    Some(Route::DirectMessage { ref dm_id, .. }) if dm_id.0 == "kb_conv:dm_alice"
+                )
+            }),
+            "unread section should keep unread direct messages"
+        );
     }
 
     #[test]

@@ -20,8 +20,8 @@ fn parse_log_level(raw: &str) -> Option<tracing::Level> {
 }
 
 fn default_log_level() -> tracing::Level {
-    let bench_mode =
-        std::env::var("ZBASE_BENCH_AUTOSTART").is_ok() || std::env::var("ZBASE_BENCH_SCRIPT").is_ok();
+    let bench_mode = std::env::var("ZBASE_BENCH_AUTOSTART").is_ok()
+        || std::env::var("ZBASE_BENCH_SCRIPT").is_ok();
     if bench_mode {
         tracing::Level::WARN
     } else {

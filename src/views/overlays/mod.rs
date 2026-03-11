@@ -19,9 +19,10 @@ use crate::{
 };
 use gpui::prelude::FluentBuilder;
 use gpui::{
-    AnyElement, Context, Entity, FontWeight, InteractiveElement, IntoElement, ObjectFit,
-    ParentElement, SharedString, StatefulInteractiveElement, Styled, StyledImage, div, img, px,
-    rgb,
+    AnyElement, App, AvailableSpace, Bounds, Context, Element, ElementId, Entity, FontWeight,
+    GlobalElementId, InteractiveElement, IntoElement, LayoutId, ObjectFit, ParentElement, Pixels,
+    SharedString, StatefulInteractiveElement, Style, Styled, StyledImage, TextRun, Window, div,
+    img, px, relative, rgb, size,
 };
 use std::collections::HashMap;
 
@@ -82,6 +83,7 @@ impl OverlayHost {
             .items_center()
             .id("overlay-root")
             .on_scroll_wheel(cx.listener(AppWindow::consume_scroll_wheel))
+            .on_mouse_move(cx.listener(AppWindow::consume_mouse_move))
             .when(has_backdrop, |d| {
                 d.bg(tint(0x000000, 0.35))
                     .on_click(cx.listener(|this, _, _, cx| {
@@ -770,6 +772,8 @@ impl OverlayHost {
             .child(
                 div()
                     .flex_1()
+                    .min_w(px(0.))
+                    .overflow_hidden()
                     .flex()
                     .flex_col()
                     .gap_0p5()
@@ -785,12 +789,14 @@ impl OverlayHost {
                     .when_some(result.sublabel.as_ref(), |container, sublabel| {
                         container.child(
                             div()
+                                .w_full()
+                                .min_w(px(0.))
                                 .text_xs()
                                 .text_color(rgb(text_secondary()))
-                                .flex()
-                                .flex_wrap()
-                                .items_center()
-                                .children(Self::highlighted_label(sublabel, sublabel_ranges)),
+                                .child(Self::highlighted_text_element(
+                                    sublabel,
+                                    sublabel_ranges,
+                                )),
                         )
                     }),
             )
@@ -897,6 +903,34 @@ impl OverlayHost {
             elements.push(div().child(text[cursor..].to_string()).into_any_element());
         }
         elements
+    }
+
+    fn highlighted_text_element(
+        text: &str,
+        ranges: &[(usize, usize)],
+    ) -> HighlightedTextElement {
+        let mut normalized: Vec<(usize, usize)> = ranges
+            .iter()
+            .copied()
+            .filter(|(s, e)| {
+                s < e && *e <= text.len() && text.is_char_boundary(*s) && text.is_char_boundary(*e)
+            })
+            .collect();
+        normalized.sort_by_key(|&(s, e)| (s, e));
+        let mut merged: Vec<(usize, usize)> = Vec::new();
+        for (s, e) in normalized {
+            if let Some(last) = merged.last_mut() {
+                if s <= last.1 {
+                    last.1 = last.1.max(e);
+                    continue;
+                }
+            }
+            merged.push((s, e));
+        }
+        HighlightedTextElement {
+            content: text.to_string(),
+            highlight_ranges: merged,
+        }
     }
 
     fn render_command_palette(cx: &mut Context<AppWindow>) -> AnyElement {
@@ -1033,4 +1067,187 @@ fn file_upload_preview_frame_size(
     width *= scale;
     height *= scale;
     (width.max(60.0), height.max(60.0))
+}
+
+struct HighlightedTextElement {
+    content: String,
+    highlight_ranges: Vec<(usize, usize)>,
+}
+
+impl HighlightedTextElement {
+    fn build_runs(&self, base_color: gpui::Hsla, font: gpui::Font) -> Vec<TextRun> {
+        let text_len = self.content.len();
+        if text_len == 0 || self.highlight_ranges.is_empty() {
+            return vec![TextRun {
+                len: text_len.max(1),
+                font,
+                color: base_color,
+                background_color: None,
+                underline: None,
+                strikethrough: None,
+            }];
+        }
+
+        let highlight_color = gpui::Hsla::from(rgb(accent()));
+        let mut runs = Vec::new();
+        let mut cursor = 0usize;
+        for &(start, end) in &self.highlight_ranges {
+            if start > cursor {
+                runs.push(TextRun {
+                    len: start - cursor,
+                    font: font.clone(),
+                    color: base_color,
+                    background_color: None,
+                    underline: None,
+                    strikethrough: None,
+                });
+            }
+            runs.push(TextRun {
+                len: end - start,
+                font: gpui::Font {
+                    weight: FontWeight::SEMIBOLD,
+                    ..font.clone()
+                },
+                color: highlight_color,
+                background_color: None,
+                underline: None,
+                strikethrough: None,
+            });
+            cursor = end;
+        }
+        if cursor < text_len {
+            runs.push(TextRun {
+                len: text_len - cursor,
+                font,
+                color: base_color,
+                background_color: None,
+                underline: None,
+                strikethrough: None,
+            });
+        }
+        runs
+    }
+}
+
+struct HighlightedTextPrepaint {
+    lines: Vec<gpui::WrappedLine>,
+    line_height: Pixels,
+}
+
+impl IntoElement for HighlightedTextElement {
+    type Element = Self;
+    fn into_element(self) -> Self::Element {
+        self
+    }
+}
+
+impl Element for HighlightedTextElement {
+    type RequestLayoutState = ();
+    type PrepaintState = HighlightedTextPrepaint;
+
+    fn id(&self) -> Option<ElementId> {
+        None
+    }
+
+    fn source_location(&self) -> Option<&'static core::panic::Location<'static>> {
+        None
+    }
+
+    fn request_layout(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        _inspector_id: Option<&gpui::InspectorElementId>,
+        window: &mut Window,
+        _cx: &mut App,
+    ) -> (LayoutId, Self::RequestLayoutState) {
+        let text_style = window.text_style();
+        let font_size = text_style.font_size.to_pixels(window.rem_size());
+        let line_height = window.line_height();
+        let content = self.content.clone();
+        let runs = self.build_runs(text_style.color, text_style.font());
+
+        let mut style = Style::default();
+        style.size.width = relative(1.).into();
+
+        (
+            window.request_measured_layout(style, move |known, available, window, _cx| {
+                let wrap_width = known.width.or(match available.width {
+                    AvailableSpace::Definite(width) => Some(width),
+                    _ => None,
+                });
+                let Some(lines) = window
+                    .text_system()
+                    .shape_text(content.clone().into(), font_size, &runs, wrap_width, None)
+                    .ok()
+                else {
+                    return size(px(0.), px(0.));
+                };
+                let mut measured = size(px(0.), px(0.));
+                for line in &lines {
+                    let line_size = line.size(line_height);
+                    measured.height += line_size.height;
+                    measured.width = measured.width.max(line_size.width).ceil();
+                }
+                if let Some(w) = wrap_width {
+                    measured.width = measured.width.min(w);
+                }
+                measured
+            }),
+            (),
+        )
+    }
+
+    fn prepaint(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        _inspector_id: Option<&gpui::InspectorElementId>,
+        bounds: Bounds<Pixels>,
+        _request_layout: &mut Self::RequestLayoutState,
+        window: &mut Window,
+        _cx: &mut App,
+    ) -> Self::PrepaintState {
+        let style = window.text_style();
+        let font_size = style.font_size.to_pixels(window.rem_size());
+        let runs = self.build_runs(style.color, style.font());
+        let lines = window
+            .text_system()
+            .shape_text(
+                self.content.clone().into(),
+                font_size,
+                &runs,
+                Some(bounds.size.width.max(px(1.0))),
+                None,
+            )
+            .map(|lines| lines.into_vec())
+            .unwrap_or_default();
+        HighlightedTextPrepaint {
+            lines,
+            line_height: window.line_height(),
+        }
+    }
+
+    fn paint(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        _inspector_id: Option<&gpui::InspectorElementId>,
+        bounds: Bounds<Pixels>,
+        _request_layout: &mut Self::RequestLayoutState,
+        prepaint: &mut Self::PrepaintState,
+        window: &mut Window,
+        _cx: &mut App,
+    ) {
+        let align = window.text_style().text_align;
+        let mut line_origin = bounds.origin;
+        for line in &prepaint.lines {
+            let _ = line.paint(
+                line_origin,
+                prepaint.line_height,
+                align,
+                Some(bounds),
+                window,
+                _cx,
+            );
+            line_origin.y += line.size(prepaint.line_height).height;
+        }
+    }
 }

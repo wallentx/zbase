@@ -107,6 +107,8 @@ impl SearchView {
             .child(
                 div()
                     .flex_1()
+                    .w_full()
+                    .min_w(px(0.))
                     .id("search-results-scroll")
                     .overflow_y_scroll()
                     .scrollbar_width(px(8.))
@@ -161,6 +163,8 @@ impl SearchView {
         video_render_cache: &HashMap<String, Arc<RenderImage>>,
         cx: &mut Context<AppWindow>,
     ) -> AnyElement {
+        let snippet = compact_snippet(&result.snippet, 160);
+
         div()
             .id(SharedString::from(format!("search-result-{index}")))
             .rounded_lg()
@@ -172,49 +176,52 @@ impl SearchView {
                 panel_surface()
             })
             .p_4()
+            .w_full()
+            .min_w(px(0.))
+            .overflow_hidden()
             .flex()
             .flex_col()
-            .gap_2()
+            .gap_1()
             .on_click(cx.listener(move |this, _, window, cx| {
                 this.open_search_result_at(index, window, cx);
             }))
             .child(
                 div()
                     .flex()
-                    .justify_between()
                     .items_center()
+                    .gap_2()
                     .child(
                         div()
-                            .font_weight(FontWeight::MEDIUM)
-                            .child(result.snippet.clone()),
+                            .text_xs()
+                            .text_color(rgb(text_secondary()))
+                            .child(message_timestamp_label(result.message.timestamp_ms)),
                     )
                     .child(
                         div()
-                            .flex()
-                            .items_center()
-                            .gap_2()
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(rgb(text_secondary()))
-                                    .child(message_timestamp_label(result.message.timestamp_ms)),
-                            )
-                            .child(badge(
-                                format!("{}", result.message.thread_reply_count),
-                                panel_alt_bg(),
-                                text_primary(),
+                            .text_xs()
+                            .text_color(rgb(text_secondary()))
+                            .child(format!(
+                                "{} · {}",
+                                result.route.label(),
+                                result.conversation_id.0
                             )),
-                    ),
+                    )
+                    .when(result.message.thread_reply_count > 0, |d| {
+                        d.child(badge(
+                            format!("{} replies", result.message.thread_reply_count),
+                            panel_alt_bg(),
+                            text_primary(),
+                        ))
+                    }),
             )
             .child(
                 div()
+                    .w_full()
+                    .min_w(px(0.))
+                    .overflow_hidden()
                     .text_sm()
-                    .text_color(rgb(text_secondary()))
-                    .child(format!(
-                        "{} · {}",
-                        result.route.label(),
-                        result.conversation_id.0
-                    )),
+                    .font_weight(FontWeight::MEDIUM)
+                    .child(snippet),
             )
             .when(!result.message.link_previews.is_empty(), |container| {
                 container.child(render_link_previews(
@@ -225,6 +232,21 @@ impl SearchView {
                 ))
             })
             .into_any_element()
+    }
+}
+
+fn compact_snippet(raw: &str, max_chars: usize) -> String {
+    let collapsed: String = raw
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join(" · ");
+    if collapsed.chars().count() <= max_chars {
+        collapsed
+    } else {
+        let truncated: String = collapsed.chars().take(max_chars).collect();
+        format!("{truncated}…")
     }
 }
 

@@ -1,13 +1,13 @@
 use crate::{
     domain::{
         affinity::Affinity,
-        attachment::AttachmentKind,
+        attachment::{AttachmentKind, AttachmentSource},
         ids::UserId,
         message::{BroadcastKind, LinkPreview, MessageFragment, MessageSendState},
     },
     models::timeline_model::{
-        EventSpan, InlineEmojiRender, MessageReactionRender, MessageRow, SystemEventIcon,
-        TeamAuthorRole, TimelineModel, TimelineRow,
+        EventSpan, InlineEmojiRender, MessageReactionRender, MessageRow, QuickReactRecent,
+        SystemEventIcon, TeamAuthorRole, TimelineModel, TimelineRow,
     },
     util::formatting::message_timestamp_label,
     views::{
@@ -18,9 +18,10 @@ use crate::{
         arrow_left_icon, arrow_right_icon, attachment_display_label, attachment_image_source,
         attachment_lightbox_source,
         avatar::{Avatar, default_avatar_background},
-        badge, close_icon, crown_icon, danger, glass_surface_dark, hash_icon,
+        badge, crown_icon, danger, format_duration_ms, glass_surface_dark, hash_icon,
         inline_markdown::{InlineMarkdownConfig, apply_inline_markdown, remap_source_byte_range},
-        link_icon, mention_soft, panel_alt_bg, panel_bg, pin_icon, plus_icon,
+        clipboard_icon, copy_icon, mention_soft, panel_alt_bg, panel_bg, pin_icon, play_icon,
+        plus_icon, trash_icon,
         selectable_text::{
             InlineAttachment, LinkRange, SelectableText, StyledRange, resolve_selectable_text,
             resolve_selectable_text_inline, resolve_selectable_text_with_attachments,
@@ -95,9 +96,10 @@ impl gpui::Element for HoveredMessageBoundsReporter {
         let message_id = self.message_id.clone();
         let is_thread = self.is_thread;
         let left: f32 = bounds.origin.x.into();
+        let top: f32 = bounds.origin.y.into();
         let width: f32 = bounds.size.width.into();
         let _ = owner.update(cx, |this, cx| {
-            this.record_hovered_message_layout(message_id, is_thread, left, width, cx);
+            this.record_hovered_message_layout(message_id, is_thread, left, top, width, cx);
         });
     }
 
@@ -119,7 +121,7 @@ pub struct TimelineList;
 
 const ROW_RENDER_CACHE_MAX_ENTRIES: usize = 512;
 
-const QUICK_REACT_EMOJI: &[(&str, &str)] = &[
+pub const QUICK_REACT_EMOJI: &[(&str, &str)] = &[
     ("+1", "\u{1F44D}"),
     ("heart", "\u{2764}\u{FE0F}"),
     ("joy", "\u{1F602}"),
@@ -521,6 +523,10 @@ impl TimelineList {
                             this.open_user_profile_card(author_user_id.clone(), cx);
                         }
                     }))
+                    .on_mouse_move(cx.listener(|this, _, _, cx| {
+                        this.clear_hovered_message(cx);
+                        cx.stop_propagation();
+                    }))
                     .cursor(gpui::CursorStyle::PointingHand)
                     .text_sm()
                     .font_weight(FontWeight::SEMIBOLD)
@@ -547,37 +553,40 @@ impl TimelineList {
             );
         }
 
-        if !is_thread
-            && let Some(reply_to_id) = &row.message.reply_to {
-                let thread_target = row
-                    .message
-                    .thread_root_id
-                    .clone()
-                    .unwrap_or_else(|| reply_to_id.clone());
+        if !is_thread && let Some(reply_to_id) = &row.message.reply_to {
+            let thread_target = row
+                .message
+                .thread_root_id
+                .clone()
+                .unwrap_or_else(|| reply_to_id.clone());
 
-                let reply_indicator = div()
-                    .id(SharedString::from(format!(
-                        "reply-indicator-{}",
-                        row.message.id.0
-                    )))
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        this.open_thread(thread_target.clone(), window, cx);
-                    }))
-                    .cursor(gpui::CursorStyle::PointingHand)
-                    .flex()
-                    .items_center()
-                    .gap_1()
-                    .child(thread_icon(text_secondary()));
+            let reply_indicator = div()
+                .id(SharedString::from(format!(
+                    "reply-indicator-{}",
+                    row.message.id.0
+                )))
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    this.open_thread(thread_target.clone(), window, cx);
+                }))
+                .on_mouse_move(cx.listener(|this, _, _, cx| {
+                    this.clear_hovered_message(cx);
+                    cx.stop_propagation();
+                }))
+                .cursor(gpui::CursorStyle::PointingHand)
+                .flex()
+                .items_center()
+                .gap_1()
+                .child(thread_icon(text_secondary()));
 
-                content = content.child(
-                    reply_indicator.child(
-                        div()
-                            .text_xs()
-                            .text_color(rgb(text_secondary()))
-                            .child("Replied in thread"),
-                    ),
-                );
-            }
+            content = content.child(
+                reply_indicator.child(
+                    div()
+                        .text_xs()
+                        .text_color(rgb(text_secondary()))
+                        .child("Replied in thread"),
+                ),
+            );
+        }
 
         let is_highlighted = timeline.highlighted_message_id.as_ref() == Some(&row.message.id)
             || timeline.editing_message_id.as_ref() == Some(&row.message.id);
@@ -588,6 +597,13 @@ impl TimelineList {
                 cx,
             ));
         } else {
+            let hover_anchor_y = is_hovered
+                .then_some(timeline.hovered_message_anchor_y)
+                .flatten();
+            let hover_window_top = is_hovered
+                .then_some(timeline.hovered_message_window_top)
+                .flatten();
+            let hover_toolbar_settled = is_hovered && timeline.hover_toolbar_settled;
             content = content.child(Self::render_message(
                 &row.message,
                 is_hovered,
@@ -602,11 +618,15 @@ impl TimelineList {
                 is_thread,
                 is_last_message,
                 hover_anchor_x,
+                hover_anchor_y,
                 hover_window_left,
+                hover_window_top,
                 hover_window_width,
+                hover_toolbar_settled,
                 row.message.edited.is_some(),
                 video_render_cache,
                 message_memo,
+                timeline.quick_react_recent.as_ref(),
                 selectable_texts,
                 cx,
             ));
@@ -622,11 +642,18 @@ impl TimelineList {
                 )))
                 .on_mouse_move(
                     cx.listener(move |this, event: &gpui::MouseMoveEvent, _, cx| {
+                        if this.cursor_over_selectable_link(event.position, cx) {
+                            this.clear_hovered_message(cx);
+                            cx.stop_propagation();
+                            return;
+                        }
                         let cursor_x: f32 = event.position.x.into();
+                        let cursor_y: f32 = event.position.y.into();
                         this.clear_reaction_hover_tooltip(cx);
                         this.set_hovered_message_with_cursor_anchor(
                             hover_msg_id_for_anchor.clone(),
                             cursor_x,
+                            cursor_y,
                             is_thread,
                             cx,
                         );
@@ -650,6 +677,10 @@ impl TimelineList {
                             row.message.id.0
                         )))
                         .cursor(gpui::CursorStyle::PointingHand)
+                        .on_mouse_move(cx.listener(|this, _, _, cx| {
+                            this.clear_hovered_message(cx);
+                            cx.stop_propagation();
+                        }))
                         .on_click(cx.listener({
                             let author_user_id = author_user_id.clone();
                             move |this, _, _, cx| {
@@ -675,11 +706,18 @@ impl TimelineList {
                 )))
                 .on_mouse_move(
                     cx.listener(move |this, event: &gpui::MouseMoveEvent, _, cx| {
+                        if this.cursor_over_selectable_link(event.position, cx) {
+                            this.clear_hovered_message(cx);
+                            cx.stop_propagation();
+                            return;
+                        }
                         let cursor_x: f32 = event.position.x.into();
+                        let cursor_y: f32 = event.position.y.into();
                         this.clear_reaction_hover_tooltip(cx);
                         this.set_hovered_message_with_cursor_anchor(
                             hover_msg_id_for_anchor.clone(),
                             cursor_x,
+                            cursor_y,
                             is_thread,
                             cx,
                         );
@@ -732,13 +770,17 @@ impl TimelineList {
         reaction_index: &HashMap<crate::domain::ids::MessageId, Vec<MessageReactionRender>>,
         show_thread_reply_badge: bool,
         _is_thread: bool,
-        is_last_message: bool,
+        _is_last_message: bool,
         hover_anchor_x: Option<f32>,
+        hover_anchor_y: Option<f32>,
         hover_window_left: Option<f32>,
+        hover_window_top: Option<f32>,
         hover_window_width: Option<f32>,
+        hover_toolbar_settled: bool,
         show_edited_badge: bool,
         video_render_cache: &HashMap<String, Arc<RenderImage>>,
         message_memo: Option<&MessageRenderMemo>,
+        quick_react_recent: Option<&QuickReactRecent>,
         selectable_texts: &mut HashMap<String, Entity<SelectableText>>,
         cx: &mut Context<AppWindow>,
     ) -> AnyElement {
@@ -839,47 +881,182 @@ impl TimelineList {
                                     let lightbox_width = preview_width;
                                     let lightbox_height = preview_height;
                                     return div()
-                                        .id(SharedString::from(format!(
-                                            "timeline-attachment-image-{}-{index}",
-                                            message.id.0
-                                        )))
                                         .flex()
                                         .flex_col()
                                         .gap_1()
-                                        .when_some(lightbox_source, |image, lightbox_source| {
-                                            let caption_text = caption_text.clone();
-                                            image.cursor(gpui::CursorStyle::PointingHand).on_click(
-                                                cx.listener(move |this, _, _, cx| {
-                                                    this.open_image_lightbox(
-                                                        lightbox_source.clone(),
-                                                        caption_text.clone(),
-                                                        lightbox_width,
-                                                        lightbox_height,
-                                                        cx,
-                                                    );
-                                                }),
-                                            )
-                                        })
                                         .child(
-                                            img(media_source)
+                                            div()
+                                                .id(SharedString::from(format!(
+                                                    "timeline-attachment-image-{}-{index}",
+                                                    message.id.0
+                                                )))
                                                 .w(px(media_width))
                                                 .h(px(media_height))
-                                                .rounded_md()
-                                                .object_fit(ObjectFit::Contain)
-                                                .flex_shrink_0()
-                                                .min_w(px(16.))
-                                                .min_h(px(16.))
-                                                .with_fallback({
-                                                    let label = attachment_label.clone();
-                                                    move || {
-                                                        div()
-                                                            .text_xs()
-                                                            .text_color(rgb(text_secondary()))
-                                                            .child(label.clone())
-                                                            .into_any_element()
-                                                    }
-                                                }),
+                                                .when_some(
+                                                    lightbox_source,
+                                                    |thumb, lightbox_source| {
+                                                        let caption_text = caption_text.clone();
+                                                        thumb
+                                                            .cursor(gpui::CursorStyle::PointingHand)
+                                                            .on_mouse_move(cx.listener(|this, _, _, cx| {
+                                                                this.clear_hovered_message(cx);
+                                                                cx.stop_propagation();
+                                                            }))
+                                                            .on_click(cx.listener(
+                                                                move |this, _, _, cx| {
+                                                                    this.open_image_lightbox(
+                                                                        lightbox_source.clone(),
+                                                                        caption_text.clone(),
+                                                                        lightbox_width,
+                                                                        lightbox_height,
+                                                                        cx,
+                                                                    );
+                                                                },
+                                                            ))
+                                                    },
+                                                )
+                                                .child(
+                                                    img(media_source)
+                                                        .w(px(media_width))
+                                                        .h(px(media_height))
+                                                        .rounded_md()
+                                                        .object_fit(ObjectFit::Contain)
+                                                        .flex_shrink_0()
+                                                        .min_w(px(16.))
+                                                        .min_h(px(16.))
+                                                        .with_fallback({
+                                                            let label = attachment_label.clone();
+                                                            move || {
+                                                                div()
+                                                                    .text_xs()
+                                                                    .text_color(rgb(
+                                                                        text_secondary(),
+                                                                    ))
+                                                                    .child(label.clone())
+                                                                    .into_any_element()
+                                                            }
+                                                        }),
+                                                ),
                                         )
+                                        .into_any_element();
+                                }
+                                if attachment.kind == AttachmentKind::Video {
+                                    if let Some(thumb_source) = attachment_image_source(attachment)
+                                    {
+                                        let (max_width, max_height) = if show_thread_reply_badge {
+                                            (360.0, 300.0)
+                                        } else {
+                                            (280.0, 240.0)
+                                        };
+                                        let preview_width = attachment
+                                            .preview
+                                            .as_ref()
+                                            .and_then(|p| p.width)
+                                            .or(attachment.width);
+                                        let preview_height = attachment
+                                            .preview
+                                            .as_ref()
+                                            .and_then(|p| p.height)
+                                            .or(attachment.height);
+                                        let (media_width, media_height) = Self::media_frame_size(
+                                            preview_width,
+                                            preview_height,
+                                            max_width,
+                                            max_height,
+                                        );
+                                        let video_path =
+                                            attachment.source.as_ref().and_then(|s| match s {
+                                                AttachmentSource::LocalPath(p) => Some(p.clone()),
+                                                _ => None,
+                                            });
+                                        let duration_label =
+                                            attachment.duration_ms.map(format_duration_ms);
+                                        return div()
+                                            .id(SharedString::from(format!(
+                                                "timeline-attachment-video-{}-{index}",
+                                                message.id.0
+                                            )))
+                                            .relative()
+                                            .w(px(media_width))
+                                            .h(px(media_height))
+                                            .rounded_md()
+                                            .overflow_hidden()
+                                            .flex_shrink_0()
+                                            .cursor(gpui::CursorStyle::PointingHand)
+                                            .on_mouse_move(cx.listener(|this, _, _, cx| {
+                                                this.clear_hovered_message(cx);
+                                                cx.stop_propagation();
+                                            }))
+                                            .when_some(video_path, |el, path| {
+                                                el.on_click(cx.listener(move |_, _, _, _| {
+                                                    AppWindow::open_video_in_native_player(&path);
+                                                }))
+                                            })
+                                            .child(
+                                                img(thumb_source)
+                                                    .size_full()
+                                                    .object_fit(ObjectFit::Cover),
+                                            )
+                                            .child(
+                                                div()
+                                                    .absolute()
+                                                    .inset_0()
+                                                    .flex()
+                                                    .items_center()
+                                                    .justify_center()
+                                                    .bg(tint(0x000000, 0.3))
+                                                    .child(
+                                                        div()
+                                                            .w(px(40.))
+                                                            .h(px(40.))
+                                                            .rounded_full()
+                                                            .bg(tint(0x000000, 0.5))
+                                                            .flex()
+                                                            .items_center()
+                                                            .justify_center()
+                                                            .child(play_icon(0xFFFFFF)),
+                                                    ),
+                                            )
+                                            .when_some(duration_label, |el, label| {
+                                                el.child(
+                                                    div()
+                                                        .absolute()
+                                                        .bottom_1()
+                                                        .right_1()
+                                                        .px_1p5()
+                                                        .py_0p5()
+                                                        .rounded_sm()
+                                                        .bg(tint(0x000000, 0.6))
+                                                        .text_xs()
+                                                        .text_color(rgb(0xFFFFFF))
+                                                        .child(label),
+                                                )
+                                            })
+                                            .into_any_element();
+                                    }
+                                    let video_path =
+                                        attachment.source.as_ref().and_then(|s| match s {
+                                            AttachmentSource::LocalPath(p) => Some(p.clone()),
+                                            _ => None,
+                                        });
+                                    return div()
+                                        .id(SharedString::from(format!(
+                                            "timeline-attachment-video-label-{}-{index}",
+                                            message.id.0
+                                        )))
+                                        .cursor(gpui::CursorStyle::PointingHand)
+                                        .on_mouse_move(cx.listener(|this, _, _, cx| {
+                                            this.clear_hovered_message(cx);
+                                            cx.stop_propagation();
+                                        }))
+                                        .when_some(video_path, |el, path| {
+                                            el.on_click(cx.listener(move |_, _, _, _| {
+                                                AppWindow::open_video_in_native_player(&path);
+                                            }))
+                                        })
+                                        .text_xs()
+                                        .text_color(rgb(accent()))
+                                        .child(attachment_label)
                                         .into_any_element();
                                 }
                                 div()
@@ -1033,17 +1210,11 @@ impl TimelineList {
                                 .id(reaction_chip_id)
                                 .cursor(gpui::CursorStyle::PointingHand)
                                 .on_mouse_move(cx.listener({
-                                    let message_id = message_id.clone();
                                     let hover_text = hover_text.clone();
                                     move |this, event: &gpui::MouseMoveEvent, _, cx| {
                                         let cursor_x: f32 = event.position.x.into();
                                         let cursor_y: f32 = event.position.y.into();
-                                        this.set_hovered_message_with_cursor_anchor(
-                                            message_id.clone(),
-                                            cursor_x,
-                                            _is_thread,
-                                            cx,
-                                        );
+                                        this.clear_hovered_message(cx);
                                         if let Some(hover_text) = hover_text.as_ref() {
                                             this.show_reaction_hover_tooltip(
                                                 hover_text.clone(),
@@ -1097,6 +1268,7 @@ impl TimelineList {
                                 message.id.0
                             )))
                             .on_click(cx.listener(move |this, _, _, cx| {
+                                this.clear_hovered_message(cx);
                                 this.quick_react(msg_id.clone(), unicode_str.clone(), cx);
                             }))
                             .w(px(26.))
@@ -1113,22 +1285,81 @@ impl TimelineList {
                     })
                     .collect();
 
+                let recent_react_button: Option<AnyElement> =
+                    quick_react_recent.and_then(|recent| {
+                        let msg_id = message.id.clone();
+                        if let Some(unicode) = &recent.unicode {
+                            let emoji_text = unicode.clone();
+                            Some(
+                                div()
+                                    .id(SharedString::from(format!(
+                                        "quick-react-recent-{}",
+                                        message.id.0
+                                    )))
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.clear_hovered_message(cx);
+                                        this.quick_react(
+                                            msg_id.clone(),
+                                            emoji_text.clone(),
+                                            cx,
+                                        );
+                                    }))
+                                    .w(px(26.))
+                                    .h(px(26.))
+                                    .rounded_md()
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .hover(|s| s.bg(subtle_surface()))
+                                    .cursor(gpui::CursorStyle::PointingHand)
+                                    .text_sm()
+                                    .child(unicode.clone())
+                                    .into_any_element(),
+                            )
+                        } else if let Some(asset_path) = &recent.asset_path {
+                            let emoji_alias = format!(":{}:", recent.alias);
+                            let path = asset_path.clone();
+                            Some(
+                                div()
+                                    .id(SharedString::from(format!(
+                                        "quick-react-recent-{}",
+                                        message.id.0
+                                    )))
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.clear_hovered_message(cx);
+                                        this.quick_react(
+                                            msg_id.clone(),
+                                            emoji_alias.clone(),
+                                            cx,
+                                        );
+                                    }))
+                                    .w(px(26.))
+                                    .h(px(26.))
+                                    .rounded_md()
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .hover(|s| s.bg(subtle_surface()))
+                                    .cursor(gpui::CursorStyle::PointingHand)
+                                    .child(
+                                        img(SharedString::from(path))
+                                            .w(px(18.))
+                                            .h(px(18.)),
+                                    )
+                                    .into_any_element(),
+                            )
+                        } else {
+                            None
+                        }
+                    });
+
                 let message_id_for_picker = message.id.clone();
                 let message_id_for_thread_btn = message.id.clone();
                 let message_id_for_copy_link_btn = message.id.clone();
+                let message_id_for_copy_text_btn = message.id.clone();
                 let message_id_for_delete_btn = message.id.clone();
-                let message_id_for_hover = message.id.clone();
                 let is_own_message = current_user_id
                     .is_some_and(|id| id.0.eq_ignore_ascii_case(&message.author_id.0));
-                let has_reactions = reaction_index
-                    .get(&message.id)
-                    .is_some_and(|reactions| !reactions.is_empty());
-                let has_thread_badge = show_thread_reply_badge && message.thread_reply_count > 0;
-                let has_blocking_inline_actions = has_reactions || has_thread_badge;
-
-                const TOOLBAR_W: f32 = 260.0;
-                const BLOCKING_LEFT: f32 = 260.0;
-
                 let inline_toolbar = div()
                     .flex()
                     .items_center()
@@ -1140,11 +1371,22 @@ impl TimelineList {
                     .py_0p5()
                     .gap_0p5()
                     .children(quick_react_buttons)
+                    .when_some(recent_react_button, |d, btn| {
+                        d.child(
+                            div()
+                                .w(px(1.))
+                                .h(px(16.))
+                                .bg(shell_border())
+                                .flex_shrink_0(),
+                        )
+                        .child(btn)
+                    })
                     .child(Self::toolbar_icon_button(
                         "message-react-more",
                         &message.id.0,
                         plus_icon(text_secondary()),
                         cx.listener(move |this, _, _, cx| {
+                            this.clear_hovered_message(cx);
                             this.react_to_message(message_id_for_picker.clone(), cx);
                         }),
                     ))
@@ -1160,95 +1402,88 @@ impl TimelineList {
                         &message.id.0,
                         thread_icon(text_secondary()),
                         cx.listener(move |this, _, window, cx| {
+                            this.clear_hovered_message(cx);
                             this.open_thread(message_id_for_thread_btn.clone(), window, cx);
                         }),
                     ))
                     .child(Self::toolbar_icon_button(
                         "message-copy-link",
                         &message.id.0,
-                        link_icon(text_secondary()),
+                        copy_icon(text_secondary()),
                         cx.listener(move |this, _, _, cx| {
+                            this.clear_hovered_message(cx);
                             this.copy_message_link(message_id_for_copy_link_btn.clone(), cx);
+                        }),
+                    ))
+                    .child(Self::toolbar_icon_button(
+                        "message-copy-text",
+                        &message.id.0,
+                        clipboard_icon(text_secondary()),
+                        cx.listener(move |this, _, _, cx| {
+                            this.clear_hovered_message(cx);
+                            this.copy_message_text(message_id_for_copy_text_btn.clone(), cx);
                         }),
                     ))
                     .when(is_own_message, |toolbar| {
                         toolbar.child(Self::toolbar_icon_button(
                             "message-delete",
                             &message.id.0,
-                            close_icon(danger()),
+                            trash_icon(danger()),
                             cx.listener(move |this, _, _, cx| {
+                                this.clear_hovered_message(cx);
                                 this.delete_message(message_id_for_delete_btn.clone(), cx);
                             }),
                         ))
                     });
 
-                let cursor_left = if has_blocking_inline_actions {
-                    None
-                } else {
-                    hover_anchor_x
-                        .zip(hover_window_left)
-                        .zip(hover_window_width)
-                        .map(|((anchor_x, window_left), window_width)| {
-                            let local_x = anchor_x - window_left;
-                            let mut left = local_x - (TOOLBAR_W * 0.5);
-                            if window_width.is_finite() && window_width > 0.0 {
-                                let max_left = (window_width - TOOLBAR_W).max(0.0);
-                                if left < 0.0 {
-                                    left = 0.0;
-                                } else if left > max_left {
-                                    left = max_left;
-                                }
-                            } else if left < 0.0 {
-                                left = 0.0;
-                            }
-                            left
-                        })
-                };
+                const TOOLBAR_W: f32 = 260.0;
+                const TOOLBAR_H: f32 = 30.0;
+                const TOOLBAR_Y_GAP: f32 = 8.0;
 
-                let blocking_left = hover_window_width
-                    .filter(|w| w.is_finite() && *w > 0.0)
-                    .map(|window_width| {
-                        let max_left = (window_width - TOOLBAR_W).max(0.0);
-                        BLOCKING_LEFT.min(max_left)
-                    })
-                    .unwrap_or(BLOCKING_LEFT);
+                let toolbar_left = hover_anchor_x
+                    .zip(hover_window_left)
+                    .zip(hover_window_width)
+                    .map(|((anchor_x, window_left), window_width)| {
+                        let local_x = anchor_x - window_left;
+                        let mut left = local_x - (TOOLBAR_W * 0.5);
+                        if window_width.is_finite() && window_width > 0.0 {
+                            let max_left = (window_width - TOOLBAR_W).max(0.0);
+                            left = left.clamp(0.0, max_left);
+                        } else if left < 0.0 {
+                            left = 0.0;
+                        }
+                        left
+                    });
 
+                let toolbar_top = hover_anchor_y
+                    .zip(hover_window_top)
+                    .map(|(anchor_y, window_top)| {
+                        let above = anchor_y - window_top - TOOLBAR_H - TOOLBAR_Y_GAP;
+                        if above >= 0.0 {
+                            above
+                        } else {
+                            anchor_y - window_top + TOOLBAR_Y_GAP
+                        }
+                    });
+
+                let toolbar_visible = is_hovered && hover_toolbar_settled;
                 let toolbar_wrapper = div()
                     .absolute()
-                    // If the row already has clickable inline actions (reactions or thread badge),
-                    // keep the picker at a fixed left offset so we don't cover them.
-                    .when(has_blocking_inline_actions, |d| d.left(px(blocking_left)))
-                    // Otherwise, place it near the cursor when we have enough geometry.
-                    .when_some(cursor_left, |d, left| d.left(px(left)))
-                    // If we don't yet have enough geometry, keep it hidden (avoids visible "jump").
-                    .when(!has_blocking_inline_actions && cursor_left.is_none(), |d| {
-                        d.right_0().opacity(0.)
-                    })
-                    .block_mouse_except_scroll()
+                    .when_some(toolbar_left, |d, left| d.left(px(left)))
+                    .when(toolbar_left.is_none(), |d| d.right_0())
+                    .when_some(toolbar_top, |d, top| d.top(px(top)))
+                    .when(toolbar_top.is_none(), |d| d.top(px(-14.)))
+                    .when(toolbar_visible, |d| d.block_mouse_except_scroll())
                     .on_mouse_move(
-                        cx.listener(move |this, event: &gpui::MouseMoveEvent, _, cx| {
-                            this.clear_reaction_hover_tooltip(cx);
-                            let cursor_x: f32 = event.position.x.into();
-                            this.set_hovered_message_with_cursor_anchor(
-                                message_id_for_hover.clone(),
-                                cursor_x,
-                                _is_thread,
-                                cx,
-                            );
+                        cx.listener(move |_, _, _, cx| {
                             cx.stop_propagation();
                         }),
                     )
-                    .when(!is_hovered, |d| d.opacity(0.))
+                    .when(!toolbar_visible, |d| d.opacity(0.))
                     .child(inline_toolbar);
-                if is_last_message {
-                    deferred(toolbar_wrapper.top(px(-14.)))
-                        .priority(10)
-                        .into_any_element()
-                } else {
-                    deferred(toolbar_wrapper.bottom(px(-14.)))
-                        .priority(10)
-                        .into_any_element()
-                }
+                deferred(toolbar_wrapper)
+                    .priority(10)
+                    .into_any_element()
             })
             .when(
                 show_thread_reply_badge && message.thread_reply_count > 0,
@@ -1262,6 +1497,10 @@ impl TimelineList {
                             )))
                             .on_click(cx.listener(move |this, _, window, cx| {
                                 this.open_thread(thread_root_id.clone(), window, cx);
+                            }))
+                            .on_mouse_move(cx.listener(|this, _, _, cx| {
+                                this.clear_hovered_message(cx);
+                                cx.stop_propagation();
                             }))
                             .cursor(gpui::CursorStyle::PointingHand)
                             .text_xs()
@@ -1477,6 +1716,10 @@ impl TimelineList {
                         .on_click(cx.listener(move |this, _, window, cx| {
                             this.open_url_or_deep_link(&url, window, cx);
                         }))
+                        .on_mouse_move(cx.listener(|this, _, _, cx| {
+                            this.clear_hovered_message(cx);
+                            cx.stop_propagation();
+                        }))
                         .cursor(gpui::CursorStyle::PointingHand)
                         .rounded_md()
                         .overflow_hidden()
@@ -1561,6 +1804,10 @@ impl TimelineList {
                     .id(element_id)
                     .on_click(cx.listener(move |this, _, window, cx| {
                         this.open_url_or_deep_link(&url, window, cx);
+                    }))
+                    .on_mouse_move(cx.listener(|this, _, _, cx| {
+                        this.clear_hovered_message(cx);
+                        cx.stop_propagation();
                     }))
                     .cursor(gpui::CursorStyle::PointingHand)
                     .border_l_2()
@@ -1850,36 +2097,36 @@ impl TimelineList {
                     source_ref.as_ref(),
                     emoji_index,
                     emoji_source_index,
-                )
-                    && let Some(asset_path) = render.asset_path.as_ref() {
-                        let size = custom_emoji_size_px(emoji_only);
-                        asset_emojis.push(
-                            div()
+                ) && let Some(asset_path) = render.asset_path.as_ref()
+                {
+                    let size = custom_emoji_size_px(emoji_only);
+                    asset_emojis.push(
+                        div()
+                            .w(px(size))
+                            .h(px(size))
+                            .flex_shrink_0()
+                            .overflow_hidden()
+                            .child(
+                                img(ImageSource::from(std::path::PathBuf::from(
+                                    crate::views::normalize_local_source_path(asset_path),
+                                )))
                                 .w(px(size))
                                 .h(px(size))
-                                .flex_shrink_0()
-                                .overflow_hidden()
-                                .child(
-                                    img(ImageSource::from(std::path::PathBuf::from(
-                                        crate::views::normalize_local_source_path(asset_path),
-                                    )))
-                                    .w(px(size))
-                                    .h(px(size))
-                                    .object_fit(ObjectFit::Contain)
-                                    .with_fallback({
-                                        let alias = alias.clone();
-                                        move || {
-                                            div()
-                                                .text_sm()
-                                                .line_height(px(22.))
-                                                .child(format!(":{alias}:"))
-                                                .into_any_element()
-                                        }
-                                    }),
-                                )
-                                .into_any_element(),
-                        );
-                    }
+                                .object_fit(ObjectFit::Contain)
+                                .with_fallback({
+                                    let alias = alias.clone();
+                                    move || {
+                                        div()
+                                            .text_sm()
+                                            .line_height(px(22.))
+                                            .child(format!(":{alias}:"))
+                                            .into_any_element()
+                                    }
+                                }),
+                            )
+                            .into_any_element(),
+                    );
+                }
                 continue;
             }
 
@@ -2443,6 +2690,10 @@ impl TimelineList {
                             .text_xs()
                             .text_color(rgb(accent()))
                             .cursor(gpui::CursorStyle::PointingHand)
+                            .on_mouse_move(cx.listener(|this, _, _, cx| {
+                                this.clear_hovered_message(cx);
+                                cx.stop_propagation();
+                            }))
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.retry_failed_message_send(retry_message_id.clone(), cx);
                             }))

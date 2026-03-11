@@ -45,7 +45,7 @@ use crate::{
         is_dark_theme,
         main_panel::MainPanelHost,
         overlays::OverlayHost,
-        panel_alt_bg, panel_surface,
+        panel_alt_bg, panel_bg, panel_surface,
         right_pane::{RightPaneHost, RightPaneResizeDrag},
         selectable_text::SelectableText,
         shell_border_strong,
@@ -78,6 +78,7 @@ const ENV_BENCH_SKIP_BACKEND: &str = "ZBASE_BENCH_SKIP_BACKEND";
 const ENV_BENCH_SCRIPT: &str = "ZBASE_BENCH_SCRIPT";
 const ENV_BENCH_SCRIPT_TICK_MS: &str = "ZBASE_BENCH_SCRIPT_TICK_MS";
 const ENV_BENCH_TIMELINE_MESSAGES: &str = "ZBASE_BENCH_TIMELINE_MESSAGES";
+const ENV_BENCH_PROFILE_USER: &str = "ZBASE_BENCH_PROFILE_USER";
 const ENV_BENCH_EXIT_ON_STOP: &str = "ZBASE_BENCH_EXIT_ON_STOP";
 const BACKEND_POLL_BOOT_INTERVAL: Duration = Duration::from_millis(16);
 const BACKEND_POLL_READY_INTERVAL: Duration = Duration::from_millis(200);
@@ -174,6 +175,7 @@ pub struct AppWindow {
     timeline_list_state: ListState,
     timeline_row_render_cache: crate::views::timeline::TimelineRowRenderCache,
     thread_scroll: ScrollHandle,
+    profile_scroll: ScrollHandle,
     timeline_unseen_count: usize,
     thread_unseen_count: usize,
     last_timeline_message_count: usize,
@@ -184,6 +186,9 @@ pub struct AppWindow {
     pending_older_scroll_seq: Option<u64>,
     suppress_next_timeline_bottom_snap: bool,
     suppress_next_timeline_unseen_increment: bool,
+    /// Set by navigate_to_message to prevent background timeline loads from overriding
+    /// the jump-to-message scroll position. Cleared once the list has been laid out.
+    jump_to_message_active: bool,
     last_thread_reply_count: usize,
     pending_thread_scroll_to_bottom: bool,
     sidebar_dm_avatar_assets: HashMap<String, String>,
@@ -194,6 +199,8 @@ pub struct AppWindow {
     bench_skip_backend: bool,
     bench_script: Option<BenchScriptConfig>,
     bench_script_step: u64,
+    bench_profile_user_id: Option<UserId>,
+    bench_profile_initialized: bool,
     perf_exit_on_stop: bool,
     sync_cache: SyncCache,
     pending_backend_events: VecDeque<BackendEvent>,
@@ -203,6 +210,7 @@ pub struct AppWindow {
     video_result_sender: Sender<VideoDecodeOutcome>,
     video_result_receiver: Receiver<VideoDecodeOutcome>,
     last_mark_read_attempt: HashMap<String, (String, Instant)>,
+    hover_settle_seq: u64,
     quick_switcher_query_seq: u64,
     quick_switcher_last_local_query: String,
     quick_switcher_last_local_matched_entry_indices: Arc<Vec<usize>>,
@@ -305,6 +313,7 @@ enum BenchScriptScenario {
     SidebarFilter,
     SyncHeavy,
     ComposerTyping,
+    ComposerPaste,
 }
 
 impl BenchScriptScenario {
@@ -318,6 +327,7 @@ impl BenchScriptScenario {
             "composer_typing" | "composer-typing" | "composer" | "typing" => {
                 Some(Self::ComposerTyping)
             }
+            "composer_paste" | "composer-paste" | "paste" => Some(Self::ComposerPaste),
             _ => None,
         }
     }
@@ -328,6 +338,7 @@ impl BenchScriptScenario {
             Self::SidebarFilter => "sidebar_filter",
             Self::SyncHeavy => "sync_heavy",
             Self::ComposerTyping => "composer_typing",
+            Self::ComposerPaste => "composer_paste",
         }
     }
 }
@@ -533,6 +544,7 @@ impl AppWindow {
         let last_thread_reply_count = models.thread_pane.replies.len();
         let initial_timeline_row_count = models.timeline.rows.len();
         let bench_script = BenchScriptConfig::from_env();
+        let bench_profile_user_id = env_nonempty(ENV_BENCH_PROFILE_USER).map(UserId::new);
         let (video_result_sender, video_result_receiver) = mpsc::channel();
 
         Self {
@@ -560,6 +572,7 @@ impl AppWindow {
             ),
             timeline_row_render_cache: crate::views::timeline::TimelineRowRenderCache::default(),
             thread_scroll: ScrollHandle::new(),
+            profile_scroll: ScrollHandle::new(),
             timeline_unseen_count: 0,
             thread_unseen_count: 0,
             last_timeline_message_count,
@@ -570,6 +583,7 @@ impl AppWindow {
             pending_older_scroll_seq: None,
             suppress_next_timeline_bottom_snap: false,
             suppress_next_timeline_unseen_increment: false,
+            jump_to_message_active: false,
             last_thread_reply_count,
             pending_thread_scroll_to_bottom: false,
             sidebar_dm_avatar_assets: HashMap::new(),
@@ -580,6 +594,8 @@ impl AppWindow {
             bench_skip_backend: env_flag(ENV_BENCH_SKIP_BACKEND),
             bench_script,
             bench_script_step: 0,
+            bench_profile_user_id,
+            bench_profile_initialized: false,
             perf_exit_on_stop: env_flag(ENV_BENCH_EXIT_ON_STOP),
             sync_cache: SyncCache::default(),
             pending_backend_events: VecDeque::new(),
@@ -589,6 +605,7 @@ impl AppWindow {
             video_result_sender,
             video_result_receiver,
             last_mark_read_attempt: HashMap::new(),
+            hover_settle_seq: 0,
             quick_switcher_query_seq: 0,
             quick_switcher_last_local_query: String::new(),
             quick_switcher_last_local_matched_entry_indices: Arc::new(Vec::new()),
@@ -965,10 +982,9 @@ impl AppWindow {
                 self.sync_models_from_store();
                 self.request_mark_conversation_read_if_needed();
                 needs_refresh = true;
-            } else if !quick_switcher_typing
-                && self.request_mark_conversation_read_if_needed() {
-                    needs_refresh = true;
-                }
+            } else if !quick_switcher_typing && self.request_mark_conversation_read_if_needed() {
+                needs_refresh = true;
+            }
             self.perf_harness
                 .record_duration(PerfTimer::DrainBackendEvents, drain_t0.elapsed());
             if needs_refresh {
@@ -1490,8 +1506,43 @@ impl AppWindow {
             .set_sidebar_filter(self.sidebar_filter_input.read(cx).text());
     }
 
+    fn take_pasted_image(
+        input: &Entity<TextField>,
+        cx: &mut Context<Self>,
+    ) -> Option<Vec<u8>> {
+        let has_image = input.read(cx).pasted_image.is_some();
+        if has_image {
+            input.update(cx, |input, _| input.pasted_image.take())
+        } else {
+            None
+        }
+    }
+
+    fn handle_pasted_image(&mut self, bytes: Vec<u8>, target: UploadTarget, cx: &mut Context<Self>) {
+        use std::time::SystemTime;
+        let ts = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0);
+        let path = std::env::temp_dir().join(format!(
+            "zbase-paste-{}-{ts}.png",
+            std::process::id(),
+        ));
+        if std::fs::write(&path, &bytes).is_ok() {
+            self.open_file_upload_lightbox_with_paths(vec![path], target, cx);
+        }
+    }
+
     fn sync_drafts_from_inputs(&mut self, cx: &mut Context<Self>) {
         let started_at = Instant::now();
+
+        if let Some(bytes) = Self::take_pasted_image(&self.composer_input, cx) {
+            self.handle_pasted_image(bytes, UploadTarget::Composer, cx);
+        }
+        if let Some(bytes) = Self::take_pasted_image(&self.thread_input, cx) {
+            self.handle_pasted_image(bytes, UploadTarget::Thread, cx);
+        }
+
         if self.composer_input.read(cx).up_at_top_triggered {
             self.composer_input.update(cx, |input, _| {
                 input.up_at_top_triggered = false;
@@ -1499,8 +1550,11 @@ impl AppWindow {
             self.edit_last_own_message(cx);
         }
 
-        let composer_text = self.composer_input.read(cx).text();
-        if self.models.composer.draft_text != composer_text {
+        let composer_text = self
+            .composer_input
+            .read(cx)
+            .text_if_different(&self.models.composer.draft_text);
+        if let Some(composer_text) = composer_text {
             let was_near_bottom = self.timeline_is_near_bottom();
             let key = DraftKey::Conversation(self.models.composer.conversation_id.clone());
             self.models
@@ -1515,8 +1569,11 @@ impl AppWindow {
             }
         }
 
-        let thread_text = self.thread_input.read(cx).text();
-        if self.models.thread_pane.reply_draft != thread_text {
+        let thread_text = self
+            .thread_input
+            .read(cx)
+            .text_if_different(&self.models.thread_pane.reply_draft);
+        if let Some(thread_text) = thread_text {
             self.models.update_thread_reply_draft(thread_text.clone());
             self.last_text_input_activity = Some(Instant::now());
             if let Some(root_id) = self.models.thread_pane.root_message_id.clone() {
@@ -1616,6 +1673,7 @@ impl AppWindow {
             return;
         };
 
+        self.ensure_bench_profile_initialized();
         self.bench_script_step = self.bench_script_step.wrapping_add(1);
         match script.scenario {
             BenchScriptScenario::TimelineScroll => {
@@ -1670,8 +1728,49 @@ impl AppWindow {
 
                 self.composer_input
                     .update(cx, |input, cx| input.set_text(next_text, cx));
+                self.sync_drafts_from_inputs(cx);
+                self.refresh(cx);
+            }
+            BenchScriptScenario::ComposerPaste => {
+                if self.bench_script_step.is_multiple_of(96) {
+                    self.composer_input
+                        .update(cx, |input, cx| input.set_text(String::new(), cx));
+                } else if self.bench_script_step.is_multiple_of(48) {
+                    let payload = Self::bench_composer_paste_payload(self.bench_script_step);
+                    self.composer_input.update(cx, |input, cx| {
+                        input.set_text(String::new(), cx);
+                        input.insert_text(&payload, cx);
+                    });
+                }
+                self.sync_drafts_from_inputs(cx);
+                self.refresh(cx);
             }
         }
+    }
+
+    fn ensure_bench_profile_initialized(&mut self) {
+        if self.bench_profile_initialized {
+            return;
+        }
+        let Some(user_id) = self.bench_profile_user_id.clone() else {
+            return;
+        };
+        self.models.profile_panel.active_social_tab = SocialTab::Followers;
+        self.models.profile_panel.user_id = Some(user_id.clone());
+        self.models
+            .set_right_pane(RightPaneMode::Profile(user_id.clone()));
+        self.dispatch_ui_action(UiAction::ShowUserProfilePanel {
+            user_id: user_id.clone(),
+        });
+        self.dispatch_ui_action(UiAction::LoadSocialGraphList {
+            user_id: user_id.clone(),
+            list_type: SocialGraphListType::Followers,
+        });
+        self.dispatch_ui_action(UiAction::RefreshProfilePresence {
+            user_id,
+            conversation_id: self.app_store.snapshot().timeline.conversation_id.clone(),
+        });
+        self.bench_profile_initialized = true;
     }
 
     fn inflate_bench_timeline_messages(&mut self, message_count: usize) {
@@ -1777,6 +1876,17 @@ impl AppWindow {
         self.reset_timeline_scroll_state();
     }
 
+fn bench_composer_paste_payload(step: u64) -> String {
+    const BLOCK: &str = "Release checklist:\n- Verify migration status for all regions.\n- Confirm roll-forward and rollback scripts are in the runbook.\n- Coordinate with QA on smoke-test coverage before cutover.\n- Update incident channel with timestamps and owners.\n\nNotes:\nThe previous deployment hit a warmup bottleneck on cold cache reads.\nWe should stage traffic in three waves and validate query latency after each wave.\n";
+    let repeat = 4 + ((step / 48) as usize % 4);
+    let mut text = String::with_capacity((BLOCK.len() + 32) * repeat);
+    for ix in 0..repeat {
+        text.push_str(BLOCK);
+        text.push_str(&format!("Chunk {} / {}\n\n", ix + 1, repeat));
+    }
+    text
+}
+
     fn sidebar_view_state(&self) -> SidebarViewState {
         SidebarViewState {
             sidebar: self.models.sidebar.clone(),
@@ -1868,7 +1978,8 @@ impl AppWindow {
         if self.timeline_list_state.item_count() == target_len {
             return;
         }
-        let was_near_bottom = self.timeline_is_near_bottom();
+        let was_near_bottom =
+            self.timeline_is_near_bottom() && !self.jump_to_message_active;
         let prev = self.timeline_list_state.logical_scroll_top();
         self.timeline_list_state.reset(target_len);
         if target_len == 0 {
@@ -2265,7 +2376,7 @@ impl AppWindow {
         if sidebar_sections_changed || workspace_changed {
             self.models.apply_saved_sidebar_order();
         }
-        if sidebar_sections_changed || route_changed {
+        if route_changed {
             self.models.expand_section_for_route(&next_route);
         }
 
@@ -2325,12 +2436,13 @@ impl AppWindow {
             self.pending_older_scroll_seq = None;
             self.suppress_next_timeline_bottom_snap = false;
         }
-        let was_near_bottom_before_sync = self.timeline_is_near_bottom();
+        let was_near_bottom_before_sync =
+            self.timeline_is_near_bottom() && !self.jump_to_message_active;
         let previous_has_pinned_banner = self.models.conversation.pinned_message.is_some();
         let timeline_anchor_message_id = if !conversation_changed
             && self.pending_older_scroll_anchor.is_none()
             && self.models.timeline.pending_scroll_target.is_none()
-            && !self.timeline_is_near_bottom()
+            && (!self.timeline_is_near_bottom() || self.jump_to_message_active)
         {
             self.first_visible_timeline_message_id()
         } else {
@@ -2383,6 +2495,7 @@ impl AppWindow {
                 })
                 .collect();
             self.sync_cache.timeline_emoji_sig = Some(timeline_emoji_sig);
+            self.models.refresh_quick_react_recent();
         }
         let timeline_reactions_sig = timeline_reactions_signature(
             Some(&self.models.timeline.conversation_id),
@@ -2639,11 +2752,11 @@ impl AppWindow {
                     .get(conversation_id)
                     .and_then(|pinned| pinned.items.first().cloned())
                     .filter(|pinned_item| {
-                        self
-                            .models
+                        self.models
                             .settings
                             .dismissed_pinned_items
-                            .get(&conversation_id.0).is_none_or(|dismissed_id| dismissed_id != &pinned_item.id)
+                            .get(&conversation_id.0)
+                            .is_none_or(|dismissed_id| dismissed_id != &pinned_item.id)
                     })
             });
         let has_pinned_banner = self.models.conversation.pinned_message.is_some();
@@ -2873,6 +2986,20 @@ impl AppWindow {
             self.scroll_timeline_list_to_bottom();
         }
 
+        // Clear jump_to_message_active once the list layout is settled and the pixel-based
+        // near-bottom check is reliable (max_offset > 0 means the list has been painted).
+        if self.jump_to_message_active
+            && (conversation_changed
+                || (self.models.timeline.pending_scroll_target.is_none()
+                    && self
+                        .timeline_list_state
+                        .max_offset_for_scrollbar()
+                        .height
+                        > px(0.)))
+        {
+            self.jump_to_message_active = false;
+        }
+
         let elapsed = t0.elapsed();
         self.perf_harness
             .record_duration(PerfTimer::SyncModelsFromStore, elapsed);
@@ -2960,6 +3087,8 @@ impl AppWindow {
         cx: &mut Context<Self>,
     ) {
         self.capture_live_inputs(cx);
+        self.models.dismiss_overlays();
+        self.jump_to_message_active = false;
         let route_changed = self.models.navigation.current != route;
         if route_changed {
             self.models.navigate_to(route.clone());
@@ -2978,11 +3107,7 @@ impl AppWindow {
             self.scroll_timeline_list_to_bottom();
         }
         self.sync_inputs_from_models(cx);
-        if matches!(route, Route::Channel { .. } | Route::DirectMessage { .. }) {
-            window.focus(&self.composer_input.focus_handle(cx));
-        } else {
-            window.focus(&self.focus_handle);
-        }
+        self.restore_chat_focus(window, cx);
         self.refresh(cx);
     }
 
@@ -2999,10 +3124,14 @@ impl AppWindow {
         if route_changed {
             self.models.navigate_to(route.clone());
         }
-        self.dispatch_ui_action(UiAction::Navigate(route.clone()));
+        // Use NavigateQuiet to set navigation state without triggering LoadConversation.
+        // LoadConversation spawns a background task that sends TimelineReplaced with recent
+        // messages, which can race with JumpToMessage and override the scroll position.
+        self.dispatch_ui_action(UiAction::NavigateQuiet(route.clone()));
         self.models.expand_section_for_route(&route);
         self.models.timeline.pending_scroll_target = Some(message_id.clone());
         self.models.timeline.highlighted_message_id = Some(message_id.clone());
+        self.jump_to_message_active = true;
         if let Some(conversation_id) = self.app_store.snapshot().timeline.conversation_id.clone() {
             self.dispatch_ui_action(UiAction::JumpToMessage {
                 conversation_id,
@@ -3010,12 +3139,17 @@ impl AppWindow {
             });
         }
         self.reset_timeline_scroll_state();
-        // Jump-to-message may load a partial timeline and then later load newer messages.
-        // Those messages are "newer than the anchor", but not "newly arrived".
         self.suppress_next_timeline_unseen_increment = true;
         self.reset_thread_scroll_state();
         self.sync_inputs_from_models(cx);
-        window.focus(&self.focus_handle);
+        if route_changed {
+            // Trigger the full conversation load (emojis, profiles, team roles) now that
+            // JumpToMessage has settled the scroll position. The background TimelineReplaced
+            // from this load will merge with the jump-centered messages; the
+            // jump_to_message_active flag prevents scroll-to-bottom overrides.
+            self.dispatch_ui_action(UiAction::Navigate(route.clone()));
+        }
+        self.restore_chat_focus(window, cx);
         self.refresh(cx);
     }
 
@@ -3074,7 +3208,7 @@ impl AppWindow {
                 self.scroll_timeline_list_to_bottom();
             }
             self.sync_inputs_from_models(cx);
-            window.focus(&self.focus_handle);
+            self.restore_chat_focus(window, cx);
             self.refresh(cx);
         }
     }
@@ -3091,7 +3225,7 @@ impl AppWindow {
                 self.scroll_timeline_list_to_bottom();
             }
             self.sync_inputs_from_models(cx);
-            window.focus(&self.focus_handle);
+            self.restore_chat_focus(window, cx);
             self.refresh(cx);
         }
     }
@@ -3234,7 +3368,7 @@ impl AppWindow {
     pub(crate) fn open_thread(
         &mut self,
         root_id: MessageId,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         self.capture_live_inputs(cx);
@@ -3255,6 +3389,7 @@ impl AppWindow {
         self.reset_thread_scroll_state();
         self.pending_thread_scroll_to_bottom = true;
         self.sync_inputs_from_models(cx);
+        window.focus(&self.thread_input.focus_handle(cx));
         self.refresh(cx);
     }
 
@@ -3303,18 +3438,20 @@ impl AppWindow {
         self.refresh(cx);
     }
 
+    fn timeline_interactions_blocked_by_overlay(&self) -> bool {
+        timeline_interactions_blocked_by_overlay_state(
+            &self.models.overlay,
+            self.keybase_inspector.open,
+        )
+    }
+
     pub(crate) fn timeline_scrolled(
         &mut self,
         event: &ScrollWheelEvent,
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.models.overlay.quick_switcher_open
-            || self.models.overlay.command_palette_open
-            || self.models.overlay.emoji_picker_open
-            || self.models.overlay.profile_card_user_id.is_some()
-            || self.keybase_inspector.open
-        {
+        if self.timeline_interactions_blocked_by_overlay() {
             return;
         }
         let boost = match event.delta {
@@ -3372,17 +3509,22 @@ impl AppWindow {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.models.overlay.quick_switcher_open
-            || self.models.overlay.command_palette_open
-            || self.models.overlay.emoji_picker_open
-            || self.models.overlay.profile_card_user_id.is_some()
-            || self.keybase_inspector.open
-        {
+        if self.timeline_interactions_blocked_by_overlay() {
             return;
         }
         if self.sync_scroll_indicators() {
             self.refresh(cx);
         }
+    }
+
+    pub(crate) fn profile_scrolled(
+        &mut self,
+        _: &ScrollWheelEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.perf_harness.record_refresh();
+        cx.notify();
     }
 
     fn request_timeline_older_page_if_needed(&mut self) -> bool {
@@ -3660,28 +3802,6 @@ impl AppWindow {
         self.refresh(cx);
     }
 
-    pub(crate) fn cycle_density(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
-        self.models.cycle_density();
-        self.persist_settings();
-        self.refresh(cx);
-    }
-
-    pub(crate) fn toggle_reduced_motion(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
-        self.models.toggle_reduced_motion();
-        self.persist_settings();
-        self.refresh(cx);
-    }
-
-    pub(crate) fn toggle_right_pane_setting(
-        &mut self,
-        _window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.models.toggle_right_pane_setting();
-        self.persist_settings();
-        self.refresh(cx);
-    }
-
     pub(crate) fn focus_search_input(
         &mut self,
         _: &ClickEvent,
@@ -3743,6 +3863,34 @@ impl AppWindow {
         cx: &mut Context<Self>,
     ) {
         window.focus(&self.composer_input.focus_handle(cx));
+    }
+
+    pub(crate) fn restore_chat_focus(&self, window: &mut Window, cx: &mut Context<Self>) {
+        let o = &self.models.overlay;
+        if o.quick_switcher_open
+            || o.command_palette_open
+            || o.emoji_picker_open
+            || o.new_chat_open
+            || o.fullscreen_image.is_some()
+            || o.file_upload_lightbox.is_some()
+            || o.profile_card_user_id.is_some()
+            || self.keybase_inspector.open
+            || self.splash_open
+        {
+            return;
+        }
+        if !matches!(
+            self.models.navigation.current,
+            Route::Channel { .. } | Route::DirectMessage { .. }
+        ) {
+            window.focus(&self.focus_handle);
+            return;
+        }
+        if self.models.navigation.right_pane == RightPaneMode::Thread {
+            window.focus(&self.thread_input.focus_handle(cx));
+        } else {
+            window.focus(&self.composer_input.focus_handle(cx));
+        }
     }
 
     pub(crate) fn focus_thread_input(
@@ -4062,6 +4210,7 @@ impl AppWindow {
         target: UploadTarget,
         cx: &mut Context<Self>,
     ) {
+        self.clear_hovered_message(cx);
         if !self.models.open_file_upload_lightbox(paths, target) {
             return;
         }
@@ -4249,8 +4398,14 @@ impl AppWindow {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.models.overlay.reaction_target_message_id.is_some() {
-            self.composer_insert_emoji_item(item, cx);
+        if let Some(message_id) = self.models.overlay.reaction_target_message_id.clone() {
+            let (emoji_text, recent_alias) = self.emoji_picker_insert_text(&item);
+            let emoji = emoji_text.trim().to_string();
+            self.models.add_recent_emoji_alias(recent_alias);
+            self.persist_settings();
+            self.models.overlay.emoji_picker_open = false;
+            self.models.overlay.reaction_target_message_id = None;
+            self.quick_react(message_id, emoji, cx);
             return;
         }
         let thread_focused = self.thread_input.focus_handle(cx).is_focused(window);
@@ -4378,12 +4533,24 @@ impl AppWindow {
         height: Option<u32>,
         cx: &mut Context<Self>,
     ) {
+        self.clear_hovered_message(cx);
         self.models
             .open_image_lightbox(source, caption, width, height);
         self.refresh(cx);
     }
 
+    pub(crate) fn open_video_in_native_player(path: &str) {
+        let _ = std::process::Command::new("open").arg(path).spawn();
+    }
+
+    const HOVER_SETTLE_DELAY: Duration = Duration::from_millis(50);
+    const HOVER_DISMISS_RADIUS: f32 = 50.0;
+
     pub(crate) fn set_hovered_message(&mut self, message_id: MessageId, cx: &mut Context<Self>) {
+        if self.timeline_interactions_blocked_by_overlay() {
+            self.clear_hovered_message(cx);
+            return;
+        }
         let mut needs_refresh = false;
         if self.models.overlay.sidebar_hover_tooltip.is_some() {
             self.models.hide_sidebar_hover_tooltip();
@@ -4398,8 +4565,11 @@ impl AppWindow {
             self.models.timeline.hovered_message_id = Some(message_id);
             self.models.timeline.hovered_message_is_thread = None;
             self.models.timeline.hovered_message_anchor_x = None;
+            self.models.timeline.hovered_message_anchor_y = None;
             self.models.timeline.hovered_message_window_left = None;
+            self.models.timeline.hovered_message_window_top = None;
             self.models.timeline.hovered_message_window_width = None;
+            self.models.timeline.hover_toolbar_settled = false;
             needs_refresh = true;
         }
         if needs_refresh {
@@ -4411,9 +4581,14 @@ impl AppWindow {
         &mut self,
         message_id: MessageId,
         cursor_x: f32,
+        cursor_y: f32,
         is_thread: bool,
         cx: &mut Context<Self>,
     ) {
+        if self.timeline_interactions_blocked_by_overlay() {
+            self.clear_hovered_message(cx);
+            return;
+        }
         let mut needs_refresh = false;
         if self.models.overlay.sidebar_hover_tooltip.is_some() {
             self.models.hide_sidebar_hover_tooltip();
@@ -4425,20 +4600,58 @@ impl AppWindow {
             self.models.hide_reaction_hover_tooltip();
             needs_refresh = true;
         }
+
         if message_changed {
-            self.models.timeline.hovered_message_id = Some(message_id);
+            self.models.timeline.hovered_message_id = Some(message_id.clone());
             self.models.timeline.hovered_message_is_thread = Some(is_thread);
             self.models.timeline.hovered_message_anchor_x = Some(cursor_x);
+            self.models.timeline.hovered_message_anchor_y = Some(cursor_y);
             self.models.timeline.hovered_message_window_left = None;
+            self.models.timeline.hovered_message_window_top = None;
             self.models.timeline.hovered_message_window_width = None;
+            self.models.timeline.hover_toolbar_settled = false;
             needs_refresh = true;
-        } else if self.models.timeline.hovered_message_anchor_x.is_none() {
+            self.schedule_hover_settle(cx);
+        } else if self.models.timeline.hover_toolbar_settled {
+            let anchor_x = self.models.timeline.hovered_message_anchor_x.unwrap_or(0.0);
+            let anchor_y = self.models.timeline.hovered_message_anchor_y.unwrap_or(0.0);
+            let dx = cursor_x - anchor_x;
+            let dy = cursor_y - anchor_y;
+            let distance = (dx * dx + dy * dy).sqrt();
+            if distance > Self::HOVER_DISMISS_RADIUS {
+                self.models.timeline.hover_toolbar_settled = false;
+                self.models.timeline.hovered_message_anchor_x = Some(cursor_x);
+                self.models.timeline.hovered_message_anchor_y = Some(cursor_y);
+                needs_refresh = true;
+                self.schedule_hover_settle(cx);
+            }
+        } else {
             self.models.timeline.hovered_message_anchor_x = Some(cursor_x);
-            needs_refresh = true;
+            self.models.timeline.hovered_message_anchor_y = Some(cursor_y);
+            self.schedule_hover_settle(cx);
         }
         if needs_refresh {
             self.refresh(cx);
         }
+    }
+
+    fn schedule_hover_settle(&mut self, cx: &mut Context<Self>) {
+        self.hover_settle_seq = self.hover_settle_seq.wrapping_add(1);
+        let seq = self.hover_settle_seq;
+        cx.spawn(move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
+            let background = cx.background_executor().clone();
+            let mut async_app = cx.clone();
+            async move {
+                background.timer(Self::HOVER_SETTLE_DELAY).await;
+                let _ = this.update(&mut async_app, |this, cx| {
+                    if this.hover_settle_seq == seq {
+                        this.models.timeline.hover_toolbar_settled = true;
+                        this.refresh(cx);
+                    }
+                });
+            }
+        })
+        .detach();
     }
 
     pub(crate) fn record_hovered_message_layout(
@@ -4446,6 +4659,7 @@ impl AppWindow {
         message_id: MessageId,
         is_thread: bool,
         window_left: f32,
+        window_top: f32,
         window_width: f32,
         cx: &mut Context<Self>,
     ) {
@@ -4462,14 +4676,36 @@ impl AppWindow {
             || self
                 .models
                 .timeline
+                .hovered_message_window_top
+                .is_none_or(|y| (y - window_top).abs() > 0.5)
+            || self
+                .models
+                .timeline
                 .hovered_message_window_width
                 .is_none_or(|w| (w - window_width).abs() > 0.5);
         if !needs_refresh {
             return;
         }
         self.models.timeline.hovered_message_window_left = Some(window_left);
+        self.models.timeline.hovered_message_window_top = Some(window_top);
         self.models.timeline.hovered_message_window_width = Some(window_width);
         cx.notify();
+    }
+
+    pub(crate) fn cursor_over_selectable_link(
+        &self,
+        position: gpui::Point<gpui::Pixels>,
+        cx: &Context<Self>,
+    ) -> bool {
+        self.selectable_texts
+            .values()
+            .any(|entity| entity.read(cx).is_position_over_link(position))
+    }
+
+    pub(crate) fn any_text_selected(&self, cx: &Context<Self>) -> bool {
+        self.selectable_texts
+            .values()
+            .any(|entity| entity.read(cx).has_selection())
     }
 
     pub(crate) fn clear_hovered_message(&mut self, cx: &mut Context<Self>) {
@@ -4478,8 +4714,12 @@ impl AppWindow {
             self.models.timeline.hovered_message_id = None;
             self.models.timeline.hovered_message_is_thread = None;
             self.models.timeline.hovered_message_anchor_x = None;
+            self.models.timeline.hovered_message_anchor_y = None;
             self.models.timeline.hovered_message_window_left = None;
+            self.models.timeline.hovered_message_window_top = None;
             self.models.timeline.hovered_message_window_width = None;
+            self.models.timeline.hover_toolbar_settled = false;
+            self.hover_settle_seq = self.hover_settle_seq.wrapping_add(1);
             needs_refresh = true;
         }
         if self.models.overlay.reaction_hover_tooltip.is_some() {
@@ -4718,7 +4958,7 @@ impl AppWindow {
     }
 
     pub(crate) fn copy_message_link(&mut self, message_id: MessageId, cx: &mut Context<Self>) {
-        let link = self.models.timeline.rows.iter().find_map(|row| match row {
+        let stored_link = self.models.timeline.rows.iter().find_map(|row| match row {
             crate::models::timeline_model::TimelineRow::Message(message_row)
                 if message_row.message.id == message_id =>
             {
@@ -4727,14 +4967,48 @@ impl AppWindow {
             _ => None,
         });
 
-        if let Some(link) = link {
-            cx.write_to_clipboard(ClipboardItem::new_string(link));
-            self.models.push_toast(
-                "Copied message link",
-                Some(ToastAction::OpenCurrentConversation),
-            );
-            self.refresh(cx);
+        let link = stored_link
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| self.build_permalink_from_conversation(&message_id));
+
+        cx.write_to_clipboard(ClipboardItem::new_string(link));
+        self.models.push_toast(
+            "Copied message link",
+            Some(ToastAction::OpenCurrentConversation),
+        );
+        self.refresh(cx);
+    }
+
+    fn build_permalink_from_conversation(&self, message_id: &MessageId) -> String {
+        let summary = &self.models.conversation.summary;
+        match &summary.group {
+            Some(group) => format!(
+                "keybase://chat/{}#{}/{}",
+                group.display_name, summary.topic, message_id.0
+            ),
+            None => format!("keybase://chat/{}/{}", summary.topic, message_id.0),
         }
+    }
+
+    pub(crate) fn copy_message_text(&mut self, message_id: MessageId, cx: &mut Context<Self>) {
+        let text = self.models.timeline.rows.iter().find_map(|row| match row {
+            crate::models::timeline_model::TimelineRow::Message(message_row)
+                if message_row.message.id == message_id =>
+            {
+                message_row.message.source_text.clone()
+            }
+            _ => None,
+        });
+
+        if let Some(text) = text.filter(|s| !s.is_empty()) {
+            cx.write_to_clipboard(ClipboardItem::new_string(text));
+            self.models
+                .push_toast("Copied message text", None);
+        } else {
+            self.models
+                .push_toast("No text to copy", None);
+        }
+        self.refresh(cx);
     }
 
     pub(crate) fn open_files_pane(&mut self, cx: &mut Context<Self>) {
@@ -4813,6 +5087,9 @@ impl AppWindow {
             self.dispatch_ui_action(UiAction::CloseNewChat);
         }
         self.models.toggle_quick_switcher();
+        if self.models.overlay.quick_switcher_open {
+            self.clear_hovered_message(cx);
+        }
         self.quick_switcher_query_seq = self.quick_switcher_query_seq.wrapping_add(1);
         self.sync_inputs_from_models(cx);
         self.refresh(cx);
@@ -4879,6 +5156,9 @@ impl AppWindow {
             self.dispatch_ui_action(UiAction::CloseNewChat);
         }
         self.models.toggle_command_palette();
+        if self.models.overlay.command_palette_open {
+            self.clear_hovered_message(cx);
+        }
         self.refresh(cx);
     }
 
@@ -5155,6 +5435,15 @@ impl AppWindow {
         cx: &mut Context<Self>,
     ) {
         window.prevent_default();
+        cx.stop_propagation();
+    }
+
+    pub(crate) fn consume_mouse_move(
+        &mut self,
+        _: &MouseMoveEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         cx.stop_propagation();
     }
 
@@ -5454,6 +5743,11 @@ impl AppWindow {
             return;
         };
         self.models.quick_switcher.selected_index = index;
+        if result.kind != QuickSwitcherResultKind::Message {
+            self.models
+                .record_quick_switcher_selection_affinity(&result.conversation_id);
+            self.persist_settings();
+        }
         if let Some(message_id) = result.message_id {
             self.navigate_to_message(result.route, message_id, window, cx);
         } else {
@@ -5706,6 +6000,20 @@ impl AppWindow {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.models.overlay.file_upload_lightbox.is_some() {
+            let total = self
+                .models
+                .overlay
+                .file_upload_lightbox
+                .as_ref()
+                .map_or(0, |lb| lb.candidates.len());
+            if total > 1 {
+                self.file_upload_send_all(window, cx);
+            } else {
+                self.file_upload_send_current(window, cx);
+            }
+            return;
+        }
         if self.models.overlay.quick_switcher_open {
             if let Some(selected) = self.models.quick_switcher_selected_result().cloned() {
                 if selected.kind != QuickSwitcherResultKind::Message {
@@ -5841,7 +6149,7 @@ impl AppWindow {
         if self.models.overlay.quick_switcher_open {
             window.focus(&self.quick_switcher_input.focus_handle(cx));
         } else {
-            window.focus(&self.focus_handle);
+            self.restore_chat_focus(window, cx);
         }
     }
 
@@ -5961,10 +6269,19 @@ impl AppWindow {
         self.dismiss_overlays(cx);
         if should_close_right_pane {
             self.close_right_pane(window, cx);
-            window.focus(&self.focus_handle);
-        } else if had_overlay {
-            window.focus(&self.focus_handle);
         }
+        if had_overlay || should_close_right_pane {
+            self.restore_chat_focus(window, cx);
+        }
+    }
+
+    fn dismiss_hover_toolbar_action(
+        &mut self,
+        _: &commands::DismissHoverToolbar,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.clear_hovered_message(cx);
     }
 }
 
@@ -5975,8 +6292,11 @@ impl Render for AppWindow {
             self.models.timeline.hovered_message_id = None;
             self.models.timeline.hovered_message_is_thread = None;
             self.models.timeline.hovered_message_anchor_x = None;
+            self.models.timeline.hovered_message_anchor_y = None;
             self.models.timeline.hovered_message_window_left = None;
+            self.models.timeline.hovered_message_window_top = None;
             self.models.timeline.hovered_message_window_width = None;
+            self.models.timeline.hover_toolbar_settled = false;
         }
         let resolved_theme = resolve_theme(&self.models.settings.theme_mode, window.appearance());
         let theme_changed = self.resolved_theme != resolved_theme;
@@ -6006,6 +6326,7 @@ impl Render for AppWindow {
                     &mut self.selectable_texts,
                     &self.thread_input,
                     &self.thread_scroll,
+                    &self.profile_scroll,
                     self.thread_unseen_count,
                     cx,
                 )
@@ -6060,6 +6381,7 @@ impl Render for AppWindow {
                 .on_action(cx.listener(Self::toggle_splash_screen_action))
                 .on_action(cx.listener(Self::toggle_benchmark_capture_action))
                 .on_action(cx.listener(Self::dismiss_overlays_action))
+                .on_action(cx.listener(Self::dismiss_hover_toolbar_action))
                 .on_action(cx.listener(Self::open_url_action))
                 .on_drag_move::<RightPaneResizeDrag>(
                     cx.listener(Self::update_thread_resize_drag_on_drag),
@@ -6280,7 +6602,7 @@ fn render_sidebar_hover_tooltip(
         .top(px(clamped_y))
         .w(px(width_px))
         .rounded_md()
-        .bg(panel_surface())
+        .bg(tint(panel_bg(), 0.92))
         .border_1()
         .border_color(shell_border_strong())
         .px_2()
@@ -6314,7 +6636,7 @@ fn render_reaction_hover_tooltip(
         .top(px(clamped_y))
         .w(px(width_px))
         .rounded_md()
-        .bg(panel_surface())
+        .bg(tint(panel_bg(), 0.92))
         .border_1()
         .border_color(shell_border_strong())
         .px_2()
@@ -7507,6 +7829,13 @@ fn env_flag(name: &str) -> bool {
         .unwrap_or(false)
 }
 
+fn env_nonempty(name: &str) -> Option<String> {
+    env::var(name)
+        .ok()
+        .map(|raw| raw.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
 fn env_usize(name: &str) -> Option<usize> {
     env::var(name)
         .ok()
@@ -7529,13 +7858,29 @@ fn route_for_conversation_id(
     }
 }
 
+fn timeline_interactions_blocked_by_overlay_state(
+    overlay: &crate::models::overlay_model::OverlayModel,
+    keybase_inspector_open: bool,
+) -> bool {
+    overlay.quick_switcher_open
+        || overlay.command_palette_open
+        || overlay.emoji_picker_open
+        || overlay.fullscreen_image.is_some()
+        || overlay.file_upload_lightbox.is_some()
+        || overlay.profile_card_user_id.is_some()
+        || keybase_inspector_open
+}
+
 #[cfg(test)]
 mod tests {
-    use super::latest_timeline_snapshot_message_id;
+    use super::{
+        latest_timeline_snapshot_message_id, timeline_interactions_blocked_by_overlay_state,
+    };
     use crate::domain::{
         ids::{ConversationId, MessageId, UserId},
         message::{ChatEvent, MessageFragment, MessageRecord, MessageSendState},
     };
+    use crate::models::overlay_model::OverlayModel;
 
     fn test_message(id: &str, event: Option<ChatEvent>) -> MessageRecord {
         MessageRecord {
@@ -7555,6 +7900,23 @@ mod tests {
             thread_reply_count: 0,
             send_state: MessageSendState::Sent,
             edited: None,
+        }
+    }
+
+    fn test_overlay() -> OverlayModel {
+        OverlayModel {
+            new_chat_open: false,
+            quick_switcher_open: false,
+            command_palette_open: false,
+            emoji_picker_open: false,
+            reaction_target_message_id: None,
+            fullscreen_image: None,
+            file_upload_lightbox: None,
+            active_modal: None,
+            profile_card_user_id: None,
+            profile_card_position: None,
+            sidebar_hover_tooltip: None,
+            reaction_hover_tooltip: None,
         }
     }
 
@@ -7578,5 +7940,47 @@ mod tests {
         let latest =
             latest_timeline_snapshot_message_id(&messages).expect("expected latest message id");
         assert_eq!(latest.0, "10");
+    }
+
+    #[test]
+    fn timeline_interactions_blocked_by_overlay_state_respects_overlay_flags() {
+        let overlay = test_overlay();
+        assert!(!timeline_interactions_blocked_by_overlay_state(
+            &overlay, false
+        ));
+
+        let mut quick_switcher_overlay = test_overlay();
+        quick_switcher_overlay.quick_switcher_open = true;
+        assert!(timeline_interactions_blocked_by_overlay_state(
+            &quick_switcher_overlay,
+            false
+        ));
+
+        let mut palette_overlay = test_overlay();
+        palette_overlay.command_palette_open = true;
+        assert!(timeline_interactions_blocked_by_overlay_state(
+            &palette_overlay,
+            false
+        ));
+
+        let mut emoji_overlay = test_overlay();
+        emoji_overlay.emoji_picker_open = true;
+        assert!(timeline_interactions_blocked_by_overlay_state(
+            &emoji_overlay,
+            false
+        ));
+
+        let mut profile_overlay = test_overlay();
+        profile_overlay.profile_card_user_id = Some(UserId::new("bob"));
+        assert!(timeline_interactions_blocked_by_overlay_state(
+            &profile_overlay,
+            false
+        ));
+
+        let inspector_overlay = test_overlay();
+        assert!(timeline_interactions_blocked_by_overlay_state(
+            &inspector_overlay,
+            true
+        ));
     }
 }

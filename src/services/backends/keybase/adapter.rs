@@ -68,6 +68,7 @@ use super::{
 };
 
 use crate::services::local_store::paths as store_paths;
+use crate::util::video_decoder::extract_video_thumbnail_to_file;
 
 pub struct KeybaseBackend {
     backend_id: BackendId,
@@ -83,6 +84,7 @@ pub struct KeybaseBackend {
 struct PendingSendMeta {
     op_id: OpId,
     client_message_id: ClientMessageId,
+    local_attachment_path: Option<String>,
 }
 
 impl KeybaseBackend {
@@ -248,12 +250,13 @@ impl ChatBackend for KeybaseBackend {
                 }];
                 if let Ok(cached_emojis) =
                     self.local_store.load_conversation_emojis(&conversation_id)
-                    && !cached_emojis.is_empty() {
-                        events.push(BackendEvent::ConversationEmojisSynced {
-                            conversation_id: conversation_id.clone(),
-                            emojis: cached_emoji_entries(&cached_emojis),
-                        });
-                    }
+                    && !cached_emojis.is_empty()
+                {
+                    events.push(BackendEvent::ConversationEmojisSynced {
+                        conversation_id: conversation_id.clone(),
+                        emojis: cached_emoji_entries(&cached_emojis),
+                    });
+                }
                 if let Some(team_roles_event) =
                     team_roles_event_from_cache(&self.local_store, &conversation_id)
                 {
@@ -822,15 +825,17 @@ impl ChatBackend for KeybaseBackend {
                     match send_result {
                         Ok(response) => {
                             if let Some(outbox_id) = extract_outbox_id_from_post_response(&response)
-                                && let Ok(mut pending) = self.pending_outbox_sends.lock() {
-                                    pending.insert(
-                                        outbox_id,
-                                        PendingSendMeta {
-                                            op_id,
-                                            client_message_id,
-                                        },
-                                    );
-                                }
+                                && let Ok(mut pending) = self.pending_outbox_sends.lock()
+                            {
+                                pending.insert(
+                                    outbox_id,
+                                    PendingSendMeta {
+                                        op_id,
+                                        client_message_id,
+                                        local_attachment_path: None,
+                                    },
+                                );
+                            }
                         }
                         Err(error) => {
                             emitted.push(BackendEvent::MessageSendFailed {
@@ -911,15 +916,17 @@ impl ChatBackend for KeybaseBackend {
                     match send_result {
                         Ok(response) => {
                             if let Some(outbox_id) = extract_outbox_id_from_post_response(&response)
-                                && let Ok(mut pending) = self.pending_outbox_sends.lock() {
-                                    pending.insert(
-                                        outbox_id,
-                                        PendingSendMeta {
-                                            op_id,
-                                            client_message_id,
-                                        },
-                                    );
-                                }
+                                && let Ok(mut pending) = self.pending_outbox_sends.lock()
+                            {
+                                pending.insert(
+                                    outbox_id,
+                                    PendingSendMeta {
+                                        op_id,
+                                        client_message_id,
+                                        local_attachment_path: Some(local_path.clone()),
+                                    },
+                                );
+                            }
                         }
                         Err(error) => {
                             emitted.push(BackendEvent::MessageSendFailed {
@@ -1066,14 +1073,20 @@ impl ChatBackend for KeybaseBackend {
                         )
                         .await
                     });
-                    if let Err(error) = delete_result {
-                        warn!(
-                            target: "zbase.keybase.delete_message",
-                            conversation_id = %conversation_id.0,
-                            message_id = target_message_id,
-                            %error,
-                            "failed to delete message"
-                        );
+                    match delete_result {
+                        Ok(_) => {
+                            let msg_id = MessageId::new(target_message_id.to_string());
+                            let _ = self.local_store.delete_message(&conversation_id, &msg_id);
+                        }
+                        Err(error) => {
+                            warn!(
+                                target: "zbase.keybase.delete_message",
+                                conversation_id = %conversation_id.0,
+                                message_id = target_message_id,
+                                %error,
+                                "failed to delete message"
+                            );
+                        }
                     }
                 } else {
                     warn!(
@@ -1720,22 +1733,21 @@ fn run_listener(
                     {
                         break;
                     }
-                    if should_refresh_inbox
-                        && try_mark_inbox_unread_refresh_in_flight() {
-                            let sender_for_refresh = sender.clone();
-                            let local_store_for_refresh = Arc::clone(&local_store);
-                            let _ = task_runtime::spawn_task(
-                                TaskPriority::Low,
-                                Some("refresh_inbox_unread".to_string()),
-                                move || {
-                                    refresh_inbox_unread_state(
-                                        &sender_for_refresh,
-                                        &local_store_for_refresh,
-                                    );
-                                    clear_inbox_unread_refresh_in_flight();
-                                },
-                            );
-                        }
+                    if should_refresh_inbox && try_mark_inbox_unread_refresh_in_flight() {
+                        let sender_for_refresh = sender.clone();
+                        let local_store_for_refresh = Arc::clone(&local_store);
+                        let _ = task_runtime::spawn_task(
+                            TaskPriority::Low,
+                            Some("refresh_inbox_unread".to_string()),
+                            move || {
+                                refresh_inbox_unread_state(
+                                    &sender_for_refresh,
+                                    &local_store_for_refresh,
+                                );
+                                clear_inbox_unread_refresh_in_flight();
+                            },
+                        );
+                    }
                     for (conversation_id, users) in parse_typing_updates_from_notify(&event) {
                         if sender
                             .send(BackendEvent::TypingUpdated {
@@ -1808,6 +1820,14 @@ fn run_listener(
                                     live_message.conversation_id.clone(),
                                 );
                             }
+                            if let Some(ref meta) = pending_send_meta {
+                                if let Some(ref local_path) = meta.local_attachment_path {
+                                    stamp_local_attachment_path(
+                                        &mut live_message,
+                                        local_path,
+                                    );
+                                }
+                            }
                             ingest_message_record(
                                 Some(&sender),
                                 &local_store,
@@ -1835,18 +1855,18 @@ fn run_listener(
                                     std::slice::from_ref(&live_message),
                                 )
                             };
-                            if let Some(pending_send) = pending_send_meta
-                                && sender
+                            if let Some(pending_send) = pending_send_meta {
+                                if sender
                                     .send(BackendEvent::MessageSendConfirmed {
                                         op_id: pending_send.op_id,
                                         client_message_id: pending_send.client_message_id,
-                                        server_message: live_message.clone(),
+                                        server_message: live_message,
                                     })
                                     .is_err()
-                            {
-                                break;
-                            }
-                            if sender
+                                {
+                                    break;
+                                }
+                            } else if sender
                                 .send(BackendEvent::MessageUpserted(live_message))
                                 .is_err()
                             {
@@ -1865,7 +1885,11 @@ fn run_listener(
                         break;
                     }
                 }
-                send_internal(&sender, "zbase.internal.notification_loop_ended", Value::Nil);
+                send_internal(
+                    &sender,
+                    "zbase.internal.notification_loop_ended",
+                    Value::Nil,
+                );
             }
             Err(error) => {
                 warn!("keybase socket connect failed: {error}");
@@ -4157,7 +4181,10 @@ fn run_load_conversation(
             let reaction_hydrate_ms = reaction_hydrate_started.elapsed().as_millis();
             let attachment_hydration_candidates = messages
                 .iter()
-                .filter(|message| message_needs_image_attachment_hydration(message))
+                .filter(|message| {
+                    message_needs_image_attachment_hydration(message)
+                        || message_needs_video_attachment_hydration(message)
+                })
                 .map(|message| message.id.clone())
                 .collect::<Vec<_>>();
             let attachment_hydration_candidate_count = attachment_hydration_candidates.len();
@@ -4363,7 +4390,10 @@ fn run_hydrate_timeline_attachments(
                 .ok()
                 .flatten()
         })
-        .filter(message_needs_image_attachment_hydration)
+        .filter(|message| {
+            message_needs_image_attachment_hydration(message)
+                || message_needs_video_attachment_hydration(message)
+        })
         .collect::<Vec<_>>();
     if messages.is_empty() {
         return;
@@ -4373,11 +4403,12 @@ fn run_hydrate_timeline_attachments(
     let hydrate_result = runtime.block_on(async move {
         let transport = FramedMsgpackTransport::connect(&socket_path).await?;
         let mut client = KeybaseRpcClient::new(transport);
+        let message_limit = messages.len();
         let updated_ids = hydrate_attachment_paths_for_messages(
             &mut client,
             &raw_conversation_id,
             &mut messages,
-            ATTACHMENT_DOWNLOAD_LIMIT_PER_PAGE,
+            message_limit,
         )
         .await;
         Ok::<_, io::Error>((messages, updated_ids))
@@ -5583,6 +5614,87 @@ fn refresh_root_descendant_reply_count(
     }
 }
 
+/// Spawn a background thread to download attachments that need hydration for a
+/// live notification message. This ensures images are viewable immediately
+/// instead of requiring a conversation reload.
+fn spawn_live_attachment_hydration(
+    sender: &Sender<BackendEvent>,
+    local_store: &Arc<LocalStore>,
+    message: &MessageRecord,
+) {
+    let needs_image = message_needs_image_attachment_hydration(message);
+    let needs_video = message_needs_video_attachment_hydration(message);
+    if !needs_image && !needs_video {
+        return;
+    }
+    let Some(raw_conversation_id) =
+        conversation_id_to_raw_bytes(&message.conversation_id)
+    else {
+        return;
+    };
+    let Ok(_message_id_i64) = message.id.0.parse::<i64>() else {
+        return;
+    };
+    let sender = sender.clone();
+    let local_store = Arc::clone(local_store);
+    let mut message = message.clone();
+    std::thread::spawn(move || {
+        let Some(path) = socket_path() else { return };
+        let Ok(runtime) = Builder::new_current_thread().enable_all().build() else {
+            return;
+        };
+        runtime.block_on(async {
+            let Ok(transport) = FramedMsgpackTransport::connect(&path).await else {
+                return;
+            };
+            let mut client = KeybaseRpcClient::new(transport);
+            let updated_ids = hydrate_attachment_paths_for_messages(
+                &mut client,
+                &raw_conversation_id,
+                std::slice::from_mut(&mut message),
+                1,
+            )
+            .await;
+            if !updated_ids.is_empty() {
+                let _ = local_store.persist_message(&message);
+                let _ = sender.send(BackendEvent::MessageUpserted(message));
+            }
+        });
+    });
+}
+
+fn conversation_id_to_raw_bytes(id: &ConversationId) -> Option<Vec<u8>> {
+    if let Some(hex) = id.0.strip_prefix("kb_conv:") {
+        return hex_decode(hex);
+    }
+    if id.0.len().is_multiple_of(2) && id.0.chars().all(|ch| ch.is_ascii_hexdigit()) {
+        return hex_decode(&id.0);
+    }
+    None
+}
+
+/// Apply a local file path to a message's image/video attachments so that the
+/// immediately-renderable local copy is persisted alongside the server's URL.
+fn stamp_local_attachment_path(message: &mut MessageRecord, local_path: &str) {
+    let local_source = AttachmentSource::LocalPath(local_path.to_string());
+    for attachment in &mut message.attachments {
+        if matches!(attachment.kind, AttachmentKind::Image | AttachmentKind::Video) {
+            attachment.source = Some(local_source.clone());
+            if attachment.kind == AttachmentKind::Image {
+                if let Some(ref mut preview) = attachment.preview {
+                    preview.source = local_source.clone();
+                } else {
+                    attachment.preview = Some(AttachmentPreview {
+                        source: local_source.clone(),
+                        width: None,
+                        height: None,
+                    });
+                }
+            }
+        }
+    }
+}
+
 fn ingest_message_record(
     sender: Option<&Sender<BackendEvent>>,
     local_store: &Arc<LocalStore>,
@@ -5593,7 +5705,11 @@ fn ingest_message_record(
         spawn_sync_message_emoji_sources(sender, message);
     }
     hydrate_thread_metadata(local_store, message);
+    merge_cached_attachment_paths(local_store, message);
     let _ = local_store.persist_message(message);
+    if let Some(sender) = sender {
+        spawn_live_attachment_hydration(sender, local_store, message);
+    }
     maybe_schedule_reply_ancestor_backfill(
         sender.cloned(),
         Arc::clone(local_store),
@@ -5635,8 +5751,52 @@ fn ingest_message_record_for_timeline_load(
         spawn_sync_message_emoji_sources(sender, message);
     }
     hydrate_thread_metadata(local_store, message);
+    merge_cached_attachment_paths(local_store, message);
     let _ = local_store.persist_message(message);
     enqueue_message_search_upsert(search_index, message);
+}
+
+/// Carry forward locally hydrated attachment paths from a previously cached
+/// message so that a fresh fetch from the service doesn't discard them.
+fn merge_cached_attachment_paths(local_store: &LocalStore, message: &mut MessageRecord) {
+    let cached = match local_store.get_message(&message.conversation_id, &message.id) {
+        Ok(Some(cached)) => cached,
+        _ => return,
+    };
+    if cached.attachments.len() != message.attachments.len() {
+        return;
+    }
+    for (fresh, cached) in message.attachments.iter_mut().zip(cached.attachments.iter()) {
+        if fresh.kind != cached.kind {
+            continue;
+        }
+        let fresh_has_local_source = fresh
+            .source
+            .as_ref()
+            .is_some_and(|s| matches!(s, AttachmentSource::LocalPath(p) if !p.trim().is_empty()));
+        if !fresh_has_local_source {
+            if let Some(AttachmentSource::LocalPath(ref p)) = cached.source {
+                if !p.trim().is_empty() && Path::new(p).exists() {
+                    fresh.source = cached.source.clone();
+                }
+            }
+        }
+        let fresh_has_local_preview = fresh
+            .preview
+            .as_ref()
+            .is_some_and(|preview| {
+                matches!(&preview.source, AttachmentSource::LocalPath(p) if !p.trim().is_empty())
+            });
+        if !fresh_has_local_preview {
+            if let Some(ref preview) = cached.preview {
+                if let AttachmentSource::LocalPath(ref p) = preview.source {
+                    if !p.trim().is_empty() && Path::new(p).exists() {
+                        fresh.preview = cached.preview.clone();
+                    }
+                }
+            }
+        }
+    }
 }
 
 fn resolve_thread_root_for_message(
@@ -7035,12 +7195,14 @@ fn percent_decode(value: &str) -> String {
     let mut out = String::with_capacity(value.len());
     let mut index = 0usize;
     while index < bytes.len() {
-        if bytes[index] == b'%' && index + 2 < bytes.len()
-            && let (Some(hi), Some(lo)) = (from_hex(bytes[index + 1]), from_hex(bytes[index + 2])) {
-                out.push((hi << 4 | lo) as char);
-                index += 3;
-                continue;
-            }
+        if bytes[index] == b'%'
+            && index + 2 < bytes.len()
+            && let (Some(hi), Some(lo)) = (from_hex(bytes[index + 1]), from_hex(bytes[index + 2]))
+        {
+            out.push((hi << 4 | lo) as char);
+            index += 3;
+            continue;
+        }
         out.push(bytes[index] as char);
         index += 1;
     }
@@ -7246,9 +7408,10 @@ fn collect_usernames_from_notify(raw_params: &Value, keys: &[&str]) -> Vec<Strin
         if let Some(Value::Array(values)) = find_value_for_keys(raw_params, &[*key], 0) {
             for value in values {
                 if let Some(name) = value.as_str()
-                    && let Some(normalized) = canonical_username(name) {
-                        usernames.push(normalized);
-                    }
+                    && let Some(normalized) = canonical_username(name)
+                {
+                    usernames.push(normalized);
+                }
             }
         }
     }
@@ -7941,10 +8104,10 @@ fn strip_reaction_delete_tombstones(
                 .ok()
                 .flatten()
                 .is_some()
-            {
-                let _ = local_store.delete_message(conversation_id, &message.id);
-                return false;
-            }
+        {
+            let _ = local_store.delete_message(conversation_id, &message.id);
+            return false;
+        }
         true
     });
 }
@@ -8834,9 +8997,9 @@ fn parse_live_message_from_notify(event: &KeybaseNotifyEvent) -> Option<MessageR
         | KeybaseNotifyEvent::Unknown { raw_params, .. } => raw_params,
     };
 
-    let incoming_message = extract_notify_incoming_message_root(raw_params);
-    let preferred_root = extract_notify_incoming_valid_message(raw_params).unwrap_or(raw_params);
-    let conversation_root = incoming_message.unwrap_or(raw_params);
+    let incoming_message = extract_notify_incoming_message_root(raw_params)?;
+    let preferred_root = extract_notify_incoming_valid_message(raw_params)?;
+    let conversation_root = incoming_message;
     let conv_keys = &[
         "convID",
         "convId",
@@ -8844,24 +9007,24 @@ fn parse_live_message_from_notify(event: &KeybaseNotifyEvent) -> Option<MessageR
         "conversationId",
         "conversation_id",
     ];
-    let conversation_bytes = find_conversation_id_bytes_for_keys(conversation_root, conv_keys, 0)
-        .or_else(|| find_conversation_id_bytes_for_keys(preferred_root, conv_keys, 0))
-        .or_else(|| find_conversation_id_bytes_for_keys(raw_params, conv_keys, 0))?;
+    let conversation_bytes =
+        find_conversation_id_bytes_for_keys(conversation_root, conv_keys, 0)
+            .or_else(|| find_conversation_id_bytes_for_keys(preferred_root, conv_keys, 0))?;
     let conversation_id =
         ConversationId::new(format!("kb_conv:{}", hex_encode(&conversation_bytes)));
-    let message_id = extract_live_event_message_id(preferred_root)
-        .or_else(|| extract_live_event_message_id(raw_params))?;
+    let message_id = extract_live_message_id_from_valid_message(preferred_root)?;
     let message_id_num = message_id.0.parse::<i64>().ok();
     let message_body = map_get_any(preferred_root, &["messageBody", "b"])
-        .or_else(|| find_value_for_keys(preferred_root, &["messageBody", "content"], 0))
-        .or_else(|| find_value_for_keys(raw_params, &["messageBody", "content"], 0));
+        .or_else(|| find_value_for_keys(preferred_root, &["messageBody", "content"], 0));
     let reply_to = extract_reply_to_message_id(preferred_root, message_body)
-        .or_else(|| extract_reply_to_message_id(raw_params, message_body));
-    let thread_reply_count =
-        extract_reply_children_count(preferred_root).max(extract_reply_children_count(raw_params));
-    let attachments = message_body
+        .or_else(|| extract_reply_to_message_id(conversation_root, message_body));
+    let thread_reply_count = extract_reply_children_count(preferred_root)
+        .max(extract_reply_children_count(conversation_root));
+    let mut attachments = message_body
         .map(extract_message_attachments)
         .unwrap_or_default();
+    apply_message_attachment_url_hints(preferred_root, &mut attachments);
+    apply_message_attachment_url_hints(conversation_root, &mut attachments);
     let message_type = message_body.and_then(message_type_from_message_body);
     if is_unset_message_type_only(message_body) {
         return None;
@@ -8877,14 +9040,15 @@ fn parse_live_message_from_notify(event: &KeybaseNotifyEvent) -> Option<MessageR
     let mut link_previews =
         extract_link_previews(preferred_root, message_body, text_body.as_deref());
     if link_previews.is_empty() {
-        link_previews = extract_link_previews(raw_params, message_body, text_body.as_deref());
+        link_previews =
+            extract_link_previews(conversation_root, message_body, text_body.as_deref());
     }
     if text_body.is_none() && attachments.is_empty() && is_unfurl_only_message(message_body) {
         return None;
     }
     let has_unfurl_payload = is_unfurl_only_message(message_body)
         || root_contains_unfurls(preferred_root)
-        || root_contains_unfurls(raw_params);
+        || root_contains_unfurls(conversation_root);
     if attachments.is_empty()
         && text_body
             .as_deref()
@@ -8906,7 +9070,8 @@ fn parse_live_message_from_notify(event: &KeybaseNotifyEvent) -> Option<MessageR
                 .then(|| message_body.and_then(extract_attachment_caption))
                 .flatten()
         })
-        .or_else(|| find_body_string(raw_params, 0).map(|text| text.trim().to_string()))
+        .or_else(|| find_body_string(preferred_root, 0).map(|text| text.trim().to_string()))
+        .or_else(|| find_body_string(conversation_root, 0).map(|text| text.trim().to_string()))
         .filter(|text| !text.is_empty());
     let body = body.unwrap_or_else(|| default_body_for_message(message_body, &attachments));
     if event.is_none()
@@ -8924,13 +9089,13 @@ fn parse_live_message_from_notify(event: &KeybaseNotifyEvent) -> Option<MessageR
         return None;
     }
     let decorated_body = extract_decorated_text_body(preferred_root)
-        .or_else(|| extract_decorated_text_body(raw_params))
+        .or_else(|| extract_decorated_text_body(conversation_root))
         .or_else(|| message_body.and_then(extract_decorated_text_body));
     let mention_metadata = parse_mention_metadata(preferred_root, message_body);
     let mut emoji_source_refs = parse_emoji_source_refs(preferred_root, message_body);
     merge_emoji_source_refs(
         &mut emoji_source_refs,
-        parse_emoji_source_refs(raw_params, message_body),
+        parse_emoji_source_refs(conversation_root, message_body),
     );
     let fragments = fragments_from_message_body(
         &body,
@@ -8941,15 +9106,11 @@ fn parse_live_message_from_notify(event: &KeybaseNotifyEvent) -> Option<MessageR
     let author = map_get_any(preferred_root, &["senderUsername", "su"])
         .and_then(as_str)
         .map(str::to_string)
-        .or_else(|| find_sender_username(raw_params))
-        .or_else(|| {
-            find_value_for_keys(raw_params, &["username"], 0)
-                .and_then(as_str)
-                .map(str::to_string)
-        })
+        .or_else(|| find_sender_username(preferred_root))
+        .or_else(|| find_sender_username(conversation_root))
         .unwrap_or_else(|| "unknown".to_string());
     let timestamp_ms = extract_message_timestamp_ms(preferred_root)
-        .or_else(|| extract_message_timestamp_ms(raw_params));
+        .or_else(|| extract_message_timestamp_ms(conversation_root));
     let server_header_live =
         map_get_any(preferred_root, &["serverHeader", "s"]).unwrap_or(&Value::Nil);
     let (record_id, edited) = if message_type == Some(MESSAGE_TYPE_EDIT) {
@@ -8966,7 +9127,7 @@ fn parse_live_message_from_notify(event: &KeybaseNotifyEvent) -> Option<MessageR
         }
     } else {
         let edited = if is_message_superseded(server_header_live, preferred_root)
-            || is_message_superseded(server_header_live, raw_params)
+            || is_message_superseded(server_header_live, conversation_root)
         {
             let superseded_by =
                 map_get_any(server_header_live, &["supersededBy", "superseded_by", "sb"])
@@ -8978,7 +9139,7 @@ fn parse_live_message_from_notify(event: &KeybaseNotifyEvent) -> Option<MessageR
                             .filter(|&id| id > 0)
                     })
                     .or_else(|| {
-                        map_get_any(raw_params, &["supersedes"])
+                        map_get_any(conversation_root, &["supersedes"])
                             .and_then(as_i64)
                             .filter(|&id| id > 0)
                     })
@@ -9004,7 +9165,10 @@ fn parse_live_message_from_notify(event: &KeybaseNotifyEvent) -> Option<MessageR
         event,
         link_previews,
         permalink: message_id_num
-            .and_then(|message_id_num| build_keybase_permalink(raw_params, message_id_num))
+            .and_then(|message_id_num| {
+                build_keybase_permalink(preferred_root, message_id_num)
+                    .or_else(|| build_keybase_permalink(conversation_root, message_id_num))
+            })
             .unwrap_or_default(),
         fragments,
         source_text: Some(body),
@@ -9086,6 +9250,16 @@ fn extract_live_event_message_id(value: &Value) -> Option<MessageId> {
     find_value_for_keys(value, &["messageID", "messageId", "msgID", "msgId"], 0)
         .or_else(|| find_value_for_keys(value, &["id"], 0))
         .and_then(parse_message_id_from_value)
+}
+
+fn extract_live_message_id_from_valid_message(value: &Value) -> Option<MessageId> {
+    map_get_any(value, &["serverHeader", "s"])
+        .and_then(|header| map_get_any(header, &["messageID", "messageId", "m"]))
+        .and_then(parse_message_id_from_value)
+        .or_else(|| {
+            map_get_any(value, &["messageID", "messageId", "msgID", "msgId", "id"])
+                .and_then(parse_message_id_from_value)
+        })
 }
 
 fn parse_live_reaction_map_deltas_from_notify(
@@ -9360,6 +9534,9 @@ fn message_type_from_message_body(message_body: &Value) -> Option<i64> {
         if let Some(message_type) = single_numeric_variant_key(body) {
             return Some(message_type);
         }
+        if map_get_any(body, &["pin"]).is_some() {
+            return Some(MESSAGE_TYPE_PIN);
+        }
     }
 
     if map_get_any(message_body, &["reaction", "r"]).is_some() {
@@ -9391,6 +9568,9 @@ fn message_type_from_message_body(message_body: &Value) -> Option<i64> {
     }
     if map_get_any(message_body, &["system", "s"]).is_some() {
         return Some(MESSAGE_TYPE_SYSTEM);
+    }
+    if map_get_any(message_body, &["pin"]).is_some() {
+        return Some(MESSAGE_TYPE_PIN);
     }
 
     map_get_any(message_body, &["body", "b"]).and_then(single_numeric_variant_key)
@@ -9530,9 +9710,10 @@ fn find_value_for_keys<'a>(value: &'a Value, keys: &[&str], depth: usize) -> Opt
         Value::Map(entries) => {
             for (key, inner) in entries {
                 if let Some(key_name) = key.as_str()
-                    && keys.contains(&key_name) {
-                        return Some(inner);
-                    }
+                    && keys.contains(&key_name)
+                {
+                    return Some(inner);
+                }
             }
             for (_, inner) in entries {
                 if let Some(found) = find_value_for_keys(inner, keys, depth + 1) {
@@ -9548,7 +9729,11 @@ fn find_value_for_keys<'a>(value: &'a Value, keys: &[&str], depth: usize) -> Opt
     }
 }
 
-fn find_conversation_id_bytes_for_keys(value: &Value, keys: &[&str], depth: usize) -> Option<Vec<u8>> {
+fn find_conversation_id_bytes_for_keys(
+    value: &Value,
+    keys: &[&str],
+    depth: usize,
+) -> Option<Vec<u8>> {
     if depth > 8 {
         return None;
     }
@@ -10843,20 +11028,37 @@ async fn hydrate_thread_attachment_paths(
 
 fn message_needs_image_attachment_hydration(message: &MessageRecord) -> bool {
     message.attachments.iter().any(|attachment| {
-        attachment.kind == AttachmentKind::Image
-            && (attachment.source.is_none() || attachment.preview.is_none())
+        attachment.kind == AttachmentKind::Image && !attachment_has_renderable_image_source(attachment)
+    })
+}
+
+fn message_needs_video_attachment_hydration(message: &MessageRecord) -> bool {
+    message.attachments.iter().any(|attachment| {
+        attachment.kind == AttachmentKind::Video
+            && !attachment
+                .source
+                .as_ref()
+                .is_some_and(|source| matches!(source, AttachmentSource::LocalPath(p) if !p.trim().is_empty()))
     })
 }
 
 fn image_attachment_hydration_flags(message: &MessageRecord) -> (bool, bool) {
-    let needs_source_hydration = message
-        .attachments
-        .iter()
-        .any(|attachment| attachment.kind == AttachmentKind::Image && attachment.source.is_none());
-    let needs_preview_hydration = message
-        .attachments
-        .iter()
-        .any(|attachment| attachment.kind == AttachmentKind::Image && attachment.preview.is_none());
+    let needs_source_hydration = message.attachments.iter().any(|attachment| {
+        attachment.kind == AttachmentKind::Image
+            && !attachment_has_renderable_image_source(attachment)
+            && !attachment
+                .source
+                .as_ref()
+                .is_some_and(attachment_source_renderable_for_image)
+    });
+    let needs_preview_hydration = message.attachments.iter().any(|attachment| {
+        attachment.kind == AttachmentKind::Image
+            && !attachment_has_renderable_image_source(attachment)
+            && !attachment
+                .preview
+                .as_ref()
+                .is_some_and(|preview| attachment_source_renderable_for_image(&preview.source))
+    });
     (needs_source_hydration, needs_preview_hydration)
 }
 
@@ -10874,13 +11076,16 @@ async fn hydrate_attachment_paths_for_messages(
         }
         let (needs_source_hydration, needs_preview_hydration) =
             image_attachment_hydration_flags(message);
-        if !needs_source_hydration && !needs_preview_hydration {
+        let needs_video_hydration = message_needs_video_attachment_hydration(message);
+        if !needs_source_hydration && !needs_preview_hydration && !needs_video_hydration {
             continue;
         }
         let Ok(message_id) = message.id.0.parse::<i64>() else {
             continue;
         };
-        let full_file_path = if needs_source_hydration {
+
+        let needs_image_download = needs_source_hydration || needs_preview_hydration;
+        let full_file_path = if needs_source_hydration || needs_video_hydration {
             download_attachment_to_cache(client, raw_conversation_id, message_id, false).await
         } else {
             None
@@ -10897,28 +11102,64 @@ async fn hydrate_attachment_paths_for_messages(
         let mut attachment_updated = false;
         hydrated = hydrated.saturating_add(1);
         for attachment in &mut message.attachments {
-            if attachment.kind != AttachmentKind::Image {
-                continue;
-            }
-            if attachment.preview.is_none() {
-                let Some(file_path) = preview_file_path.clone().or_else(|| full_file_path.clone())
-                else {
+            if attachment.kind == AttachmentKind::Image && needs_image_download {
+                let preview_renderable = attachment
+                    .preview
+                    .as_ref()
+                    .is_some_and(|preview| {
+                        attachment_source_renderable_for_image(&preview.source)
+                    });
+                if !preview_renderable {
+                    let Some(file_path) =
+                        preview_file_path.clone().or_else(|| full_file_path.clone())
+                    else {
+                        continue;
+                    };
+                    attachment.preview = Some(AttachmentPreview {
+                        source: AttachmentSource::LocalPath(file_path),
+                        width: attachment.width,
+                        height: attachment.height,
+                    });
+                    attachment_updated = true;
+                }
+                let source_renderable = attachment
+                    .source
+                    .as_ref()
+                    .is_some_and(attachment_source_renderable_for_image);
+                if !source_renderable {
+                    let Some(file_path) =
+                        full_file_path.clone().or_else(|| preview_file_path.clone())
+                    else {
+                        continue;
+                    };
+                    attachment.source = Some(AttachmentSource::LocalPath(file_path));
+                    attachment_updated = true;
+                }
+            } else if attachment.kind == AttachmentKind::Video && needs_video_hydration {
+                let already_has_local_source = attachment
+                    .source
+                    .as_ref()
+                    .is_some_and(|s| matches!(s, AttachmentSource::LocalPath(p) if !p.trim().is_empty()));
+                if already_has_local_source {
+                    continue;
+                }
+                let Some(video_path) = full_file_path.clone() else {
                     continue;
                 };
-                attachment.preview = Some(AttachmentPreview {
-                    source: AttachmentSource::LocalPath(file_path),
-                    width: attachment.width,
-                    height: attachment.height,
-                });
+                attachment.source = Some(AttachmentSource::LocalPath(video_path.clone()));
                 attachment_updated = true;
-            }
-            if attachment.source.is_none() {
-                let Some(file_path) = full_file_path.clone().or_else(|| preview_file_path.clone())
-                else {
-                    continue;
-                };
-                attachment.source = Some(AttachmentSource::LocalPath(file_path));
-                attachment_updated = true;
+
+                let thumb_path = format!("{video_path}.thumb.png");
+                if let Some((thumb_w, thumb_h)) = extract_video_thumbnail_to_file(
+                    Path::new(&video_path),
+                    Path::new(&thumb_path),
+                ) {
+                    attachment.preview = Some(AttachmentPreview {
+                        source: AttachmentSource::LocalPath(thumb_path),
+                        width: Some(thumb_w),
+                        height: Some(thumb_h),
+                    });
+                }
             }
         }
         if attachment_updated {
@@ -10926,6 +11167,46 @@ async fn hydrate_attachment_paths_for_messages(
         }
     }
     updated_ids
+}
+
+fn attachment_has_renderable_image_source(attachment: &AttachmentSummary) -> bool {
+    attachment
+        .source
+        .as_ref()
+        .is_some_and(attachment_source_renderable_for_image)
+        || attachment
+            .preview
+            .as_ref()
+            .is_some_and(|preview| attachment_source_renderable_for_image(&preview.source))
+}
+
+fn attachment_source_renderable_for_image(source: &AttachmentSource) -> bool {
+    match source {
+        AttachmentSource::Url(url) => !is_unrenderable_keybase_asset_url(url),
+        AttachmentSource::LocalPath(path) => !path.trim().is_empty(),
+    }
+}
+
+fn is_unrenderable_keybase_asset_url(url: &str) -> bool {
+    let lower = url.to_ascii_lowercase();
+    if lower.starts_with("http://127.0.0.1:") || lower.starts_with("http://localhost:") {
+        return true;
+    }
+    let prefix = if lower.starts_with("https://s3.amazonaws.com/") {
+        "https://s3.amazonaws.com/"
+    } else if lower.starts_with("http://s3.amazonaws.com/") {
+        "http://s3.amazonaws.com/"
+    } else {
+        return false;
+    };
+    if lower.contains("x-amz-signature=") || lower.contains("awsaccesskeyid=") {
+        return false;
+    }
+    let path = &url[prefix.len()..];
+    let Some(first_segment) = path.split('/').next() else {
+        return false;
+    };
+    first_segment.len() == 64 && first_segment.chars().all(|ch| ch.is_ascii_hexdigit())
 }
 
 async fn download_attachment_to_cache(
@@ -11156,18 +11437,19 @@ fn conversation_unread_count(conversation: &Value, reader_info: &Value) -> u32 {
     if let (Some(max_visible), Some(read_msg)) = (
         map_get_any(conversation, &["maxVisibleMsgID"]).and_then(as_i64),
         read_msg,
-    )
-        && max_visible > 0 {
-            return if max_visible > read_msg { 1 } else { 0 };
-        }
+    ) && max_visible > 0
+    {
+        return if max_visible > read_msg { 1 } else { 0 };
+    }
 
     // Use maxMsgSummaries (ConversationLocal from inbox) to check only TEXT
     // and ATTACHMENT messages. Returns Some(true/false) when the field exists,
     // None when it doesn't (so we can fall through to other heuristics).
     if let Some(read_msg) = read_msg
-        && let Some(has_unread) = has_unread_visible_content(conversation, read_msg) {
-            return if has_unread { 1 } else { 0 };
-        }
+        && let Some(has_unread) = has_unread_visible_content(conversation, read_msg)
+    {
+        return if has_unread { 1 } else { 0 };
+    }
 
     if let Some(unread_total) = map_get_any(
         conversation,
@@ -11267,6 +11549,8 @@ fn parse_thread_page(value: &Value, conversation_id: &ConversationId) -> ThreadP
         return page;
     };
 
+    let permalink_base = extract_permalink_base(value);
+
     for item in items {
         let Some(valid) = extract_valid_message(item) else {
             continue;
@@ -11279,7 +11563,18 @@ fn parse_thread_page(value: &Value, conversation_id: &ConversationId) -> ThreadP
             }
             continue;
         }
-        if let Some(message) = parse_thread_message(valid, conversation_id, message_type) {
+        if let Some(mut message) = parse_thread_message(valid, conversation_id, message_type) {
+            if message.permalink.is_empty() {
+                if let Some((ref tlf_name, ref topic_name)) = permalink_base {
+                    if let Ok(msg_id) = message.id.0.parse::<i64>() {
+                        message.permalink = if topic_name == tlf_name {
+                            format!("keybase://chat/{}/{}", tlf_name, msg_id)
+                        } else {
+                            format!("keybase://chat/{}#{}/{}", tlf_name, topic_name, msg_id)
+                        };
+                    }
+                }
+            }
             page.reaction_deltas
                 .extend(parse_reaction_deltas_for_target(
                     valid,
@@ -11421,9 +11716,10 @@ fn parse_thread_message(
         return None;
     }
     let event = extract_chat_event(message_body, valid);
-    let attachments = message_body
+    let mut attachments = message_body
         .map(extract_message_attachments)
         .unwrap_or_default();
+    apply_message_attachment_url_hints(valid, &mut attachments);
     let text_body = message_body
         .and_then(extract_text_body)
         .map(|text| text.trim().to_string())
@@ -12160,10 +12456,7 @@ fn parse_code_fragment_at(body: &str, backtick_index: usize) -> Option<(MessageF
     ))
 }
 
-fn parse_plain_emoji_shortcode_at(
-    body: &str,
-    colon_index: usize,
-) -> Option<(&str, usize)> {
+fn parse_plain_emoji_shortcode_at(body: &str, colon_index: usize) -> Option<(&str, usize)> {
     let start = colon_index + 1;
     if start >= body.len() {
         return None;
@@ -12249,10 +12542,7 @@ fn is_plain_mention_char(ch: char) -> bool {
     ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '#' | '-')
 }
 
-fn parse_plain_channel_mention_at(
-    body: &str,
-    hash_index: usize,
-) -> Option<(&str, usize)> {
+fn parse_plain_channel_mention_at(body: &str, hash_index: usize) -> Option<(&str, usize)> {
     let start = hash_index + 1;
     if start >= body.len() {
         return None;
@@ -12760,7 +13050,7 @@ fn push_raw_text_fragment(fragments: &mut Vec<MessageFragment>, text: &str) {
     }
 }
 
-fn build_keybase_permalink(payload: &Value, message_id: i64) -> Option<String> {
+fn extract_permalink_base(payload: &Value) -> Option<(String, String)> {
     let conversation = map_get_any(
         payload,
         &["conversation", "conv", "chatConversation", "chatConv"],
@@ -12778,10 +13068,19 @@ fn build_keybase_permalink(payload: &Value, message_id: i64) -> Option<String> {
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .unwrap_or(tlf_name);
-    Some(format!(
-        "keybase://chat/{}#{}/{}",
-        tlf_name, topic_name, message_id
-    ))
+    Some((tlf_name.to_string(), topic_name.to_string()))
+}
+
+fn build_keybase_permalink(payload: &Value, message_id: i64) -> Option<String> {
+    let (tlf_name, topic_name) = extract_permalink_base(payload)?;
+    if topic_name == tlf_name {
+        Some(format!("keybase://chat/{}/{}", tlf_name, message_id))
+    } else {
+        Some(format!(
+            "keybase://chat/{}#{}/{}",
+            tlf_name, topic_name, message_id
+        ))
+    }
 }
 
 fn extract_valid_message(value: &Value) -> Option<&Value> {
@@ -13126,9 +13425,10 @@ fn attachment_source_from_asset(asset: &Value) -> Option<AttachmentSource> {
         && let Some(source) = attachment_source_from_value(
             location,
             &["url", "u", "file", "path", "localPath", "local_path"],
-        ) {
-            return Some(source);
-        }
+        )
+    {
+        return Some(source);
+    }
 
     None
 }
@@ -13338,9 +13638,10 @@ fn extract_edit_target_message_id(message_body: &Value) -> Option<MessageId> {
 fn is_message_superseded(server_header: &Value, root: &Value) -> bool {
     if let Some(id) =
         map_get_any(server_header, &["supersededBy", "superseded_by", "sb"]).and_then(as_i64)
-        && id > 0 {
-            return true;
-        }
+        && id > 0
+    {
+        return true;
+    }
     if let Some(flag) = map_get_any(root, &["superseded"]).and_then(as_bool) {
         return flag;
     }
@@ -13949,9 +14250,10 @@ fn extract_link_previews_from_message_body(message_body: &Value) -> Vec<LinkPrev
     };
 
     if let Some(result) = map_get_any(payload, &["unfurl", "u"])
-        && let Some(preview) = extract_link_preview_from_result(result) {
-            previews.push(preview);
-        }
+        && let Some(preview) = extract_link_preview_from_result(result)
+    {
+        previews.push(preview);
+    }
     if let Some(preview) = extract_link_preview_from_result(payload) {
         previews.push(preview);
     }
@@ -14371,9 +14673,10 @@ fn value_to_f32(value: &Value) -> Option<f32> {
         return Some(raw as f32);
     }
     if let Some(raw) = value.as_f64()
-        && raw.is_finite() {
-            return Some(raw as f32);
-        }
+        && raw.is_finite()
+    {
+        return Some(raw as f32);
+    }
     as_str(value)
         .and_then(|raw| raw.trim().parse::<f32>().ok())
         .filter(|candidate| candidate.is_finite())
@@ -14421,9 +14724,10 @@ fn find_body_string(value: &Value, depth: usize) -> Option<String> {
         Value::Map(entries) => {
             for (key, inner) in entries {
                 if matches!(key.as_str(), Some("body" | "b"))
-                    && let Some(text) = as_str(inner) {
-                        return Some(text.to_string());
-                    }
+                    && let Some(text) = as_str(inner)
+                {
+                    return Some(text.to_string());
+                }
                 if let Some(found) = find_body_string(inner, depth + 1) {
                     return Some(found);
                 }
@@ -14804,6 +15108,60 @@ mod tests {
             send_state: MessageSendState::Sent,
             edited: None,
         }
+    }
+
+    fn test_image_attachment(
+        source: Option<AttachmentSource>,
+        preview_source: Option<AttachmentSource>,
+    ) -> AttachmentSummary {
+        AttachmentSummary {
+            name: "paste.png".to_string(),
+            kind: AttachmentKind::Image,
+            mime_type: Some("image/png".to_string()),
+            size_bytes: 2200,
+            width: Some(64),
+            height: Some(64),
+            preview: preview_source.map(|source| AttachmentPreview {
+                source,
+                width: Some(64),
+                height: Some(64),
+            }),
+            source,
+            ..AttachmentSummary::default()
+        }
+    }
+
+    #[test]
+    fn message_needs_image_attachment_hydration_skips_renderable_image_urls() {
+        let mut message = make_test_message("img-renderable");
+        message.attachments.push(test_image_attachment(
+            Some(AttachmentSource::Url(
+                "https://example.com/images/paste.png".to_string(),
+            )),
+            None,
+        ));
+
+        assert!(
+            !message_needs_image_attachment_hydration(&message),
+            "renderable image URL should not require local hydration"
+        );
+        assert_eq!(image_attachment_hydration_flags(&message), (false, false));
+    }
+
+    #[test]
+    fn message_needs_image_attachment_hydration_for_unrenderable_keybase_assets() {
+        let unrenderable = "https://s3.amazonaws.com/0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef/paste.png".to_string();
+        let mut message = make_test_message("img-unrenderable");
+        message.attachments.push(test_image_attachment(
+            Some(AttachmentSource::Url(unrenderable.clone())),
+            Some(AttachmentSource::Url(unrenderable)),
+        ));
+
+        assert!(
+            message_needs_image_attachment_hydration(&message),
+            "Keybase hash-bucket URLs without a signature need local hydration"
+        );
+        assert_eq!(image_attachment_hydration_flags(&message), (true, true));
     }
 
     #[test]
@@ -16037,6 +16395,43 @@ mod tests {
     }
 
     #[test]
+    fn parse_live_message_from_notify_ignores_non_incoming_activity_payloads() {
+        let event = KeybaseNotifyEvent::Unknown {
+            method: "chat.1.NotifyChat.NewChatActivity".to_string(),
+            raw_params: Value::Map(vec![
+                (Value::from("convID"), Value::Binary(vec![0xAA, 0xBB])),
+                (Value::from("messageID"), Value::from(321)),
+                (Value::from("senderUsername"), Value::from("alice")),
+                (
+                    Value::from("activity"),
+                    Value::Map(vec![(
+                        Value::from("pin"),
+                        Value::Map(vec![
+                            (Value::from("msgID"), Value::from(11)),
+                            (Value::from("body"), Value::from("very old pinned body")),
+                        ]),
+                    )]),
+                ),
+                (
+                    Value::from("content"),
+                    Value::Map(vec![(
+                        Value::from("text"),
+                        Value::Map(vec![(
+                            Value::from("body"),
+                            Value::from("synthetic top-level fallback body"),
+                        )]),
+                    )]),
+                ),
+            ]),
+        };
+
+        assert!(
+            parse_live_message_from_notify(&event).is_none(),
+            "payloads without incomingMessage.valid should not synthesize timeline rows"
+        );
+    }
+
+    #[test]
     fn parse_live_message_from_notify_prefers_nested_valid_payload_shape() {
         let event = KeybaseNotifyEvent::Unknown {
             method: "chat.1.NotifyChat.NewChatActivity".to_string(),
@@ -16103,6 +16498,64 @@ mod tests {
             fragment,
             MessageFragment::ChannelMention { name } if name == "general"
         )));
+    }
+
+    #[test]
+    fn parse_live_message_from_notify_treats_pin_payload_as_system_event() {
+        let event = KeybaseNotifyEvent::Unknown {
+            method: "chat.1.NotifyChat.NewChatActivity".to_string(),
+            raw_params: Value::Map(vec![(
+                Value::from("activity"),
+                Value::Map(vec![(
+                    Value::from("incomingMessage"),
+                    Value::Map(vec![
+                        (Value::from("convID"), Value::Binary(vec![0xCA, 0xFE])),
+                        (
+                            Value::from("message"),
+                            Value::Map(vec![
+                                (Value::from("state"), Value::from(0)),
+                                (
+                                    Value::from("valid"),
+                                    Value::Map(vec![
+                                        (
+                                            Value::from("serverHeader"),
+                                            Value::Map(vec![(
+                                                Value::from("messageID"),
+                                                Value::from(200),
+                                            )]),
+                                        ),
+                                        (Value::from("senderUsername"), Value::from("alice")),
+                                        (
+                                            Value::from("messageBody"),
+                                            Value::Map(vec![(
+                                                Value::from("pin"),
+                                                Value::Map(vec![
+                                                    (Value::from("msgID"), Value::from(42)),
+                                                    (
+                                                        Value::from("body"),
+                                                        Value::from("very old message text"),
+                                                    ),
+                                                ]),
+                                            )]),
+                                        ),
+                                    ]),
+                                ),
+                            ]),
+                        ),
+                    ]),
+                )]),
+            )]),
+        };
+
+        let message = parse_live_message_from_notify(&event).expect("expected live message");
+        assert_eq!(message.id.0, "200");
+        assert_eq!(message.conversation_id.0, "kb_conv:cafe");
+        assert!(matches!(
+            message.event.as_ref(),
+            Some(ChatEvent::MessagePinned {
+                target_message_id: Some(target)
+            }) if target.0 == "42"
+        ));
     }
 
     #[test]

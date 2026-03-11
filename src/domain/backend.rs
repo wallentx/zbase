@@ -55,8 +55,7 @@ impl ProviderMessageRef {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-#[derive(Default)]
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
 pub struct BackendCapabilities {
     pub supports_threads: bool,
     pub supports_message_edit: bool,
@@ -106,4 +105,3 @@ impl BackendCapabilities {
         }
     }
 }
-
