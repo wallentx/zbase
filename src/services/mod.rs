@@ -3,6 +3,7 @@ pub mod draft_store;
 pub mod local_store;
 pub mod media_service;
 pub mod notifications_service;
+pub mod og_service;
 pub mod search_index;
 pub mod search_service;
 pub mod settings_store;

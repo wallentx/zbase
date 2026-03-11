@@ -22,11 +22,13 @@ use gpui::{
     AnyElement, Background, BoxShadow, FontWeight, Hsla, ImageSource, IntoElement, ParentElement,
     SharedString, Styled, div, linear_color_stop, linear_gradient, point, px, rgb, svg,
 };
+use gpui::prelude::FluentBuilder;
 use std::{cell::Cell, path::PathBuf};
 
 use crate::{
     app::theme::ThemeVariant,
     domain::attachment::{AttachmentKind, AttachmentSource, AttachmentSummary},
+    domain::message::{LinkPreview, MessageFragment},
 };
 
 thread_local! {
@@ -799,6 +801,108 @@ pub fn send_icon(color: u32) -> AnyElement {
 
 pub fn play_icon(color: u32) -> AnyElement {
     icon_asset("assets/icons/play.svg", 24., color)
+}
+
+pub fn paperclip_icon_small(color: u32) -> AnyElement {
+    icon_asset("assets/icons/paperclip.svg", 14., color)
+}
+
+fn trim_url_token(token: &str) -> Option<&str> {
+    let mut t = token.trim();
+    if t.is_empty() {
+        return None;
+    }
+    while let Some(ch) = t.as_bytes().first().copied()
+        && matches!(ch, b'(' | b'[' | b'<')
+    {
+        t = &t[1..];
+    }
+    while let Some(ch) = t.as_bytes().last().copied()
+        && matches!(ch, b'.' | b',' | b')' | b']' | b'>' | b';')
+    {
+        t = &t[..t.len().saturating_sub(1)];
+    }
+    (!t.is_empty()).then_some(t)
+}
+
+pub fn is_media_link_only_message(fragments: &[MessageFragment], previews: &[LinkPreview]) -> bool {
+    if fragments.is_empty() || previews.is_empty() {
+        return false;
+    }
+
+    let matches_media_preview = |url: &str| {
+        previews.iter().any(|p| {
+            if !p.is_media {
+                return false;
+            }
+            crate::views::app_window::urls_match(&p.url, url)
+                || p.video_url
+                    .as_deref()
+                    .is_some_and(|v| crate::views::app_window::urls_match(v, url))
+        })
+    };
+
+    let mut saw_any_url = false;
+    for fragment in fragments {
+        match fragment {
+            MessageFragment::Link { url, .. } => {
+                if !matches_media_preview(url) {
+                    return false;
+                }
+                saw_any_url = true;
+            }
+            MessageFragment::Text(text) => {
+                let trimmed = text.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                let mut local_saw = false;
+                for raw in trimmed.split_whitespace() {
+                    let Some(token) = trim_url_token(raw) else {
+                        continue;
+                    };
+                    if !(token.starts_with("http://") || token.starts_with("https://")) {
+                        return false;
+                    }
+                    if !matches_media_preview(token) {
+                        return false;
+                    }
+                    local_saw = true;
+                }
+                if !local_saw {
+                    return false;
+                }
+                saw_any_url = true;
+            }
+            _ => return false,
+        }
+    }
+    saw_any_url
+}
+
+pub fn attachment_header_row(attachment: &AttachmentSummary) -> AnyElement {
+    let name = attachment.name.clone();
+    let size = attachment_size_text(attachment.size_bytes);
+    div()
+        .flex()
+        .items_center()
+        .gap_1()
+        .child(paperclip_icon_small(text_secondary()))
+        .child(
+            div()
+                .text_xs()
+                .text_color(rgb(text_primary()))
+                .child(name),
+        )
+        .when_some(size, |row, size_label| {
+            row.child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(text_secondary()))
+                    .child(size_label),
+            )
+        })
+        .into_any_element()
 }
 
 pub fn format_duration_ms(ms: u64) -> String {

@@ -31,6 +31,8 @@ pub fn run() {
         }
 
         cx.bind_keys([
+            KeyBinding::new("cmd-q", commands::QuitApp, Some("Workspace")),
+            KeyBinding::new("cmd-w", commands::CloseWindow, Some("Workspace")),
             KeyBinding::new("cmd-[", commands::NavigateBack, Some("Workspace")),
             KeyBinding::new("cmd-]", commands::NavigateForward, Some("Workspace")),
             KeyBinding::new("cmd-shift-a", commands::ShowActivity, Some("Workspace")),

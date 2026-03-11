@@ -88,11 +88,7 @@ struct PendingSendMeta {
 }
 
 impl KeybaseBackend {
-    pub fn new() -> Self {
-        let local_store =
-            Arc::new(LocalStore::open().unwrap_or_else(|error| {
-                panic!("failed to initialize local RocksDB store: {error}")
-            }));
+    pub fn new(local_store: Arc<LocalStore>) -> Self {
         let search_index =
             Arc::new(SearchIndex::open().unwrap_or_else(|error| {
                 panic!("failed to initialize local Tantivy index: {error}")
@@ -136,12 +132,6 @@ impl KeybaseBackend {
             method,
             payload_preview: None,
         })
-    }
-}
-
-impl Default for KeybaseBackend {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
