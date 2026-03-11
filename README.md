@@ -45,9 +45,6 @@ zBase is a from-scratch replacement for the official Keybase desktop app. It tal
 - Team showcase
 - Presence indicators (active, away, do not disturb, offline) with status text
 
-### Calls
-- Start and join audio/video calls from any conversation
-- Participant list with mute and screen-sharing status
 
 ### Preferences
 - Light, dark, and system-follow theme modes
@@ -148,7 +145,7 @@ open /Applications/zBase.app
 ```
 src/
 ├── app/          # Bootstrap, window management, theme, key bindings
-├── domain/       # Core types: messages, conversations, users, profiles, calls
+├── domain/       # Core types: messages, conversations, users, profiles
 ├── models/       # View models (sidebar, timeline, composer, search, settings, …)
 ├── state/        # Unidirectional store: actions → reducer → state → effects
 ├── services/     # Backend adapters, RocksDB cache, Tantivy search, sync, uploads
