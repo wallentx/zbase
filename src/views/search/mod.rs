@@ -351,7 +351,7 @@ fn render_link_previews(
                                     .border_color(rgb(border()))
                                     .text_xs()
                                     .text_color(rgb(text_primary()))
-                                .child("video"),
+                                    .child("video"),
                             )
                         }
                     })
@@ -392,10 +392,16 @@ fn render_link_previews(
                 )
                 .child(div().text_sm().child(title))
                 .when(has_title && !is_giphy, |container| {
-                    container.child(div().text_xs().text_color(rgb(accent())).child(preview.url.clone()))
+                    container.child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(accent()))
+                            .child(preview.url.clone()),
+                    )
                 })
                 .when_some(thumbnail, |container, thumb_path| {
-                    let (tw, th) = if let (Some(w), Some(h)) = (preview.media_width, preview.media_height)
+                    let (tw, th) = if let (Some(w), Some(h)) =
+                        (preview.media_width, preview.media_height)
                         && w > 0
                         && h > 0
                     {

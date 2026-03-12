@@ -54,9 +54,10 @@ pub fn open_main_window(cx: &mut App) {
             AppModels::empty_with_settings(settings)
         };
         let app_store = build_app_store(&models);
-        let local_store = Arc::new(LocalStore::open().unwrap_or_else(|error| {
-            panic!("failed to initialize local RocksDB store: {error}")
-        }));
+        let local_store =
+            Arc::new(LocalStore::open().unwrap_or_else(|error| {
+                panic!("failed to initialize local RocksDB store: {error}")
+            }));
         let backend_router = build_backend_router(&models, Arc::clone(&local_store));
         let search_text = models.search.query.clone();
         let emoji_picker_text = models.emoji_picker.query.clone();

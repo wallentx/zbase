@@ -26,9 +26,10 @@ use super::{
     paths,
     schema::{
         CachedConversationBinding, CachedConversationEmoji, CachedConversationSummary,
-        CachedConversationTeamBinding, CachedEmojiSourceRef, CachedMessageBinding,
-        CachedLinkPreview, CachedMessageReaction, CachedMessageRecord, CachedMeta, CachedReactionOp,
-        CachedTeamRoleEntry, CachedTeamRoleMap, CachedUserProfile, SCHEMA_VERSION,
+        CachedConversationTeamBinding, CachedEmojiSourceRef, CachedLinkPreview,
+        CachedMessageBinding, CachedMessageReaction, CachedMessageRecord, CachedMeta,
+        CachedReactionOp, CachedTeamRoleEntry, CachedTeamRoleMap, CachedUserProfile,
+        SCHEMA_VERSION,
     },
 };
 

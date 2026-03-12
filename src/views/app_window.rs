@@ -29,7 +29,9 @@ use crate::{
         sidebar_model::SidebarModel,
         timeline_model::TeamAuthorRole,
     },
-    services::{backends::router::BackendRouter, local_store::LocalStore, settings_store::SettingsStore},
+    services::{
+        backends::router::BackendRouter, local_store::LocalStore, settings_store::SettingsStore,
+    },
     state::{
         AppStore, ConnectionState, DraftKey, UiAction, bindings::MessageBinding,
         event::{BackendEvent, TeamRoleKind},
@@ -1600,10 +1602,7 @@ impl AppWindow {
             .set_sidebar_filter(self.sidebar_filter_input.read(cx).text());
     }
 
-    fn take_pasted_image(
-        input: &Entity<TextField>,
-        cx: &mut Context<Self>,
-    ) -> Option<Vec<u8>> {
+    fn take_pasted_image(input: &Entity<TextField>, cx: &mut Context<Self>) -> Option<Vec<u8>> {
         let has_image = input.read(cx).pasted_image.is_some();
         if has_image {
             input.update(cx, |input, _| input.pasted_image.take())
@@ -1612,16 +1611,19 @@ impl AppWindow {
         }
     }
 
-    fn handle_pasted_image(&mut self, bytes: Vec<u8>, target: UploadTarget, cx: &mut Context<Self>) {
+    fn handle_pasted_image(
+        &mut self,
+        bytes: Vec<u8>,
+        target: UploadTarget,
+        cx: &mut Context<Self>,
+    ) {
         use std::time::SystemTime;
         let ts = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
             .map(|d| d.as_millis())
             .unwrap_or(0);
-        let path = std::env::temp_dir().join(format!(
-            "zbase-paste-{}-{ts}.png",
-            std::process::id(),
-        ));
+        let path =
+            std::env::temp_dir().join(format!("zbase-paste-{}-{ts}.png", std::process::id(),));
         if std::fs::write(&path, &bytes).is_ok() {
             self.open_file_upload_lightbox_with_paths(vec![path], target, cx);
         }
@@ -1970,16 +1972,16 @@ impl AppWindow {
         self.reset_timeline_scroll_state();
     }
 
-fn bench_composer_paste_payload(step: u64) -> String {
-    const BLOCK: &str = "Release checklist:\n- Verify migration status for all regions.\n- Confirm roll-forward and rollback scripts are in the runbook.\n- Coordinate with QA on smoke-test coverage before cutover.\n- Update incident channel with timestamps and owners.\n\nNotes:\nThe previous deployment hit a warmup bottleneck on cold cache reads.\nWe should stage traffic in three waves and validate query latency after each wave.\n";
-    let repeat = 4 + ((step / 48) as usize % 4);
-    let mut text = String::with_capacity((BLOCK.len() + 32) * repeat);
-    for ix in 0..repeat {
-        text.push_str(BLOCK);
-        text.push_str(&format!("Chunk {} / {}\n\n", ix + 1, repeat));
+    fn bench_composer_paste_payload(step: u64) -> String {
+        const BLOCK: &str = "Release checklist:\n- Verify migration status for all regions.\n- Confirm roll-forward and rollback scripts are in the runbook.\n- Coordinate with QA on smoke-test coverage before cutover.\n- Update incident channel with timestamps and owners.\n\nNotes:\nThe previous deployment hit a warmup bottleneck on cold cache reads.\nWe should stage traffic in three waves and validate query latency after each wave.\n";
+        let repeat = 4 + ((step / 48) as usize % 4);
+        let mut text = String::with_capacity((BLOCK.len() + 32) * repeat);
+        for ix in 0..repeat {
+            text.push_str(BLOCK);
+            text.push_str(&format!("Chunk {} / {}\n\n", ix + 1, repeat));
+        }
+        text
     }
-    text
-}
 
     fn sidebar_view_state(&self) -> SidebarViewState {
         SidebarViewState {
@@ -2072,8 +2074,7 @@ fn bench_composer_paste_payload(step: u64) -> String {
         if self.timeline_list_state.item_count() == target_len {
             return;
         }
-        let was_near_bottom =
-            self.timeline_is_near_bottom() && !self.jump_to_message_active;
+        let was_near_bottom = self.timeline_is_near_bottom() && !self.jump_to_message_active;
         let prev = self.timeline_list_state.logical_scroll_top();
         self.timeline_list_state.reset(target_len);
         if target_len == 0 {
@@ -3104,11 +3105,7 @@ fn bench_composer_paste_payload(step: u64) -> String {
         if self.jump_to_message_active
             && (conversation_changed
                 || (self.models.timeline.pending_scroll_target.is_none()
-                    && self
-                        .timeline_list_state
-                        .max_offset_for_scrollbar()
-                        .height
-                        > px(0.)))
+                    && self.timeline_list_state.max_offset_for_scrollbar().height > px(0.)))
         {
             self.jump_to_message_active = false;
         }
@@ -5336,11 +5333,9 @@ fn bench_composer_paste_payload(step: u64) -> String {
 
         if let Some(text) = text.filter(|s| !s.is_empty()) {
             cx.write_to_clipboard(ClipboardItem::new_string(text));
-            self.models
-                .push_toast("Copied message text", None);
+            self.models.push_toast("Copied message text", None);
         } else {
-            self.models
-                .push_toast("No text to copy", None);
+            self.models.push_toast("No text to copy", None);
         }
         self.refresh(cx);
     }
@@ -8296,7 +8291,12 @@ fn extract_urls_from_text(text: &str, out: &mut Vec<String>) {
             }
             url_end += ch.len_utf8();
         }
-        while url_end > url_start && matches!(text.as_bytes()[url_end - 1], b'.' | b',' | b')' | b']' | b';') {
+        while url_end > url_start
+            && matches!(
+                text.as_bytes()[url_end - 1],
+                b'.' | b',' | b')' | b']' | b';'
+            )
+        {
             url_end -= 1;
         }
         if url_end > url_start + 8 {

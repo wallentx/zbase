@@ -180,8 +180,7 @@ impl ThreadPane {
         cx: &mut Context<AppWindow>,
     ) -> AnyElement {
         let thread_rows = build_thread_message_rows(thread, timeline);
-        let thread_content_width =
-            (thread.width_px - RIGHT_PANE_RESIZE_HANDLE_WIDTH_PX).max(0.0);
+        let thread_content_width = (thread.width_px - RIGHT_PANE_RESIZE_HANDLE_WIDTH_PX).max(0.0);
         // Keep media within the usable message-content column in the thread pane:
         // row padding (32) + avatar/gap (44) + scrollbar gutter/right padding (32) + guard (8).
         let thread_media_max_width = (thread_content_width - 116.0).clamp(72.0, 280.0);
@@ -449,7 +448,8 @@ fn render_parent_message(
                             .attachments
                             .iter()
                             .all(|attachment| attachment.kind == AttachmentKind::Image);
-                    let caption_text = if image_attachment_message && !message.fragments.is_empty() {
+                    let caption_text = if image_attachment_message && !message.fragments.is_empty()
+                    {
                         message_caption_text(&message)
                     } else {
                         None
@@ -498,20 +498,25 @@ fn render_parent_message(
                                                 )))
                                                 .w(px(media_width))
                                                 .h(px(media_height))
-                                                .when_some(lightbox_source, |thumb, lightbox_source| {
-                                                    let caption_text = lightbox_caption.clone();
-                                                    thumb
-                                                        .cursor(CursorStyle::PointingHand)
-                                                        .on_click(cx.listener(move |this, _, _, cx| {
-                                                            this.open_image_lightbox(
-                                                                lightbox_source.clone(),
-                                                                caption_text.clone(),
-                                                                lightbox_width,
-                                                                lightbox_height,
-                                                                cx,
-                                                            );
-                                                        }))
-                                                })
+                                                .when_some(
+                                                    lightbox_source,
+                                                    |thumb, lightbox_source| {
+                                                        let caption_text = lightbox_caption.clone();
+                                                        thumb
+                                                            .cursor(CursorStyle::PointingHand)
+                                                            .on_click(cx.listener(
+                                                                move |this, _, _, cx| {
+                                                                    this.open_image_lightbox(
+                                                                        lightbox_source.clone(),
+                                                                        caption_text.clone(),
+                                                                        lightbox_width,
+                                                                        lightbox_height,
+                                                                        cx,
+                                                                    );
+                                                                },
+                                                            ))
+                                                    },
+                                                )
                                                 .child(
                                                     img(media_source)
                                                         .w(px(media_width))
@@ -526,7 +531,9 @@ fn render_parent_message(
                                                             move || {
                                                                 div()
                                                                     .text_xs()
-                                                                    .text_color(rgb(text_secondary()))
+                                                                    .text_color(rgb(
+                                                                        text_secondary(),
+                                                                    ))
                                                                     .child(label.clone())
                                                                     .into_any_element()
                                                             }
@@ -561,13 +568,9 @@ fn render_parent_message(
                                             260.0,
                                             220.0,
                                         );
-                                        let video_path = attachment
-                                            .source
-                                            .as_ref()
-                                            .and_then(|s| match s {
-                                                AttachmentSource::LocalPath(p) => {
-                                                    Some(p.clone())
-                                                }
+                                        let video_path =
+                                            attachment.source.as_ref().and_then(|s| match s {
+                                                AttachmentSource::LocalPath(p) => Some(p.clone()),
                                                 _ => None,
                                             });
                                         let duration_label =
@@ -586,13 +589,11 @@ fn render_parent_message(
                                                 .flex_shrink_0()
                                                 .cursor(CursorStyle::PointingHand)
                                                 .when_some(video_path, |el, path| {
-                                                    el.on_click(
-                                                        cx.listener(move |_, _, _, _| {
-                                                            AppWindow::open_video_in_native_player(
-                                                                &path,
-                                                            );
-                                                        }),
-                                                    )
+                                                    el.on_click(cx.listener(move |_, _, _, _| {
+                                                        AppWindow::open_video_in_native_player(
+                                                            &path,
+                                                        );
+                                                    }))
                                                 })
                                                 .child(
                                                     img(thumb_source)
@@ -897,7 +898,7 @@ fn render_link_previews(
                                     .border_color(rgb(border()))
                                     .text_xs()
                                     .text_color(rgb(text_primary()))
-                                .child("video"),
+                                    .child("video"),
                             )
                         }
                     })
@@ -941,10 +942,16 @@ fn render_link_previews(
                 )
                 .child(div().text_sm().text_color(rgb(text_primary())).child(title))
                 .when(has_title && !is_giphy, |container| {
-                    container.child(div().text_xs().text_color(rgb(accent())).child(preview.url.clone()))
+                    container.child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(accent()))
+                            .child(preview.url.clone()),
+                    )
                 })
                 .when_some(thumbnail, |container, thumb_path| {
-                    let (tw, th) = if let (Some(w), Some(h)) = (preview.media_width, preview.media_height)
+                    let (tw, th) = if let (Some(w), Some(h)) =
+                        (preview.media_width, preview.media_height)
                         && w > 0
                         && h > 0
                     {
