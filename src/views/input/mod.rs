@@ -111,6 +111,9 @@ actions!(
     text_field,
     [
         Backspace,
+        DeleteWordBackward,
+        MoveToPreviousWordStart,
+        MoveToNextWordEnd,
         Delete,
         Left,
         Right,
@@ -118,13 +121,21 @@ actions!(
         Down,
         SelectLeft,
         SelectRight,
+        SelectToPreviousWordStart,
+        SelectToNextWordEnd,
         SelectUp,
         SelectDown,
         SelectAll,
+        MoveToBeginningOfLine,
+        MoveToEndOfLine,
         Home,
         End,
+        SelectToBeginningOfLine,
+        SelectToEndOfLine,
         SelectHome,
         SelectEnd,
+        DeleteToBeginningOfLine,
+        DeleteToEndOfLine,
         InsertNewline,
         ShowCharacterPalette,
         Paste,
@@ -444,9 +455,8 @@ impl TextField {
 
     fn replace_content_range(&mut self, range: Range<usize>, replacement: &str) {
         if text_field_use_legacy_replace() {
-            self.content = self.content[0..range.start].to_owned()
-                + replacement
-                + &self.content[range.end..];
+            self.content =
+                self.content[0..range.start].to_owned() + replacement + &self.content[range.end..];
         } else {
             self.content.replace_range(range, replacement);
         }
@@ -463,6 +473,32 @@ impl TextField {
     fn right(&mut self, _: &Right, _: &mut Window, cx: &mut Context<Self>) {
         if self.selected_range.is_empty() {
             self.move_to(self.next_boundary(self.selected_range.end), cx);
+        } else {
+            self.move_to(self.selected_range.end, cx);
+        }
+    }
+
+    fn move_to_previous_word_start(
+        &mut self,
+        _: &MoveToPreviousWordStart,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.selected_range.is_empty() {
+            self.move_to(previous_word_start(&self.content, self.cursor_offset()), cx);
+        } else {
+            self.move_to(self.selected_range.start, cx);
+        }
+    }
+
+    fn move_to_next_word_end(
+        &mut self,
+        _: &MoveToNextWordEnd,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.selected_range.is_empty() {
+            self.move_to(next_word_end(&self.content, self.selected_range.end), cx);
         } else {
             self.move_to(self.selected_range.end, cx);
         }
@@ -494,6 +530,24 @@ impl TextField {
         self.select_to(self.next_boundary(self.cursor_offset()), cx);
     }
 
+    fn select_to_previous_word_start(
+        &mut self,
+        _: &SelectToPreviousWordStart,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.select_to(previous_word_start(&self.content, self.cursor_offset()), cx);
+    }
+
+    fn select_to_next_word_end(
+        &mut self,
+        _: &SelectToNextWordEnd,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.select_to(next_word_end(&self.content, self.cursor_offset()), cx);
+    }
+
     fn select_up(&mut self, _: &SelectUp, _: &mut Window, cx: &mut Context<Self>) {
         self.select_vertical(-1.0, cx);
     }
@@ -505,6 +559,29 @@ impl TextField {
     fn select_all(&mut self, _: &SelectAll, _: &mut Window, cx: &mut Context<Self>) {
         self.move_to(0, cx);
         self.select_to(self.content.len(), cx);
+    }
+
+    fn move_to_beginning_of_line(
+        &mut self,
+        _: &MoveToBeginningOfLine,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let offset = if self.selected_range.is_empty() {
+            self.cursor_offset()
+        } else {
+            self.selected_range.start
+        };
+        self.move_to(current_line_start(&self.content, offset), cx);
+    }
+
+    fn move_to_end_of_line(&mut self, _: &MoveToEndOfLine, _: &mut Window, cx: &mut Context<Self>) {
+        let offset = if self.selected_range.is_empty() {
+            self.cursor_offset()
+        } else {
+            self.selected_range.end
+        };
+        self.move_to(current_line_end(&self.content, offset), cx);
     }
 
     fn home(&mut self, _: &Home, _: &mut Window, cx: &mut Context<Self>) {
@@ -523,6 +600,24 @@ impl TextField {
         self.select_to(self.content.len(), cx);
     }
 
+    fn select_to_beginning_of_line(
+        &mut self,
+        _: &SelectToBeginningOfLine,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.select_to(current_line_start(&self.content, self.cursor_offset()), cx);
+    }
+
+    fn select_to_end_of_line(
+        &mut self,
+        _: &SelectToEndOfLine,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.select_to(current_line_end(&self.content, self.cursor_offset()), cx);
+    }
+
     fn insert_newline(&mut self, _: &InsertNewline, window: &mut Window, cx: &mut Context<Self>) {
         if self.is_multiline() {
             self.replace_text_in_range(None, "\n", window, cx);
@@ -536,9 +631,48 @@ impl TextField {
         self.replace_text_in_range(None, "", window, cx);
     }
 
+    fn delete_word_backward(
+        &mut self,
+        _: &DeleteWordBackward,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.selected_range.is_empty() {
+            self.select_to(
+                delete_to_previous_word_start(&self.content, self.cursor_offset()),
+                cx,
+            );
+        }
+        self.replace_text_in_range(None, "", window, cx);
+    }
+
+    fn delete_to_beginning_of_line(
+        &mut self,
+        _: &DeleteToBeginningOfLine,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.selected_range.is_empty() {
+            self.select_to(current_line_start(&self.content, self.cursor_offset()), cx);
+        }
+        self.replace_text_in_range(None, "", window, cx);
+    }
+
     fn delete(&mut self, _: &Delete, window: &mut Window, cx: &mut Context<Self>) {
         if self.selected_range.is_empty() {
             self.select_to(self.next_boundary(self.cursor_offset()), cx);
+        }
+        self.replace_text_in_range(None, "", window, cx);
+    }
+
+    fn delete_to_end_of_line(
+        &mut self,
+        _: &DeleteToEndOfLine,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.selected_range.is_empty() {
+            self.select_to(current_line_end(&self.content, self.cursor_offset()), cx);
         }
         self.replace_text_in_range(None, "", window, cx);
     }
@@ -1101,8 +1235,7 @@ impl Element for TextLineElement {
                     font_size,
                     line_height,
                 )
-            })
-        {
+            }) {
             cached_layout.clone()
         } else {
             let run = TextRun {
@@ -1266,7 +1399,9 @@ impl Element for TextLineElement {
                 && let Some(started_at) = input.pending_height_edit_at.take()
             {
                 let elapsed = started_at.elapsed();
-                if text_field_profile_enabled() && elapsed.as_millis() >= text_field_profile_min_ms() {
+                if text_field_profile_enabled()
+                    && elapsed.as_millis() >= text_field_profile_min_ms()
+                {
                     tracing::warn!(
                         target: "zbase.input.perf",
                         phase = "content_height_update_lag",
@@ -1291,6 +1426,9 @@ impl Render for TextField {
             .track_focus(&self.focus_handle(cx))
             .cursor(CursorStyle::IBeam)
             .on_action(cx.listener(Self::backspace))
+            .on_action(cx.listener(Self::delete_word_backward))
+            .on_action(cx.listener(Self::move_to_previous_word_start))
+            .on_action(cx.listener(Self::move_to_next_word_end))
             .on_action(cx.listener(Self::delete))
             .on_action(cx.listener(Self::left))
             .on_action(cx.listener(Self::right))
@@ -1298,13 +1436,21 @@ impl Render for TextField {
             .on_action(cx.listener(Self::down))
             .on_action(cx.listener(Self::select_left))
             .on_action(cx.listener(Self::select_right))
+            .on_action(cx.listener(Self::select_to_previous_word_start))
+            .on_action(cx.listener(Self::select_to_next_word_end))
             .on_action(cx.listener(Self::select_up))
             .on_action(cx.listener(Self::select_down))
             .on_action(cx.listener(Self::select_all))
+            .on_action(cx.listener(Self::move_to_beginning_of_line))
+            .on_action(cx.listener(Self::move_to_end_of_line))
             .on_action(cx.listener(Self::home))
             .on_action(cx.listener(Self::end))
+            .on_action(cx.listener(Self::select_to_beginning_of_line))
+            .on_action(cx.listener(Self::select_to_end_of_line))
             .on_action(cx.listener(Self::select_home))
             .on_action(cx.listener(Self::select_end))
+            .on_action(cx.listener(Self::delete_to_beginning_of_line))
+            .on_action(cx.listener(Self::delete_to_end_of_line))
             .on_action(cx.listener(Self::insert_newline))
             .on_action(cx.listener(Self::show_character_palette))
             .on_action(cx.listener(Self::paste))
@@ -1594,6 +1740,125 @@ fn word_range_at_offset(content: &str, offset: usize) -> Option<Range<usize>> {
                 (target >= start && target < end).then_some(start..end)
             })
     })
+}
+
+fn previous_boundary_in_content(content: &str, offset: usize) -> usize {
+    if content.is_empty() || offset == 0 {
+        return 0;
+    }
+
+    content
+        .grapheme_indices(true)
+        .rev()
+        .find_map(|(idx, _)| (idx < offset).then_some(idx))
+        .unwrap_or(0)
+}
+
+fn previous_word_start(content: &str, offset: usize) -> usize {
+    if content.is_empty() || offset == 0 {
+        return 0;
+    }
+
+    let target = offset.min(content.len());
+    let segments: Vec<_> = content.split_word_bound_indices().collect();
+    segments
+        .into_iter()
+        .rev()
+        .find_map(|(start, segment)| {
+            (start < target && !segment.chars().all(char::is_whitespace)).then_some(start)
+        })
+        .unwrap_or(0)
+}
+
+fn next_word_end(content: &str, offset: usize) -> usize {
+    if content.is_empty() {
+        return 0;
+    }
+
+    let target = offset.min(content.len());
+    content
+        .split_word_bound_indices()
+        .find_map(|(start, segment)| {
+            let end = start + segment.len();
+            (end > target && !segment.chars().all(char::is_whitespace)).then_some(end)
+        })
+        .unwrap_or(content.len())
+}
+
+fn current_line_start(content: &str, offset: usize) -> usize {
+    let target = offset.min(content.len());
+    content[..target]
+        .rfind('\n')
+        .map(|idx| idx + 1)
+        .unwrap_or(0)
+}
+
+fn current_line_end(content: &str, offset: usize) -> usize {
+    let target = offset.min(content.len());
+    content[target..]
+        .find('\n')
+        .map(|idx| target + idx)
+        .unwrap_or(content.len())
+}
+
+fn delete_to_previous_word_start(content: &str, offset: usize) -> usize {
+    if content.is_empty() || offset == 0 {
+        return 0;
+    }
+
+    let target = offset.min(content.len());
+    let line_start = current_line_start(content, target);
+    if line_start == target {
+        return previous_boundary_in_content(content, target);
+    }
+
+    let line_slice = &content[line_start..target];
+    line_start + previous_word_start(line_slice, line_slice.len())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        current_line_end, current_line_start, delete_to_previous_word_start, next_word_end,
+        previous_word_start,
+    };
+
+    #[test]
+    fn previous_word_start_moves_to_prior_word() {
+        assert_eq!(previous_word_start("hello world", "hello world".len()), 6);
+    }
+
+    #[test]
+    fn previous_word_start_skips_intervening_whitespace() {
+        assert_eq!(previous_word_start("hello   world", 8), 0);
+    }
+
+    #[test]
+    fn previous_word_start_stops_at_punctuation_segment() {
+        assert_eq!(previous_word_start("hello,", "hello,".len()), 5);
+    }
+
+    #[test]
+    fn next_word_end_skips_whitespace_to_following_word() {
+        assert_eq!(next_word_end("hello   world", 5), "hello   world".len());
+    }
+
+    #[test]
+    fn current_line_boundaries_are_local_to_the_line() {
+        assert_eq!(current_line_start("one\ntwo", 5), 4);
+        assert_eq!(current_line_end("one\ntwo", 4), 7);
+        assert_eq!(current_line_end("one\ntwo", 2), 3);
+    }
+
+    #[test]
+    fn delete_to_previous_word_start_keeps_newline_separate() {
+        assert_eq!(delete_to_previous_word_start("hello\n   world", 9), 6);
+    }
+
+    #[test]
+    fn delete_to_previous_word_start_deletes_newline_from_line_start() {
+        assert_eq!(delete_to_previous_word_start("hello\nworld", 6), 5);
+    }
 }
 
 fn line_range_at_offset(content: &str, offset: usize) -> Range<usize> {
