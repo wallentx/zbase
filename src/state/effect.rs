@@ -43,6 +43,9 @@ pub enum BackendCommand {
     LoadConversation {
         conversation_id: ConversationId,
     },
+    LoadConversationMembers {
+        conversation_id: ConversationId,
+    },
     LoadThread {
         conversation_id: ConversationId,
         root_id: MessageId,

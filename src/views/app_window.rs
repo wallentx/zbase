@@ -2889,7 +2889,7 @@ impl AppWindow {
                     .map(|roles_by_user| {
                         roles_by_user
                             .iter()
-                            .map(|(user_id, role)| {
+                            .filter_map(|(user_id, role)| {
                                 let mapped = match role {
                                     crate::state::event::TeamRoleKind::Admin => {
                                         TeamAuthorRole::Admin
@@ -2897,11 +2897,12 @@ impl AppWindow {
                                     crate::state::event::TeamRoleKind::Owner => {
                                         TeamAuthorRole::Owner
                                     }
+                                    crate::state::event::TeamRoleKind::Member => return None,
                                 };
-                                (
+                                Some((
                                     crate::domain::ids::UserId::new(user_id.0.to_ascii_lowercase()),
                                     mapped,
-                                )
+                                ))
                             })
                             .collect::<HashMap<_, _>>()
                     })
@@ -7539,14 +7540,27 @@ fn build_channel_details(
     current_user_id: Option<&UserId>,
 ) -> ChannelDetails {
     let mut members = Vec::new();
-    let mut member_preview = Vec::new();
     let team_role_map = backend
         .conversation_team_ids
         .get(&summary.id)
         .and_then(|team_id| backend.team_roles.get(team_id));
-    let mut sorted_member_ids = team_role_map
-        .map(|roles| roles.keys().cloned().collect::<Vec<_>>())
+    let mut sorted_member_ids = backend
+        .conversation_members
+        .get(&summary.id)
+        .map(|state| state.members.clone())
         .unwrap_or_default();
+    if sorted_member_ids.is_empty() {
+        sorted_member_ids = match summary.kind {
+            ConversationKind::DirectMessage | ConversationKind::GroupDirectMessage => summary
+                .title
+                .split(',')
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(|username| UserId::new(username.to_ascii_lowercase()))
+                .collect(),
+            ConversationKind::Channel => Vec::new(),
+        };
+    }
     sorted_member_ids.sort_by(|left, right| left.0.cmp(&right.0));
     for user_id in sorted_member_ids.into_iter() {
         let profile = backend.user_profiles.get(&user_id).or_else(|| {
@@ -7574,52 +7588,27 @@ fn build_channel_details(
                         .cloned()
                 })
                 .unwrap_or(Affinity::None),
+            is_team_admin_or_owner: team_role_map.is_some_and(|roles| {
+                matches!(
+                    roles.get(&user_id),
+                    Some(TeamRoleKind::Admin | TeamRoleKind::Owner)
+                )
+            }),
         };
-        if member_preview.len() < 6 {
-            member_preview.push(preview.clone());
-        }
         members.push(preview);
     }
-    if member_preview.is_empty() {
-        for username in summary
-            .title
-            .split(',')
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-        {
-            let lookup = UserId::new(username.to_ascii_lowercase());
-            let profile = backend.user_profiles.get(&lookup).or_else(|| {
-                backend
-                    .user_profiles
-                    .get(&UserId::new(username.to_string()))
-            });
-            let display_name = profile
-                .map(|profile| profile.display_name.trim())
-                .filter(|name| !name.is_empty())
-                .map(|name| name.to_string())
-                .unwrap_or_else(|| username.to_string());
-            let preview = ChannelMemberPreview {
-                user_id: lookup.clone(),
-                display_name,
-                avatar_asset: profile.and_then(|profile| profile.avatar_asset.clone()),
-                affinity: backend
-                    .user_affinities
-                    .get(&lookup)
-                    .cloned()
-                    .or_else(|| {
-                        backend
-                            .user_affinities
-                            .get(&UserId::new(lookup.0.to_ascii_lowercase()))
-                            .cloned()
-                    })
-                    .unwrap_or(Affinity::None),
-            };
-            if member_preview.len() < 6 {
-                member_preview.push(preview.clone());
-            }
-            members.push(preview);
-        }
-    }
+    // If we don't have a roster yet:
+    // - DMs/GDMs: we can reasonably derive from title.
+    // - Channels: we intentionally show empty until backend provides roster.
+
+    members.sort_by(|left, right| {
+        let left_name = left.display_name.trim().to_ascii_lowercase();
+        let right_name = right.display_name.trim().to_ascii_lowercase();
+        left_name
+            .cmp(&right_name)
+            .then_with(|| left.user_id.0.cmp(&right.user_id.0))
+    });
+    let member_preview = members.iter().take(6).cloned().collect::<Vec<_>>();
 
     let role = current_user_id
         .and_then(|user_id| team_role_map.and_then(|roles| roles.get(user_id)))
@@ -7632,8 +7621,9 @@ fn build_channel_details(
     };
     let topic = summary.topic.trim().to_string();
 
-    let derived_member_count = if let Some(roles) = team_role_map {
-        roles.len() as u32
+    let derived_member_count = if let Some(state) = backend.conversation_members.get(&summary.id)
+    {
+        state.members.len() as u32
     } else if member_count > 0 {
         member_count
     } else {
@@ -8095,8 +8085,9 @@ fn timeline_author_roles_signature(
             continue;
         };
         let role_value = match role {
-            crate::state::event::TeamRoleKind::Admin => 1u64,
-            crate::state::event::TeamRoleKind::Owner => 2u64,
+            crate::state::event::TeamRoleKind::Member => 1u64,
+            crate::state::event::TeamRoleKind::Admin => 2u64,
+            crate::state::event::TeamRoleKind::Owner => 3u64,
         };
         mix_sig(&mut sig, role_value);
     }

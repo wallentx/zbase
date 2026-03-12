@@ -83,11 +83,20 @@ fn reduce_ui_action(state: &mut UiState, action: UiAction) -> ReducerOutput {
                 state.timeline.loading_older = false;
             }
 
-            ReducerOutput {
-                effects: vec![Effect::Backend(BackendCommand::LoadConversation {
+            let mut effects = vec![Effect::Backend(BackendCommand::LoadConversation {
+                conversation_id: conversation_id.clone(),
+            })];
+            if state
+                .backend
+                .accounts
+                .values()
+                .any(|account| account.capabilities.supports_conversation_members)
+            {
+                effects.push(Effect::Backend(BackendCommand::LoadConversationMembers {
                     conversation_id,
-                })],
+                }));
             }
+            ReducerOutput { effects }
         }
         UiAction::NavigateQuiet(route) => {
             state.navigation.current_route = Some(route.clone());
@@ -1254,6 +1263,21 @@ fn reduce_backend_event(state: &mut UiState, event: BackendEvent) -> ReducerOutp
                 role_index.insert(role_entry.user_id, role_entry.role);
             }
             state.backend.team_roles.insert(team_id, role_index);
+        }
+        BackendEvent::ConversationMembersUpdated {
+            conversation_id,
+            members,
+            updated_ms,
+            is_complete,
+        } => {
+            state.backend.conversation_members.insert(
+                conversation_id,
+                super::state::ConversationMembersState {
+                    members,
+                    updated_ms,
+                    is_complete,
+                },
+            );
         }
         BackendEvent::ConversationUnreadChanged {
             conversation_id,

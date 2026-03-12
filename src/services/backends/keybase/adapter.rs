@@ -1548,6 +1548,18 @@ impl ChatBackend for KeybaseBackend {
                 });
                 Ok(Vec::new())
             }
+            RoutedBackendCommand::LoadConversationMembers { conversation, .. } => {
+                self.ensure_listener_started();
+                let Some(sender) = self.inbound_sender.clone() else {
+                    return Ok(Vec::new());
+                };
+                let conversation_id = canonical_conversation_id_from_provider_ref(&conversation);
+                let dedupe_key = format!("load_conversation_members:{}", conversation_id.0);
+                let _ = task_runtime::spawn_task(TaskPriority::High, Some(dedupe_key), move || {
+                    run_load_conversation_members(sender, conversation_id);
+                });
+                Ok(Vec::new())
+            }
             RoutedBackendCommand::RefreshParticipants {
                 user_id,
                 conversation_id,
@@ -1925,6 +1937,7 @@ const CHAT_DOWNLOAD_FILE_ATTACHMENT_LOCAL: &str = "chat.1.local.DownloadFileAtta
 const CHAT_USER_EMOJIS: &str = "chat.1.local.userEmojis";
 const CHAT_MARK_AS_READ_LOCAL: &str = "chat.1.local.markAsReadLocal";
 const CHAT_REFRESH_PARTICIPANTS_LOCAL: &str = "chat.1.local.refreshParticipants";
+const CHAT_GET_PARTICIPANTS_LOCAL: &str = "chat.1.local.getParticipants";
 const CHAT_GET_LAST_ACTIVE_FOR_TLF_LOCAL: &str = "chat.1.local.getLastActiveForTLF";
 const CHAT_PIN_MESSAGE_LOCAL: &str = "chat.1.local.pinMessage";
 const CHAT_UNPIN_MESSAGE_LOCAL: &str = "chat.1.local.unpinMessage";
@@ -2681,6 +2694,121 @@ fn run_refresh_profile_presence(
             );
         }
     }
+}
+
+fn run_load_conversation_members(sender: Sender<BackendEvent>, conversation_id: ConversationId) {
+    let Some(raw_conversation_id) = provider_ref_to_conversation_id_bytes(
+        &ProviderConversationRef::new(conversation_id.0.clone()),
+    ) else {
+        return;
+    };
+    let Some(path) = socket_path() else {
+        send_internal(
+            &sender,
+            "zbase.internal.get_participants_socket_path_missing",
+            Value::from(conversation_id.0.clone()),
+        );
+        return;
+    };
+    let runtime = match Builder::new_current_thread().enable_all().build() {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            send_internal(
+                &sender,
+                "zbase.internal.get_participants_runtime_init_failed",
+                Value::from(error.to_string()),
+            );
+            return;
+        }
+    };
+
+    let result = runtime.block_on(async move {
+        let transport = FramedMsgpackTransport::connect(&path).await?;
+        let mut client = KeybaseRpcClient::new(transport);
+        client
+            .call(
+                CHAT_GET_PARTICIPANTS_LOCAL,
+                vec![Value::Map(vec![(
+                    Value::from("convID"),
+                    Value::Binary(raw_conversation_id),
+                )])],
+            )
+            .await
+            .map_err(|e| io::Error::other(e.to_string()))
+    });
+
+    let response = match result {
+        Ok(response) => response,
+        Err(error) => {
+            send_internal(
+                &sender,
+                "zbase.internal.get_participants_failed",
+                Value::Map(vec![
+                    (Value::from("conversation_id"), Value::from(conversation_id.0.clone())),
+                    (Value::from("error"), Value::from(error.to_string())),
+                ]),
+            );
+            return;
+        }
+    };
+
+    let Some(usernames) = parse_conversation_participants_usernames(&response) else {
+        send_internal(
+            &sender,
+            "zbase.internal.get_participants_unparseable",
+            Value::Map(vec![
+                (Value::from("conversation_id"), Value::from(conversation_id.0.clone())),
+                (
+                    Value::from("response_kind"),
+                    Value::from(format!("{:?}", response)),
+                ),
+            ]),
+        );
+        return;
+    };
+
+    let mut members = usernames
+        .into_iter()
+        .map(UserId::new)
+        .collect::<Vec<_>>();
+    members.sort_by(|left, right| left.0.cmp(&right.0));
+    members.dedup_by(|left, right| left.0.eq_ignore_ascii_case(&right.0));
+    let _ = sender.send(BackendEvent::ConversationMembersUpdated {
+        conversation_id,
+        members,
+        updated_ms: now_unix_ms(),
+        is_complete: true,
+    });
+}
+
+fn parse_conversation_participants_usernames(value: &Value) -> Option<Vec<String>> {
+    // chat.1.local.getParticipants returns []ConversationLocalParticipant where each item has
+    // { username, fullname?, contactName?, inConvName }.
+    let items = if let Some(items) = as_array(value) {
+        items
+    } else if let Some(result) = map_get_any(value, &["result", "Result"]).and_then(as_array) {
+        result
+    } else if let Some(result) = map_get_any(value, &["participants", "Participants"]).and_then(as_array) {
+        result
+    } else {
+        return None;
+    };
+    let mut usernames = Vec::new();
+    for item in items {
+        let Some(username) = map_get_any(item, &["username", "Username"])
+            .and_then(as_str)
+            .map(str::trim)
+            .filter(|u| !u.is_empty())
+        else {
+            continue;
+        };
+        if let Some(canon) = canonical_username(username) {
+            usernames.push(canon);
+        }
+    }
+    usernames.sort();
+    usernames.dedup();
+    Some(usernames)
 }
 
 fn candidate_profile_presence_conversations(
@@ -8761,6 +8889,7 @@ fn team_roles_backend_event(
 
 fn team_role_kind_from_raw(role: i64) -> Option<TeamRoleKind> {
     match role {
+        0..=2 => Some(TeamRoleKind::Member),
         3 => Some(TeamRoleKind::Admin),
         4 => Some(TeamRoleKind::Owner),
         _ => None,
@@ -9114,6 +9243,10 @@ fn parse_live_message_from_notify(event: &KeybaseNotifyEvent) -> Option<MessageR
     merge_emoji_source_refs(
         &mut emoji_source_refs,
         parse_emoji_source_refs(conversation_root, message_body),
+    );
+    merge_emoji_source_refs(
+        &mut emoji_source_refs,
+        parse_emoji_source_refs(raw_params, message_body),
     );
     let fragments = fragments_from_message_body(
         &body,
@@ -16540,6 +16673,89 @@ mod tests {
             fragment,
             MessageFragment::ChannelMention { name } if name == "general"
         )));
+    }
+
+    #[test]
+    fn parse_live_message_from_notify_attaches_emoji_source_ref_from_top_level_content_metadata() {
+        let event = KeybaseNotifyEvent::Unknown {
+            method: "chat.1.NotifyChat.NewChatActivity".to_string(),
+            raw_params: Value::Map(vec![
+                (
+                    Value::from("activity"),
+                    Value::Map(vec![(
+                        Value::from("incomingMessage"),
+                        Value::Map(vec![
+                            (Value::from("convID"), Value::Binary(vec![0x12, 0x34])),
+                            (
+                                Value::from("message"),
+                                Value::Map(vec![
+                                    (Value::from("state"), Value::from(0)),
+                                    (
+                                        Value::from("valid"),
+                                        Value::Map(vec![
+                                            (Value::from("messageID"), Value::from(3670)),
+                                            (Value::from("senderUsername"), Value::from("jde5011")),
+                                            (
+                                                Value::from("messageBody"),
+                                                Value::Map(vec![(
+                                                    Value::from("text"),
+                                                    Value::Map(vec![(
+                                                        Value::from("body"),
+                                                        Value::from(":sadpanda:"),
+                                                    )]),
+                                                )]),
+                                            ),
+                                        ]),
+                                    ),
+                                ]),
+                            ),
+                        ]),
+                    )]),
+                ),
+                (
+                    Value::from("content"),
+                    Value::Map(vec![
+                        (Value::from("type"), Value::from("text")),
+                        (
+                            Value::from("text"),
+                            Value::Map(vec![
+                                (Value::from("body"), Value::from(":sadpanda:")),
+                                (
+                                    Value::from("emojis"),
+                                    Value::Array(vec![Value::Map(vec![
+                                        (Value::from("alias"), Value::from("sadpanda")),
+                                        (
+                                            Value::from("convID"),
+                                            Value::from(
+                                                "0000e31c8f25f28d7f9ae01b5925ad65884a82767fdd75f69efa2c9ec6506812",
+                                            ),
+                                        ),
+                                        (Value::from("messageID"), Value::from(4)),
+                                    ])]),
+                                ),
+                            ]),
+                        ),
+                    ]),
+                ),
+            ]),
+        };
+
+        let message = parse_live_message_from_notify(&event).expect("expected live message");
+        let source_ref = message
+            .fragments
+            .iter()
+            .find_map(|fragment| match fragment {
+                MessageFragment::Emoji {
+                    alias,
+                    source_ref: Some(source_ref),
+                } if alias == "sadpanda" => Some(source_ref.clone()),
+                _ => None,
+            })
+            .expect("expected emoji source ref");
+        assert_eq!(
+            source_ref.ref_key,
+            "emoji:conv=0000e31c8f25f28d7f9ae01b5925ad65884a82767fdd75f69efa2c9ec6506812:msg=4"
+        );
     }
 
     #[test]

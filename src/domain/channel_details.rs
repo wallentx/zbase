@@ -18,6 +18,7 @@ pub struct ChannelMemberPreview {
     pub display_name: String,
     pub avatar_asset: Option<String>,
     pub affinity: Affinity,
+    pub is_team_admin_or_owner: bool,
 }
 
 #[derive(Clone, Debug)]

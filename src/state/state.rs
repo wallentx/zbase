@@ -180,9 +180,18 @@ pub struct BackendRuntimeState {
     pub conversation_pins: HashMap<ConversationId, PinnedState>,
     pub conversation_team_ids: HashMap<ConversationId, String>,
     pub team_roles: HashMap<String, HashMap<UserId, TeamRoleKind>>,
+    /// Authoritative per-conversation member roster (backend-provided when supported).
+    pub conversation_members: HashMap<ConversationId, ConversationMembersState>,
     pub workspace_bindings: HashMap<crate::domain::ids::WorkspaceId, WorkspaceBinding>,
     pub conversation_bindings: HashMap<ConversationId, ConversationBinding>,
     pub message_bindings: HashMap<MessageId, MessageBinding>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct ConversationMembersState {
+    pub members: Vec<UserId>,
+    pub updated_ms: i64,
+    pub is_complete: bool,
 }
 
 #[derive(Clone, Debug)]

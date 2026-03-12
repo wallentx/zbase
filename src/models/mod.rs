@@ -4011,6 +4011,7 @@ mod tests {
             display_name: "cameroncooper".to_string(),
             avatar_asset: None,
             affinity: Affinity::Positive,
+            is_team_admin_or_owner: false,
         };
         models.conversation.details = Some(ChannelDetails {
             conversation_id,
@@ -4090,6 +4091,7 @@ mod tests {
             display_name: "Cameron Cooper".to_string(),
             avatar_asset: None,
             affinity: Affinity::Positive,
+            is_team_admin_or_owner: false,
         };
         models.conversation.details = Some(ChannelDetails {
             conversation_id,

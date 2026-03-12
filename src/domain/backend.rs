@@ -77,6 +77,7 @@ pub struct BackendCapabilities {
     pub supports_user_profiles: bool,
     pub supports_identity_proofs: bool,
     pub supports_social_graph: bool,
+    pub supports_conversation_members: bool,
 }
 
 impl BackendCapabilities {
@@ -102,6 +103,7 @@ impl BackendCapabilities {
             supports_user_profiles: true,
             supports_identity_proofs: true,
             supports_social_graph: true,
+            supports_conversation_members: true,
         }
     }
 }

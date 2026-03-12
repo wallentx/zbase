@@ -558,13 +558,8 @@ fn build_text_runs_for_content(
         if run_italic {
             run_font.style = FontStyle::Italic;
         }
-        let has_styled_color = styled_ranges
-            .iter()
-            .any(|s| s.color.is_some() && range_covers_span(&s.byte_range, span_start, span_end));
         let underline = if link_active {
-            if !has_styled_color {
-                run_color = link_color;
-            }
+            run_color = link_color;
             Some(UnderlineStyle {
                 color: Some(run_color),
                 ..Default::default()
