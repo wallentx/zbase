@@ -793,10 +793,7 @@ impl OverlayHost {
                                 .min_w(px(0.))
                                 .text_xs()
                                 .text_color(rgb(text_secondary()))
-                                .child(Self::highlighted_text_element(
-                                    sublabel,
-                                    sublabel_ranges,
-                                )),
+                                .child(Self::highlighted_text_element(sublabel, sublabel_ranges)),
                         )
                     }),
             )
@@ -905,10 +902,7 @@ impl OverlayHost {
         elements
     }
 
-    fn highlighted_text_element(
-        text: &str,
-        ranges: &[(usize, usize)],
-    ) -> HighlightedTextElement {
+    fn highlighted_text_element(text: &str, ranges: &[(usize, usize)]) -> HighlightedTextElement {
         let mut normalized: Vec<(usize, usize)> = ranges
             .iter()
             .copied()

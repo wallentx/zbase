@@ -379,10 +379,7 @@ impl SelectableText {
             if over_link != self.hovering_link {
                 self.hovering_link = over_link;
                 if over_link {
-                    window.dispatch_action(
-                        Box::new(commands::DismissHoverToolbar),
-                        cx,
-                    );
+                    window.dispatch_action(Box::new(commands::DismissHoverToolbar), cx);
                 }
                 cx.notify();
             }
@@ -421,9 +418,7 @@ impl SelectableText {
         if self.link_ranges.is_empty() {
             return false;
         }
-        let in_bounds = self
-            .last_bounds
-            .map_or(false, |b| b.contains(&position));
+        let in_bounds = self.last_bounds.map_or(false, |b| b.contains(&position));
         if !in_bounds {
             return false;
         }

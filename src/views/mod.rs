@@ -18,11 +18,11 @@ pub mod sidebar;
 pub mod splash;
 pub mod timeline;
 
+use gpui::prelude::FluentBuilder;
 use gpui::{
     AnyElement, Background, BoxShadow, FontWeight, Hsla, ImageSource, IntoElement, ParentElement,
     SharedString, Styled, div, linear_color_stop, linear_gradient, point, px, rgb, svg,
 };
-use gpui::prelude::FluentBuilder;
 use std::{cell::Cell, path::PathBuf};
 
 use crate::{
@@ -888,12 +888,7 @@ pub fn attachment_header_row(attachment: &AttachmentSummary) -> AnyElement {
         .items_center()
         .gap_1()
         .child(paperclip_icon_small(text_secondary()))
-        .child(
-            div()
-                .text_xs()
-                .text_color(rgb(text_primary()))
-                .child(name),
-        )
+        .child(div().text_xs().text_color(rgb(text_primary())).child(name))
         .when_some(size, |row, size_label| {
             row.child(
                 div()

@@ -1,6 +1,6 @@
 use crate::domain::message::LinkPreview;
-use crate::services::local_store::paths::data_root;
 use crate::services::local_store::LocalStore;
+use crate::services::local_store::paths::data_root;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, mpsc::Sender};
@@ -63,10 +63,7 @@ impl OgService {
         let sender = sender.clone();
         std::thread::spawn(move || {
             let preview = fetch_og_preview(&key);
-            let _ = sender.send(OgFetchResult {
-                url: key,
-                preview,
-            });
+            let _ = sender.send(OgFetchResult { url: key, preview });
         });
     }
 
@@ -137,7 +134,9 @@ async fn fetch_og_preview_async(url: &str) -> Option<LinkPreview> {
         return None;
     }
 
-    let thumbnail_url = image.as_ref().and_then(|img| resolve_image_url(&normalized, img));
+    let thumbnail_url = image
+        .as_ref()
+        .and_then(|img| resolve_image_url(&normalized, img));
     let (thumbnail_asset, media_dimensions) = if let Some(ref image_url) = thumbnail_url {
         download_thumbnail(&client, image_url)
             .await
@@ -190,7 +189,12 @@ fn thumbnail_cache_path(url: &str) -> PathBuf {
     let ext = url
         .rsplit('.')
         .next()
-        .filter(|e| matches!(e.to_ascii_lowercase().as_str(), "jpg" | "jpeg" | "png" | "gif" | "webp"))
+        .filter(|e| {
+            matches!(
+                e.to_ascii_lowercase().as_str(),
+                "jpg" | "jpeg" | "png" | "gif" | "webp"
+            )
+        })
         .unwrap_or("jpg");
     og_thumbnail_cache_dir().join(format!("{hash}.{ext}"))
 }
@@ -282,10 +286,7 @@ fn extract_title_tag(head: &str) -> Option<String> {
 
 fn extract_attribute_value(tag: &str, attr: &str) -> Option<String> {
     let lower = tag.to_ascii_lowercase();
-    let patterns = [
-        format!("{attr}=\""),
-        format!("{attr}='"),
-    ];
+    let patterns = [format!("{attr}=\""), format!("{attr}='")];
     for pattern in &patterns {
         if let Some(start) = lower.find(pattern.as_str()) {
             let value_start = start + pattern.len();
@@ -341,7 +342,10 @@ mod tests {
     fn extract_og_title_from_html() {
         let html = r#"<html><head><meta property="og:title" content="Hello World"><meta property="og:image" content="https://example.com/img.jpg"></head><body></body></html>"#;
         let head = extract_head(html).unwrap();
-        assert_eq!(extract_meta_content(&head, "og:title").unwrap(), "Hello World");
+        assert_eq!(
+            extract_meta_content(&head, "og:title").unwrap(),
+            "Hello World"
+        );
         assert_eq!(
             extract_meta_content(&head, "og:image").unwrap(),
             "https://example.com/img.jpg"

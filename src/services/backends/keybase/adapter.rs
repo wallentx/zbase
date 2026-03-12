@@ -1814,10 +1814,7 @@ fn run_listener(
                             }
                             if let Some(ref meta) = pending_send_meta {
                                 if let Some(ref local_path) = meta.local_attachment_path {
-                                    stamp_local_attachment_path(
-                                        &mut live_message,
-                                        local_path,
-                                    );
+                                    stamp_local_attachment_path(&mut live_message, local_path);
                                 }
                             }
                             ingest_message_record(
@@ -5643,9 +5640,7 @@ fn spawn_live_attachment_hydration(
     if !needs_image && !needs_video && !needs_file {
         return;
     }
-    let Some(raw_conversation_id) =
-        conversation_id_to_raw_bytes(&message.conversation_id)
-    else {
+    let Some(raw_conversation_id) = conversation_id_to_raw_bytes(&message.conversation_id) else {
         return;
     };
     let Ok(_message_id_i64) = message.id.0.parse::<i64>() else {
@@ -5694,7 +5689,10 @@ fn conversation_id_to_raw_bytes(id: &ConversationId) -> Option<Vec<u8>> {
 fn stamp_local_attachment_path(message: &mut MessageRecord, local_path: &str) {
     let local_source = AttachmentSource::LocalPath(local_path.to_string());
     for attachment in &mut message.attachments {
-        if matches!(attachment.kind, AttachmentKind::Image | AttachmentKind::Video) {
+        if matches!(
+            attachment.kind,
+            AttachmentKind::Image | AttachmentKind::Video
+        ) {
             attachment.source = Some(local_source.clone());
             if attachment.kind == AttachmentKind::Image {
                 if let Some(ref mut preview) = attachment.preview {
@@ -5782,7 +5780,11 @@ fn merge_cached_attachment_paths(local_store: &LocalStore, message: &mut Message
     if cached.attachments.len() != message.attachments.len() {
         return;
     }
-    for (fresh, cached) in message.attachments.iter_mut().zip(cached.attachments.iter()) {
+    for (fresh, cached) in message
+        .attachments
+        .iter_mut()
+        .zip(cached.attachments.iter())
+    {
         if fresh.kind != cached.kind {
             continue;
         }
@@ -11044,17 +11046,17 @@ async fn hydrate_thread_attachment_paths(
 
 fn message_needs_image_attachment_hydration(message: &MessageRecord) -> bool {
     message.attachments.iter().any(|attachment| {
-        attachment.kind == AttachmentKind::Image && !attachment_has_renderable_image_source(attachment)
+        attachment.kind == AttachmentKind::Image
+            && !attachment_has_renderable_image_source(attachment)
     })
 }
 
 fn message_needs_video_attachment_hydration(message: &MessageRecord) -> bool {
     message.attachments.iter().any(|attachment| {
         attachment.kind == AttachmentKind::Video
-            && !attachment
-                .source
-                .as_ref()
-                .is_some_and(|source| matches!(source, AttachmentSource::LocalPath(p) if !p.trim().is_empty()))
+            && !attachment.source.as_ref().is_some_and(
+                |source| matches!(source, AttachmentSource::LocalPath(p) if !p.trim().is_empty()),
+            )
     })
 }
 
@@ -11137,9 +11139,7 @@ async fn hydrate_attachment_paths_for_messages(
                 let preview_renderable = attachment
                     .preview
                     .as_ref()
-                    .is_some_and(|preview| {
-                        attachment_source_renderable_for_image(&preview.source)
-                    });
+                    .is_some_and(|preview| attachment_source_renderable_for_image(&preview.source));
                 if !preview_renderable {
                     let Some(file_path) =
                         preview_file_path.clone().or_else(|| full_file_path.clone())
@@ -11167,10 +11167,9 @@ async fn hydrate_attachment_paths_for_messages(
                     attachment_updated = true;
                 }
             } else if attachment.kind == AttachmentKind::Video && needs_video_hydration {
-                let already_has_local_source = attachment
-                    .source
-                    .as_ref()
-                    .is_some_and(|s| matches!(s, AttachmentSource::LocalPath(p) if !p.trim().is_empty()));
+                let already_has_local_source = attachment.source.as_ref().is_some_and(
+                    |s| matches!(s, AttachmentSource::LocalPath(p) if !p.trim().is_empty()),
+                );
                 if already_has_local_source {
                     continue;
                 }
@@ -11181,10 +11180,9 @@ async fn hydrate_attachment_paths_for_messages(
                 attachment_updated = true;
 
                 let thumb_path = format!("{video_path}.thumb.png");
-                if let Some((thumb_w, thumb_h)) = extract_video_thumbnail_to_file(
-                    Path::new(&video_path),
-                    Path::new(&thumb_path),
-                ) {
+                if let Some((thumb_w, thumb_h)) =
+                    extract_video_thumbnail_to_file(Path::new(&video_path), Path::new(&thumb_path))
+                {
                     attachment.preview = Some(AttachmentPreview {
                         source: AttachmentSource::LocalPath(thumb_path),
                         width: Some(thumb_w),

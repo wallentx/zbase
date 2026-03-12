@@ -386,10 +386,7 @@ fn reduce_ui_action(state: &mut UiState, action: UiAction) -> ReducerOutput {
             conversation_id,
             message_id,
         } => {
-            state
-                .timeline
-                .messages
-                .retain(|m| m.id != message_id);
+            state.timeline.messages.retain(|m| m.id != message_id);
             ReducerOutput {
                 effects: vec![Effect::Backend(BackendCommand::DeleteMessage {
                     op_id: next_op_id(state, "delete"),
@@ -2378,8 +2375,7 @@ mod tests {
         dm.unread_count = 1;
         dm.last_activity_ms = 1_000;
 
-        let sections =
-            build_sidebar_sections(&[channel], &[dm], &workspace_id, &HashMap::new());
+        let sections = build_sidebar_sections(&[channel], &[dm], &workspace_id, &HashMap::new());
         let unread = sections
             .iter()
             .find(|section| section.id.as_ref().is_some_and(|id| id.0 == "unread"))

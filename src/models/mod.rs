@@ -1134,11 +1134,9 @@ impl AppModels {
                 summary.title.eq_ignore_ascii_case(channel)
                     || summary.topic.eq_ignore_ascii_case(channel)
             }),
-            None => self
-                .workspace
-                .direct_messages
-                .iter()
-                .find(|summary| normalize_tlf_name(&summary.topic) == normalize_tlf_name(&parsed.team)),
+            None => self.workspace.direct_messages.iter().find(|summary| {
+                normalize_tlf_name(&summary.topic) == normalize_tlf_name(&parsed.team)
+            }),
         }?;
         let route = quick_switcher_route_for_summary(summary, &self.app.active_workspace_id);
         Some((route, MessageId::new(parsed.message_id)))
@@ -3192,7 +3190,11 @@ fn quick_switcher_sublabel_for_summary(summary: &ConversationSummary) -> Option<
 }
 
 fn normalize_tlf_name(tlf: &str) -> String {
-    let mut parts: Vec<&str> = tlf.split(',').map(str::trim).filter(|s| !s.is_empty()).collect();
+    let mut parts: Vec<&str> = tlf
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect();
     parts.sort_unstable_by(|a, b| a.to_ascii_lowercase().cmp(&b.to_ascii_lowercase()));
     parts.join(",")
 }

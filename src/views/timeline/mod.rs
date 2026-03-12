@@ -18,16 +18,16 @@ use crate::{
         arrow_left_icon, arrow_right_icon, attachment_display_label, attachment_header_row,
         attachment_image_source, attachment_lightbox_source,
         avatar::{Avatar, default_avatar_background},
-        badge, crown_icon, danger, format_duration_ms, glass_surface_dark, hash_icon,
+        badge, clipboard_icon, copy_icon, crown_icon, danger, format_duration_ms,
+        glass_surface_dark, hash_icon,
         inline_markdown::{InlineMarkdownConfig, apply_inline_markdown, remap_source_byte_range},
-        clipboard_icon, copy_icon, mention_soft, panel_alt_bg, panel_bg, pin_icon, play_icon,
-        plus_icon, trash_icon,
+        mention_soft, panel_alt_bg, panel_bg, pin_icon, play_icon, plus_icon,
         selectable_text::{
             InlineAttachment, LinkRange, SelectableText, StyledRange, resolve_selectable_text,
             resolve_selectable_text_inline, resolve_selectable_text_with_attachments,
         },
         shell_border, sliders_icon, subtle_surface, text_primary, text_secondary, thread_icon,
-        tint, warning, warning_soft,
+        tint, trash_icon, warning, warning_soft,
     },
 };
 use gpui::prelude::FluentBuilder;
@@ -920,29 +920,24 @@ impl TimelineList {
                                             )))
                                             .w(px(media_width))
                                             .h(px(media_height))
-                                            .when_some(
-                                                lightbox_source,
-                                                |thumb, lightbox_source| {
-                                                    let caption_text = lightbox_caption.clone();
-                                                    thumb
-                                                        .cursor(gpui::CursorStyle::PointingHand)
-                                                        .on_mouse_move(cx.listener(|this, _, _, cx| {
-                                                            this.clear_hovered_message(cx);
-                                                            cx.stop_propagation();
-                                                        }))
-                                                        .on_click(cx.listener(
-                                                            move |this, _, _, cx| {
-                                                                this.open_image_lightbox(
-                                                                    lightbox_source.clone(),
-                                                                    caption_text.clone(),
-                                                                    lightbox_width,
-                                                                    lightbox_height,
-                                                                    cx,
-                                                                );
-                                                            },
-                                                        ))
-                                                },
-                                            )
+                                            .when_some(lightbox_source, |thumb, lightbox_source| {
+                                                let caption_text = lightbox_caption.clone();
+                                                thumb
+                                                    .cursor(gpui::CursorStyle::PointingHand)
+                                                    .on_mouse_move(cx.listener(|this, _, _, cx| {
+                                                        this.clear_hovered_message(cx);
+                                                        cx.stop_propagation();
+                                                    }))
+                                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                                        this.open_image_lightbox(
+                                                            lightbox_source.clone(),
+                                                            caption_text.clone(),
+                                                            lightbox_width,
+                                                            lightbox_height,
+                                                            cx,
+                                                        );
+                                                    }))
+                                            })
                                             .child(
                                                 img(media_source)
                                                     .w(px(media_width))
@@ -1286,11 +1281,7 @@ impl TimelineList {
                                     )))
                                     .on_click(cx.listener(move |this, _, _, cx| {
                                         this.clear_hovered_message(cx);
-                                        this.quick_react(
-                                            msg_id.clone(),
-                                            emoji_text.clone(),
-                                            cx,
-                                        );
+                                        this.quick_react(msg_id.clone(), emoji_text.clone(), cx);
                                     }))
                                     .w(px(26.))
                                     .h(px(26.))
@@ -1315,11 +1306,7 @@ impl TimelineList {
                                     )))
                                     .on_click(cx.listener(move |this, _, _, cx| {
                                         this.clear_hovered_message(cx);
-                                        this.quick_react(
-                                            msg_id.clone(),
-                                            emoji_alias.clone(),
-                                            cx,
-                                        );
+                                        this.quick_react(msg_id.clone(), emoji_alias.clone(), cx);
                                     }))
                                     .w(px(26.))
                                     .h(px(26.))
@@ -1329,11 +1316,7 @@ impl TimelineList {
                                     .justify_center()
                                     .hover(|s| s.bg(subtle_surface()))
                                     .cursor(gpui::CursorStyle::PointingHand)
-                                    .child(
-                                        img(SharedString::from(path))
-                                            .w(px(18.))
-                                            .h(px(18.)),
-                                    )
+                                    .child(img(SharedString::from(path)).w(px(18.)).h(px(18.)))
                                     .into_any_element(),
                             )
                         } else {
@@ -1443,16 +1426,17 @@ impl TimelineList {
                         left
                     });
 
-                let toolbar_top = hover_anchor_y
-                    .zip(hover_window_top)
-                    .map(|(anchor_y, window_top)| {
-                        let above = anchor_y - window_top - TOOLBAR_H - TOOLBAR_Y_GAP;
-                        if above >= 0.0 {
-                            above
-                        } else {
-                            anchor_y - window_top + TOOLBAR_Y_GAP
-                        }
-                    });
+                let toolbar_top =
+                    hover_anchor_y
+                        .zip(hover_window_top)
+                        .map(|(anchor_y, window_top)| {
+                            let above = anchor_y - window_top - TOOLBAR_H - TOOLBAR_Y_GAP;
+                            if above >= 0.0 {
+                                above
+                            } else {
+                                anchor_y - window_top + TOOLBAR_Y_GAP
+                            }
+                        });
 
                 let toolbar_visible = is_hovered && hover_toolbar_settled;
                 let toolbar_wrapper = div()
@@ -1462,16 +1446,12 @@ impl TimelineList {
                     .when_some(toolbar_top, |d, top| d.top(px(top)))
                     .when(toolbar_top.is_none(), |d| d.top(px(-14.)))
                     .when(toolbar_visible, |d| d.block_mouse_except_scroll())
-                    .on_mouse_move(
-                        cx.listener(move |_, _, _, cx| {
-                            cx.stop_propagation();
-                        }),
-                    )
+                    .on_mouse_move(cx.listener(move |_, _, _, cx| {
+                        cx.stop_propagation();
+                    }))
                     .when(!toolbar_visible, |d| d.opacity(0.))
                     .child(inline_toolbar);
-                deferred(toolbar_wrapper)
-                    .priority(10)
-                    .into_any_element()
+                deferred(toolbar_wrapper).priority(10).into_any_element()
             })
             .when(
                 show_thread_reply_badge && message.thread_reply_count > 0,
@@ -1830,11 +1810,17 @@ impl TimelineList {
                     )
                     .child(div().text_sm().text_color(rgb(text_primary())).child(title))
                     .when(has_title && !is_giphy, |container| {
-                        container.child(div().text_xs().text_color(rgb(accent())).child(preview.url.clone()))
+                        container.child(
+                            div()
+                                .text_xs()
+                                .text_color(rgb(accent()))
+                                .child(preview.url.clone()),
+                        )
                     })
                     .when_some(thumbnail, |container, thumb_path| {
                         let max_thumb_height = media_max_height.min(200.0);
-                        let (tw, th) = if let (Some(w), Some(h)) = (preview.media_width, preview.media_height)
+                        let (tw, th) = if let (Some(w), Some(h)) =
+                            (preview.media_width, preview.media_height)
                             && w > 0
                             && h > 0
                         {
