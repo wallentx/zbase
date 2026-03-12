@@ -11063,10 +11063,9 @@ fn message_needs_video_attachment_hydration(message: &MessageRecord) -> bool {
 fn message_needs_file_attachment_hydration(message: &MessageRecord) -> bool {
     message.attachments.iter().any(|attachment| {
         attachment.kind == AttachmentKind::File
-            && !attachment
-                .source
-                .as_ref()
-                .is_some_and(|source| matches!(source, AttachmentSource::LocalPath(p) if !p.trim().is_empty()))
+            && !attachment.source.as_ref().is_some_and(
+                |source| matches!(source, AttachmentSource::LocalPath(p) if !p.trim().is_empty()),
+            )
     })
 }
 
@@ -11118,11 +11117,12 @@ async fn hydrate_attachment_paths_for_messages(
         };
 
         let needs_image_download = needs_source_hydration || needs_preview_hydration;
-        let full_file_path = if needs_source_hydration || needs_video_hydration || needs_file_hydration {
-            download_attachment_to_cache(client, raw_conversation_id, message_id, false).await
-        } else {
-            None
-        };
+        let full_file_path =
+            if needs_source_hydration || needs_video_hydration || needs_file_hydration {
+                download_attachment_to_cache(client, raw_conversation_id, message_id, false).await
+            } else {
+                None
+            };
         let preview_file_path = if needs_preview_hydration {
             download_attachment_to_cache(client, raw_conversation_id, message_id, true).await
         } else {
@@ -11190,10 +11190,9 @@ async fn hydrate_attachment_paths_for_messages(
                     });
                 }
             } else if attachment.kind == AttachmentKind::File && needs_file_hydration {
-                let already_has_local_source = attachment
-                    .source
-                    .as_ref()
-                    .is_some_and(|s| matches!(s, AttachmentSource::LocalPath(p) if !p.trim().is_empty()));
+                let already_has_local_source = attachment.source.as_ref().is_some_and(
+                    |s| matches!(s, AttachmentSource::LocalPath(p) if !p.trim().is_empty()),
+                );
                 if already_has_local_source {
                     continue;
                 }

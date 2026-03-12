@@ -393,7 +393,8 @@ impl SelectableText {
             // word/line range. Avoid shrinking it on mouse-up when releasing within that range.
             if self.selected_range.is_empty() {
                 self.select_to(up_offset, cx);
-            } else if !(self.selected_range.start <= up_offset && up_offset <= self.selected_range.end)
+            } else if !(self.selected_range.start <= up_offset
+                && up_offset <= self.selected_range.end)
             {
                 self.select_to(up_offset, cx);
             }

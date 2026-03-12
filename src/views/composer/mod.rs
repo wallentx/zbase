@@ -1,8 +1,11 @@
 use crate::{
-    models::composer_model::{ComposerMode, ComposerModel},
+    models::composer_model::{
+        AutocompleteCandidate, AutocompleteState, ComposerMode, ComposerModel,
+    },
     views::{
         accent, accent_soft, app_window::AppWindow, emoji_icon, input::TextField, is_dark_theme,
-        paperclip_icon, shell_border, text_primary, text_secondary, tint,
+        modal_surface, paperclip_icon, shell_border, shell_border_strong, text_primary,
+        text_secondary, tint, card_shadow,
     },
 };
 use gpui::prelude::FluentBuilder;
@@ -127,5 +130,141 @@ impl ComposerPanel {
                     ),
             )
             .into_any_element()
+    }
+}
+
+pub(crate) fn render_autocomplete_popup(
+    autocomplete: &AutocompleteState,
+    composer_target: bool,
+    cx: &mut Context<AppWindow>,
+) -> AnyElement {
+    let rows = autocomplete
+        .candidates
+        .iter()
+        .enumerate()
+        .map(|(index, candidate)| {
+            let selected = index == autocomplete.selected_index;
+            let base = div()
+                .id((
+                    if composer_target {
+                        "inline-autocomplete-composer"
+                    } else {
+                        "inline-autocomplete-thread"
+                    },
+                    index,
+                ))
+                .w_full()
+                .px_2()
+                .py_1()
+                .rounded_sm()
+                .cursor(CursorStyle::PointingHand)
+                .bg(if selected {
+                    tint(accent_soft(), if is_dark_theme() { 0.45 } else { 0.85 })
+                } else {
+                    tint(0x000000, 0.0)
+                })
+                .hover(|style| {
+                    style.bg(tint(
+                        accent_soft(),
+                        if is_dark_theme() { 0.32 } else { 0.65 },
+                    ))
+                });
+            let clickable = if composer_target {
+                base.on_click(cx.listener(move |this, _, _, cx| {
+                    this.select_composer_autocomplete_index(index, cx);
+                }))
+            } else {
+                base.on_click(cx.listener(move |this, _, _, cx| {
+                    this.select_thread_autocomplete_index(index, cx);
+                }))
+            };
+            clickable.child(render_candidate_row(candidate))
+        })
+        .collect::<Vec<_>>();
+
+    div()
+        .w_full()
+        .rounded_xl()
+        .border_1()
+        .border_color(shell_border_strong())
+        .bg(modal_surface())
+        .shadow(card_shadow())
+        .px_1()
+        .py_1()
+        .flex()
+        .flex_col()
+        .gap_1()
+        .max_h(px(220.))
+        .overflow_hidden()
+        .children(rows)
+        .into_any_element()
+}
+
+fn render_candidate_row(candidate: &AutocompleteCandidate) -> AnyElement {
+    match candidate {
+        AutocompleteCandidate::MentionUser {
+            username,
+            display_name,
+            ..
+        } => div()
+            .flex()
+            .items_center()
+            .justify_between()
+            .gap_2()
+            .child(
+                div()
+                    .text_sm()
+                    .text_color(rgb(text_primary()))
+                    .child(display_name.clone()),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(text_secondary()))
+                    .child(format!("@{username}")),
+            )
+            .into_any_element(),
+        AutocompleteCandidate::MentionBroadcast {
+            keyword,
+            description,
+        } => div()
+            .flex()
+            .items_center()
+            .justify_between()
+            .gap_2()
+            .child(
+                div()
+                    .text_sm()
+                    .text_color(rgb(text_primary()))
+                    .child(format!("@{keyword}")),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(text_secondary()))
+                    .child(description.clone()),
+            )
+            .into_any_element(),
+        AutocompleteCandidate::Emoji {
+            label,
+            glyph,
+            insert_text: _,
+        } => div()
+            .flex()
+            .items_center()
+            .gap_2()
+            .child(
+                div()
+                    .text_base()
+                    .text_color(rgb(text_primary()))
+                    .child(glyph.clone().unwrap_or_else(|| "◻".to_string())),
+            )
+            .child(
+                div()
+                    .text_sm()
+                    .text_color(rgb(text_primary()))
+                    .child(label.clone()),
+            )
+            .into_any_element(),
     }
 }

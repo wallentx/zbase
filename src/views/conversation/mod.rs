@@ -2,8 +2,8 @@ use crate::{
     domain::pins::{PinnedItem, PinnedTarget},
     models::{
         composer_model::ComposerModel, conversation_model::ConversationModel,
-        find_in_chat_model::FindInChatModel, timeline_model::TimelineModel,
-        navigation_model::RightPaneMode,
+        find_in_chat_model::FindInChatModel, navigation_model::RightPaneMode,
+        timeline_model::TimelineModel,
     },
     views::{
         accent, accent_soft,
@@ -301,8 +301,10 @@ impl ConversationHeader {
         conversation: &ConversationModel,
         cx: &mut Context<AppWindow>,
     ) -> AnyElement {
-        let is_channel =
-            matches!(conversation.summary.kind, crate::domain::conversation::ConversationKind::Channel);
+        let is_channel = matches!(
+            conversation.summary.kind,
+            crate::domain::conversation::ConversationKind::Channel
+        );
         let title_content = div()
             .flex()
             .items_center()
