@@ -707,7 +707,15 @@ impl TextField {
 
     fn on_mouse_up(&mut self, event: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
         if self.is_selecting {
-            self.select_to(self.index_for_mouse_position(event.position), cx);
+            let up_offset = self.index_for_mouse_position(event.position);
+            // For double/triple click selection, mouse-down may have already established a full
+            // word/line range. Avoid shrinking it on mouse-up when releasing within that range.
+            if self.selected_range.is_empty() {
+                self.select_to(up_offset, cx);
+            } else if !(self.selected_range.start <= up_offset && up_offset <= self.selected_range.end)
+            {
+                self.select_to(up_offset, cx);
+            }
             self.is_selecting = false;
         }
     }
