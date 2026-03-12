@@ -3,6 +3,7 @@ use crate::{
     models::{
         composer_model::ComposerModel, conversation_model::ConversationModel,
         find_in_chat_model::FindInChatModel, timeline_model::TimelineModel,
+        navigation_model::RightPaneMode,
     },
     views::{
         accent, accent_soft,
@@ -20,8 +21,8 @@ use crate::{
 };
 use gpui::prelude::FluentBuilder;
 use gpui::{
-    AnyElement, Context, Entity, ExternalPaths, FontWeight, InteractiveElement, IntoElement,
-    ListState, ParentElement, StatefulInteractiveElement, Styled, div, px, rgb,
+    AnyElement, Context, CursorStyle, Entity, ExternalPaths, FontWeight, InteractiveElement,
+    IntoElement, ListState, ParentElement, StatefulInteractiveElement, Styled, div, px, rgb,
 };
 
 #[derive(Default)]
@@ -298,36 +299,49 @@ impl ConversationHeader {
     pub fn render(
         &self,
         conversation: &ConversationModel,
-        _cx: &mut Context<AppWindow>,
+        cx: &mut Context<AppWindow>,
     ) -> AnyElement {
+        let is_channel =
+            matches!(conversation.summary.kind, crate::domain::conversation::ConversationKind::Channel);
+        let title_content = div()
+            .flex()
+            .items_center()
+            .gap_3()
+            .child(Self::conversation_badge(conversation))
+            .when_some(conversation.summary.group.as_ref(), |d, group| {
+                d.child(
+                    div()
+                        .text_sm()
+                        .text_color(rgb(text_secondary()))
+                        .child(group.display_name.clone()),
+                )
+                .child(div().text_sm().text_color(rgb(text_secondary())).child("›"))
+            })
+            .child(
+                div()
+                    .text_xl()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .child(conversation.summary.title.clone()),
+            );
+        let title_row = if is_channel {
+            div()
+                .id("conversation-header-title")
+                .cursor(CursorStyle::PointingHand)
+                .on_click(cx.listener(|this, _, window, cx| {
+                    this.toggle_pane(RightPaneMode::Details, window, cx);
+                }))
+                .child(title_content)
+                .into_any_element()
+        } else {
+            div().child(title_content).into_any_element()
+        };
         div()
             .px_4()
             .py_3()
             .flex()
             .items_center()
             .justify_between()
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_3()
-                    .child(Self::conversation_badge(conversation))
-                    .when_some(conversation.summary.group.as_ref(), |d, group| {
-                        d.child(
-                            div()
-                                .text_sm()
-                                .text_color(rgb(text_secondary()))
-                                .child(group.display_name.clone()),
-                        )
-                        .child(div().text_sm().text_color(rgb(text_secondary())).child("›"))
-                    })
-                    .child(
-                        div()
-                            .text_xl()
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .child(conversation.summary.title.clone()),
-                    ),
-            )
+            .child(title_row)
             .into_any_element()
     }
 

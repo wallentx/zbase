@@ -20,11 +20,13 @@ use gpui::{
     ScrollHandle, StatefulInteractiveElement, Styled, div, px, rgb,
 };
 
-const ENV_PROFILE_DISABLE_VIRTUALIZATION: &str = "ZBASE_PROFILE_DISABLE_VIRTUALIZATION";
+const ENV_PROFILE_DISABLE_SOCIAL_VIRTUALIZATION: &str = "ZBASE_PROFILE_DISABLE_SOCIAL_VIRTUALIZATION";
+const SOCIAL_VIRTUALIZATION_MIN_ENTRIES: usize = 200;
 
 pub fn render_profile_panel(
     profile_panel: &ProfilePanelModel,
     profile_scroll: &ScrollHandle,
+    profile_social_scroll: &ScrollHandle,
     cx: &mut Context<AppWindow>,
 ) -> AnyElement {
     let Some(user_id) = profile_panel.user_id.as_ref() else {
@@ -69,12 +71,18 @@ pub fn render_profile_panel(
     let team_showcase = profile.map(profile_team_showcase).unwrap_or(&[]);
     let custom_fields = profile.map(profile_custom_fields).unwrap_or(&[]);
     let social_entries = social_graph_entries(social_graph, profile_panel.active_social_tab);
+    let use_social_virtualization =
+        social_entries.len() >= SOCIAL_VIRTUALIZATION_MIN_ENTRIES && !social_virtualization_disabled();
     let (
         social_start_index,
         social_end_index,
         social_top_spacer_px,
         social_bottom_spacer_px,
-    ) = social_entry_window(social_entries.len(), profile_scroll);
+    ) = if use_social_virtualization {
+        social_entry_window(social_entries.len(), profile_social_scroll)
+    } else {
+        (0, social_entries.len(), 0.0, 0.0)
+    };
     let visible_social_entries = &social_entries[social_start_index..social_end_index];
 
     div()
@@ -198,6 +206,14 @@ pub fn render_profile_panel(
                 .child(skeleton_section(vec![px(180.), px(120.)]))
                 .child(skeleton_section(vec![px(140.), px(100.), px(160.)]))
         })
+        // Identity proofs
+        .when(!identity_proofs.is_empty(), |container| {
+            container.child(render_proofs_section(identity_proofs))
+        })
+        // Networks (teams)
+        .when(!team_showcase.is_empty(), |container| {
+            container.child(render_teams_section(team_showcase))
+        })
         // Bio + location block
         .when(has_bio_block, |container| {
             container.child(
@@ -228,7 +244,11 @@ pub fn render_profile_panel(
                     }),
             )
         })
-        // Social graph section
+        // Custom fields
+        .when(!custom_fields.is_empty(), |container| {
+            container.child(render_custom_fields_section(custom_fields))
+        })
+        // Followers / following (social graph)
         .when_some(social_graph, |container, graph| {
             let followers_count = graph.followers_count.unwrap_or(0);
             let following_count = graph.following_count.unwrap_or(0);
@@ -291,80 +311,101 @@ pub fn render_profile_panel(
                         },
                     )
                     .child(
-                        div()
-                            .flex()
-                            .flex_col()
-                            .when(social_top_spacer_px > 0.0, |list| {
-                                list.child(div().h(px(social_top_spacer_px)))
-                            })
-                            .children(visible_social_entries.iter().enumerate().map(
-                                |(visible_offset, entry)| {
-                                    let index = social_start_index + visible_offset;
-                                    let entry_user_id = entry.user_id.clone();
-                                    let entry_name = if entry.display_name.trim().is_empty() {
-                                        entry.user_id.0.clone()
-                                    } else {
-                                        entry.display_name.clone()
-                                    };
-                                    div()
-                                        .id(("profile-social-entry", index))
-                                        .rounded_md()
-                                        .bg(panel_alt_surface())
-                                        .px_2()
-                                        .py_2()
-                                        .flex()
-                                        .items_center()
-                                        .justify_between()
-                                        .cursor(CursorStyle::PointingHand)
-                                        .hover(|s| s.bg(subtle_surface()))
-                                        .on_click(cx.listener(move |this, _, window, cx| {
-                                            this.open_user_profile_panel(
-                                                entry_user_id.clone(),
-                                                window,
-                                                cx,
-                                            );
-                                        }))
-                                        .child(
-                                            div()
-                                                .flex()
-                                                .items_center()
-                                                .gap_2()
-                                                .child(Avatar::render(
-                                                    &entry_name,
-                                                    entry.avatar_asset.as_deref(),
-                                                    28.,
-                                                    default_avatar_background(&entry_name),
-                                                    text_primary(),
-                                                ))
-                                                .child(
-                                                    div()
-                                                        .text_sm()
-                                                        .text_color(rgb(profile_name_color(
-                                                            entry.affinity,
-                                                        )))
-                                                        .child(entry_name),
-                                                ),
-                                        )
-                                        .into_any_element()
-                                },
-                            ))
-                            .when(social_bottom_spacer_px > 0.0, |list| {
-                                list.child(div().h(px(social_bottom_spacer_px)))
-                            }),
+                        {
+                            let render_entry = |index: usize,
+                                                entry: &crate::domain::profile::SocialGraphEntry| {
+                                let entry_user_id = entry.user_id.clone();
+                                let entry_name = if entry.display_name.trim().is_empty() {
+                                    entry.user_id.0.clone()
+                                } else {
+                                    entry.display_name.clone()
+                                };
+                                div()
+                                    .id(("profile-social-entry", index))
+                                    .rounded_md()
+                                    .bg(panel_alt_surface())
+                                    .px_2()
+                                    .py_2()
+                                    .flex()
+                                    .items_center()
+                                    .justify_between()
+                                    .cursor(CursorStyle::PointingHand)
+                                    .hover(|s| s.bg(subtle_surface()))
+                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                        this.open_user_profile_panel(
+                                            entry_user_id.clone(),
+                                            window,
+                                            cx,
+                                        );
+                                    }))
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .items_center()
+                                            .gap_2()
+                                            .child(Avatar::render(
+                                                &entry_name,
+                                                entry.avatar_asset.as_deref(),
+                                                28.,
+                                                default_avatar_background(&entry_name),
+                                                text_primary(),
+                                            ))
+                                            .child(
+                                                div()
+                                                    .text_sm()
+                                                    .text_color(rgb(profile_name_color(
+                                                        entry.affinity,
+                                                    )))
+                                                    .child(entry_name),
+                                            ),
+                                    )
+                                    .into_any_element()
+                            };
+
+                            if use_social_virtualization {
+                                let mut list = div()
+                                    .id("profile-social-list-scroll")
+                                    .flex()
+                                    .flex_col()
+                                    .overflow_y_scroll()
+                                    .scrollbar_width(px(6.))
+                                    .track_scroll(profile_social_scroll)
+                                    .on_scroll_wheel(cx.listener(|_, _, _, cx| {
+                                        cx.stop_propagation();
+                                    }))
+                                    .max_h(px(420.))
+                                    .min_h(px(0.));
+
+                                if social_top_spacer_px > 0.0 {
+                                    list = list.child(div().h(px(social_top_spacer_px)));
+                                }
+
+                                list = list.children(
+                                    visible_social_entries.iter().enumerate().map(
+                                        |(visible_offset, entry)| {
+                                            let index = social_start_index + visible_offset;
+                                            render_entry(index, entry)
+                                        },
+                                    ),
+                                );
+
+                                if social_bottom_spacer_px > 0.0 {
+                                    list = list.child(div().h(px(social_bottom_spacer_px)));
+                                }
+
+                                list.into_any_element()
+                            } else {
+                                div()
+                                    .flex()
+                                    .flex_col()
+                                    .children(social_entries.iter().enumerate().map(
+                                        |(index, entry)| render_entry(index, entry),
+                                    ))
+                                    .into_any_element()
+                            }
+                        },
                     ),
             )
-        })
-        // Identity proofs
-        .when(!identity_proofs.is_empty(), |container| {
-            container.child(render_proofs_section(identity_proofs))
-        })
-        // Teams
-        .when(!team_showcase.is_empty(), |container| {
-            container.child(render_teams_section(team_showcase))
-        })
-        // Custom fields
-        .when(!custom_fields.is_empty(), |container| {
-            container.child(render_custom_fields_section(custom_fields))
         })
         .into_any_element()
 }
@@ -802,40 +843,6 @@ fn profile_social_graph(profile: &UserProfile) -> Option<&SocialGraph> {
     })
 }
 
-const SOCIAL_ENTRY_ESTIMATED_HEIGHT_PX: f32 = 44.0;
-const SOCIAL_ENTRY_OVERSCAN_ROWS: usize = 8;
-const SOCIAL_ENTRY_VISIBLE_ROWS: usize = 30;
-
-fn social_entry_window(total_entries: usize, profile_scroll: &ScrollHandle) -> (usize, usize, f32, f32) {
-    if total_entries == 0 {
-        return (0, 0, 0.0, 0.0);
-    }
-    if profile_virtualization_disabled() {
-        return (0, total_entries, 0.0, 0.0);
-    }
-    let scroll_top_px = f32::from(profile_scroll.offset().y.abs());
-    let estimated_row = (scroll_top_px / SOCIAL_ENTRY_ESTIMATED_HEIGHT_PX).floor() as usize;
-    let mut start = estimated_row.saturating_sub(SOCIAL_ENTRY_OVERSCAN_ROWS);
-    start = start.min(total_entries.saturating_sub(1));
-    let target_rows = SOCIAL_ENTRY_VISIBLE_ROWS + (SOCIAL_ENTRY_OVERSCAN_ROWS * 2);
-    let end = (start + target_rows).min(total_entries);
-    let top_spacer_px = (start as f32) * SOCIAL_ENTRY_ESTIMATED_HEIGHT_PX;
-    let bottom_spacer_px = ((total_entries.saturating_sub(end)) as f32) * SOCIAL_ENTRY_ESTIMATED_HEIGHT_PX;
-    (start, end, top_spacer_px, bottom_spacer_px)
-}
-
-fn profile_virtualization_disabled() -> bool {
-    std::env::var(ENV_PROFILE_DISABLE_VIRTUALIZATION)
-        .ok()
-        .map(|value| {
-            matches!(
-                value.trim().to_ascii_lowercase().as_str(),
-                "1" | "true" | "yes" | "on"
-            )
-        })
-        .unwrap_or(false)
-}
-
 fn social_graph_entries<'a>(
     social_graph: Option<&'a SocialGraph>,
     tab: SocialTab,
@@ -845,6 +852,48 @@ fn social_graph_entries<'a>(
         (Some(graph), SocialTab::Following) => graph.following.as_deref().unwrap_or(&[]),
         (None, _) => &[],
     }
+}
+
+const SOCIAL_ENTRY_ESTIMATED_HEIGHT_PX: f32 = 44.0;
+const SOCIAL_ENTRY_OVERSCAN_ROWS: usize = 10;
+const SOCIAL_ENTRY_VISIBLE_ROWS: usize = 24;
+
+fn social_entry_window(
+    total_entries: usize,
+    social_scroll: &ScrollHandle,
+) -> (usize, usize, f32, f32) {
+    if total_entries == 0 {
+        return (0, 0, 0.0, 0.0);
+    }
+
+    let max_offset = social_scroll.max_offset();
+    let mut scroll_top = social_scroll.offset().y.abs();
+    if max_offset.height > px(0.) && scroll_top > max_offset.height {
+        scroll_top = max_offset.height;
+    }
+    let scroll_top_px = f32::from(scroll_top);
+
+    let estimated_row = (scroll_top_px / SOCIAL_ENTRY_ESTIMATED_HEIGHT_PX).floor() as usize;
+    let mut start = estimated_row.saturating_sub(SOCIAL_ENTRY_OVERSCAN_ROWS);
+    start = start.min(total_entries.saturating_sub(1));
+    let target_rows = SOCIAL_ENTRY_VISIBLE_ROWS + (SOCIAL_ENTRY_OVERSCAN_ROWS * 2);
+    let end = (start + target_rows).min(total_entries);
+    let top_spacer_px = (start as f32) * SOCIAL_ENTRY_ESTIMATED_HEIGHT_PX;
+    let bottom_spacer_px =
+        ((total_entries.saturating_sub(end)) as f32) * SOCIAL_ENTRY_ESTIMATED_HEIGHT_PX;
+    (start, end, top_spacer_px, bottom_spacer_px)
+}
+
+fn social_virtualization_disabled() -> bool {
+    std::env::var(ENV_PROFILE_DISABLE_SOCIAL_VIRTUALIZATION)
+        .ok()
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
 }
 
 fn profile_identity_proofs(profile: &UserProfile) -> &[crate::domain::profile::IdentityProof] {

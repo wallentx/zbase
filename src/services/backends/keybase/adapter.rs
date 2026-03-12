@@ -586,6 +586,7 @@ impl ChatBackend for KeybaseBackend {
                     &messages,
                     fetched_page_has_more,
                 );
+                schedule_message_emoji_source_syncs(self.inbound_sender.as_ref(), &messages);
                 let mut events = reaction_delete_events;
                 events.push(BackendEvent::MessagesPrepended {
                     key: crate::state::state::TimelineKey::Conversation(conversation_id),
@@ -743,6 +744,7 @@ impl ChatBackend for KeybaseBackend {
                     fetched_page_has_more,
                 );
                 let newer_cursor = messages.last().map(|message| message.id.0.clone());
+                schedule_message_emoji_source_syncs(self.inbound_sender.as_ref(), &messages);
                 let mut events = reaction_delete_events;
                 events.push(BackendEvent::TimelineReplaced {
                     conversation_id,
@@ -4183,6 +4185,7 @@ fn run_load_conversation(
                 .filter(|message| {
                     message_needs_image_attachment_hydration(message)
                         || message_needs_video_attachment_hydration(message)
+                        || message_needs_file_attachment_hydration(message)
                 })
                 .map(|message| message.id.clone())
                 .collect::<Vec<_>>();
@@ -4392,6 +4395,7 @@ fn run_hydrate_timeline_attachments(
         .filter(|message| {
             message_needs_image_attachment_hydration(message)
                 || message_needs_video_attachment_hydration(message)
+                || message_needs_file_attachment_hydration(message)
         })
         .collect::<Vec<_>>();
     if messages.is_empty() {
@@ -5119,6 +5123,18 @@ fn spawn_sync_message_emoji_sources(sender: &Sender<BackendEvent>, message: &Mes
     }
 }
 
+fn schedule_message_emoji_source_syncs(
+    sender: Option<&Sender<BackendEvent>>,
+    messages: &[MessageRecord],
+) {
+    let Some(sender) = sender else {
+        return;
+    };
+    for message in messages {
+        spawn_sync_message_emoji_sources(sender, message);
+    }
+}
+
 fn spawn_sync_reaction_emoji_sources(
     sender: &Sender<BackendEvent>,
     deltas: &[MessageReactionDelta],
@@ -5623,7 +5639,8 @@ fn spawn_live_attachment_hydration(
 ) {
     let needs_image = message_needs_image_attachment_hydration(message);
     let needs_video = message_needs_video_attachment_hydration(message);
-    if !needs_image && !needs_video {
+    let needs_file = message_needs_file_attachment_hydration(message);
+    if !needs_image && !needs_video && !needs_file {
         return;
     }
     let Some(raw_conversation_id) =
@@ -11041,6 +11058,16 @@ fn message_needs_video_attachment_hydration(message: &MessageRecord) -> bool {
     })
 }
 
+fn message_needs_file_attachment_hydration(message: &MessageRecord) -> bool {
+    message.attachments.iter().any(|attachment| {
+        attachment.kind == AttachmentKind::File
+            && !attachment
+                .source
+                .as_ref()
+                .is_some_and(|source| matches!(source, AttachmentSource::LocalPath(p) if !p.trim().is_empty()))
+    })
+}
+
 fn image_attachment_hydration_flags(message: &MessageRecord) -> (bool, bool) {
     let needs_source_hydration = message.attachments.iter().any(|attachment| {
         attachment.kind == AttachmentKind::Image
@@ -11076,7 +11103,12 @@ async fn hydrate_attachment_paths_for_messages(
         let (needs_source_hydration, needs_preview_hydration) =
             image_attachment_hydration_flags(message);
         let needs_video_hydration = message_needs_video_attachment_hydration(message);
-        if !needs_source_hydration && !needs_preview_hydration && !needs_video_hydration {
+        let needs_file_hydration = message_needs_file_attachment_hydration(message);
+        if !needs_source_hydration
+            && !needs_preview_hydration
+            && !needs_video_hydration
+            && !needs_file_hydration
+        {
             continue;
         }
         let Ok(message_id) = message.id.0.parse::<i64>() else {
@@ -11084,7 +11116,7 @@ async fn hydrate_attachment_paths_for_messages(
         };
 
         let needs_image_download = needs_source_hydration || needs_preview_hydration;
-        let full_file_path = if needs_source_hydration || needs_video_hydration {
+        let full_file_path = if needs_source_hydration || needs_video_hydration || needs_file_hydration {
             download_attachment_to_cache(client, raw_conversation_id, message_id, false).await
         } else {
             None
@@ -11159,6 +11191,20 @@ async fn hydrate_attachment_paths_for_messages(
                         height: Some(thumb_h),
                     });
                 }
+            } else if attachment.kind == AttachmentKind::File && needs_file_hydration {
+                let already_has_local_source = attachment
+                    .source
+                    .as_ref()
+                    .is_some_and(|s| matches!(s, AttachmentSource::LocalPath(p) if !p.trim().is_empty()));
+                if already_has_local_source {
+                    continue;
+                }
+                let Some(file_path) = full_file_path.clone().or_else(|| preview_file_path.clone())
+                else {
+                    continue;
+                };
+                attachment.source = Some(AttachmentSource::LocalPath(file_path));
+                attachment_updated = true;
             }
         }
         if attachment_updated {
