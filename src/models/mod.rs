@@ -226,6 +226,7 @@ impl AppModels {
         };
         models.conversation.member_count = 0;
         models.conversation.pinned_message = None;
+        models.conversation.details = None;
         models.conversation.can_post = false;
         models.conversation.is_archived = false;
 
@@ -601,6 +602,7 @@ impl AppModels {
             conversation: ConversationModel {
                 summary: general.clone(),
                 pinned_message: None,
+                details: None,
                 avatar_asset: None,
                 member_count: 24,
                 can_post: true,
@@ -2238,6 +2240,7 @@ impl AppModels {
                 self.conversation = ConversationModel {
                     summary: summary.clone(),
                     pinned_message: None,
+                    details: None,
                     avatar_asset: None,
                     member_count,
                     can_post: true,
@@ -2256,6 +2259,7 @@ impl AppModels {
                 self.conversation = ConversationModel {
                     summary: summary.clone(),
                     pinned_message: None,
+                    details: None,
                     avatar_asset: None,
                     member_count: 2,
                     can_post: true,

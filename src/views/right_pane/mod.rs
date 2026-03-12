@@ -2,6 +2,7 @@ use crate::{
     domain::{
         affinity::Affinity,
         attachment::{AttachmentKind, AttachmentSource},
+        backend::BackendCapabilities,
         ids::{MessageId, UserId},
         message::{BroadcastKind, LinkPreview, MessageFragment, MessageRecord, MessageSendState},
         presence::{Availability, Presence},
@@ -23,6 +24,7 @@ use crate::{
         app_window::{AppWindow, video_preview_cache_key},
         attachment_display_label, attachment_header_row, attachment_image_source,
         attachment_lightbox_source,
+        attachment_open_target,
         avatar::{Avatar, default_avatar_background},
         badge, border, chevron_down_icon, close_icon, danger, danger_soft, emoji_icon,
         format_duration_ms, glass_surface_strong,
@@ -83,7 +85,9 @@ impl RightPaneHost {
         reply_input: &Entity<TextField>,
         thread_scroll: &ScrollHandle,
         profile_scroll: &ScrollHandle,
+        profile_social_scroll: &ScrollHandle,
         unseen_reply_count: usize,
+        capabilities: &BackendCapabilities,
         cx: &mut Context<AppWindow>,
     ) -> AnyElement {
         let content = match navigation.right_pane {
@@ -98,14 +102,19 @@ impl RightPaneHost {
                 unseen_reply_count,
                 cx,
             ),
-            RightPaneMode::Details => render_details_panel(conversation, cx),
+            RightPaneMode::Details => render_details_panel(conversation, timeline, capabilities, cx),
             RightPaneMode::Members => render_members_panel(conversation, cx),
             RightPaneMode::Files => render_files_panel(timeline, cx),
             RightPaneMode::Search => {
                 render_search_panel(conversation, search, video_render_cache, cx)
             }
             RightPaneMode::Profile(_) => {
-                crate::views::profile::render_profile_panel(profile_panel, profile_scroll, cx)
+                crate::views::profile::render_profile_panel(
+                    profile_panel,
+                    profile_scroll,
+                    profile_social_scroll,
+                    cx,
+                )
             }
         };
 
@@ -1018,8 +1027,46 @@ fn pane_header(title: &str, close_id: &'static str, cx: &mut Context<AppWindow>)
 
 fn render_details_panel(
     conversation: &ConversationModel,
+    timeline: &TimelineModel,
+    capabilities: &BackendCapabilities,
     cx: &mut Context<AppWindow>,
 ) -> AnyElement {
+    let details = conversation.details.as_ref();
+    let shared_attachments = timeline
+        .rows
+        .iter()
+        .filter_map(|row| match row {
+            TimelineRow::Message(message) => Some(message.message.attachments.iter().cloned()),
+            _ => None,
+        })
+        .flatten()
+        .collect::<Vec<_>>();
+    let files_count = shared_attachments.len();
+    let member_count = details
+        .map(|details| details.member_count)
+        .unwrap_or(conversation.member_count);
+    let member_preview = details
+        .map(|details| details.member_preview.clone())
+        .unwrap_or_default();
+    let member_count = if member_count == 0 {
+        member_preview.len() as u32
+    } else {
+        member_count
+    };
+    let pinned_items = details
+        .map(|details| details.pinned_items.clone())
+        .unwrap_or_default();
+    let group_name = details
+        .and_then(|details| details.group.as_ref())
+        .map(|group| group.display_name.clone())
+        .or_else(|| {
+            conversation
+                .summary
+                .group
+                .as_ref()
+                .map(|group| group.display_name.clone())
+        });
+
     div()
         .size_full()
         .id("right-pane-details-scroll")
@@ -1030,28 +1077,223 @@ fn render_details_panel(
         .flex_col()
         .gap_4()
         .child(pane_header("Details", "details-pane-close", cx))
-        .child(badge(
-            format!("{} members", conversation.member_count),
-            panel_alt_bg(),
-            text_primary(),
-        ))
         .child(
             div()
                 .rounded_lg()
                 .bg(panel_alt_surface())
                 .p_4()
-                .text_sm()
-                .text_color(rgb(text_secondary()))
-                .child(conversation.summary.topic.clone()),
+                .flex()
+                .flex_col()
+                .gap_1()
+                .child(
+                    div()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(rgb(text_primary()))
+                        .child(format!("#{}", conversation.summary.title)),
+                )
+                .when_some(group_name, |d, group| {
+                    d.child(div().text_sm().text_color(rgb(text_secondary())).child(group))
+                }),
         )
-        .child(div().text_sm().text_color(rgb(text_secondary())).child(
-            if conversation.is_archived {
-                "Conversation is archived"
-            } else {
-                "Conversation is active"
-            },
-        ))
+        .when(!member_preview.is_empty(), |d| {
+            d.child(
+                div()
+                    .rounded_lg()
+                    .bg(panel_alt_surface())
+                    .p_4()
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .child(
+                        div()
+                            .text_sm()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(rgb(text_primary()))
+                            .child(format!("Members ({member_count})")),
+                    )
+                    .children(member_preview.into_iter().enumerate().map(|(index, member)| {
+                        let member_user_id = member.user_id.clone();
+                        let member_name = member.display_name.clone();
+                        div()
+                            .id(("details-member-entry", index))
+                            .rounded_md()
+                            .bg(rgb(panel_alt_bg()))
+                            .px_2()
+                            .py_2()
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .cursor(CursorStyle::PointingHand)
+                            .hover(|s| s.bg(subtle_surface()))
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.open_user_profile_panel(member_user_id.clone(), window, cx);
+                            }))
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap_2()
+                                    .child(Avatar::render(
+                                        &member_name,
+                                        member.avatar_asset.as_deref(),
+                                        28.,
+                                        default_avatar_background(&member_name),
+                                        text_primary(),
+                                    ))
+                                    .child(
+                                        div()
+                                            .text_sm()
+                                            .text_color(rgb(member_name_color(member.affinity)))
+                                            .child(member_name),
+                                    ),
+                            )
+                            .into_any_element()
+                    })),
+            )
+        })
+        .when(capabilities.supports_pins && !pinned_items.is_empty(), |d| {
+            d.child(
+                div()
+                    .rounded_lg()
+                    .bg(panel_alt_surface())
+                    .p_4()
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .child(
+                        div()
+                            .text_sm()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(rgb(text_primary()))
+                            .child(format!("Pinned ({})", pinned_items.len())),
+                    )
+                    .children(pinned_items.into_iter().take(3).map(|item| {
+                        let preview = item
+                            .preview
+                            .and_then(|preview| preview.text)
+                            .filter(|text| !text.trim().is_empty())
+                            .unwrap_or_else(|| "Pinned message".to_string());
+                        div()
+                            .rounded_md()
+                            .bg(rgb(panel_alt_bg()))
+                            .px_2()
+                            .py_1p5()
+                            .text_xs()
+                            .text_color(rgb(text_secondary()))
+                            .child(preview)
+                            .into_any_element()
+                    })),
+            )
+        })
+        .child(
+            div()
+                .rounded_lg()
+                .bg(panel_alt_surface())
+                .p_4()
+                .flex()
+                .flex_col()
+                .gap_2()
+                .child(
+                    div()
+                        .text_sm()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(rgb(text_primary()))
+                        .child(format!("Shared files ({files_count})")),
+                )
+                .when(files_count == 0, |section| {
+                    section.child(
+                        div()
+                            .rounded_md()
+                            .bg(rgb(panel_alt_bg()))
+                            .px_2()
+                            .py_1p5()
+                            .text_xs()
+                            .text_color(rgb(text_secondary()))
+                            .child("No files shared yet."),
+                    )
+                })
+                .children(shared_attachments.into_iter().enumerate().map(|(index, attachment)| {
+                    let open_target = attachment_open_target(&attachment);
+                    let fallback_open_target = attachment
+                        .source
+                        .as_ref()
+                        .or_else(|| attachment.preview.as_ref().map(|preview| &preview.source))
+                        .and_then(|source| match source {
+                            AttachmentSource::Url(url) => Some(url.clone()),
+                            AttachmentSource::LocalPath(_) => None,
+                        });
+                    let save_source = attachment
+                        .source
+                        .as_ref()
+                        .or_else(|| attachment.preview.as_ref().map(|preview| &preview.source))
+                        .and_then(|source| match source {
+                            AttachmentSource::LocalPath(path) => Some(path.clone()),
+                            _ => None,
+                        });
+                    let file_name = if attachment.name.trim().is_empty() {
+                        "attachment".to_string()
+                    } else {
+                        attachment.name.clone()
+                    };
+                    let truncated_name = truncate_with_ellipsis(&file_name, 56);
+                    div()
+                        .id(("details-shared-file", index))
+                        .rounded_md()
+                        .bg(rgb(panel_alt_bg()))
+                        .px_2()
+                        .py_1p5()
+                        .flex()
+                        .items_center()
+                        .min_w(px(0.))
+                        .cursor(CursorStyle::PointingHand)
+                        .hover(|s| s.bg(subtle_surface()))
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            if let Some(source_path) = save_source.clone() {
+                                this.save_attachment_copy(&source_path, &file_name, cx);
+                            } else if let Some(target) =
+                                open_target.clone().or_else(|| fallback_open_target.clone())
+                            {
+                                if target.starts_with("http://") || target.starts_with("https://")
+                                {
+                                    this.download_attachment_and_open(&target, &file_name, cx);
+                                } else {
+                                    this.open_url_or_deep_link(&target, window, cx);
+                                }
+                            } else {
+                                this.notify_attachment_not_ready(cx);
+                            }
+                        }))
+                        .child(
+                            div()
+                                .id(("details-shared-file-open", index))
+                                .flex_1()
+                                .min_w(px(0.))
+                                .overflow_hidden()
+                                .text_xs()
+                                .text_color(rgb(accent()))
+                                .child(truncated_name),
+                        )
+                        .into_any_element()
+                })),
+        )
         .into_any_element()
+}
+
+fn member_name_color(affinity: Affinity) -> u32 {
+    match affinity {
+        Affinity::None => text_primary(),
+        Affinity::Positive => crate::views::affinity_positive(),
+        Affinity::Broken => crate::views::affinity_broken(),
+    }
+}
+
+fn truncate_with_ellipsis(value: &str, max_chars: usize) -> String {
+    if value.chars().count() <= max_chars {
+        return value.to_string();
+    }
+    let mut truncated = value.chars().take(max_chars).collect::<String>();
+    truncated.push('…');
+    truncated
 }
 
 fn render_members_panel(

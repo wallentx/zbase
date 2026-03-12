@@ -3,8 +3,11 @@ use crate::state::state::{BootPhase, TimelineKey};
 use crate::{
     app::{commands, theme::resolve_theme},
     domain::{
+        affinity::Affinity,
         attachment::AttachmentSource,
-        backend::ProviderMessageRef,
+        backend::{BackendCapabilities, ProviderMessageRef},
+        channel_details::{ChannelDetails, ChannelMemberPreview, NotificationLevel},
+        conversation::{ConversationKind, ConversationSummary},
         ids::{ConversationId, MessageId, SidebarSectionId, UserId, WorkspaceId},
         message::{ChatEvent, LinkPreview, MessageFragment, MessageRecord, MessageSendState},
         profile::SocialGraphListType,
@@ -29,7 +32,7 @@ use crate::{
     services::{backends::router::BackendRouter, local_store::LocalStore, settings_store::SettingsStore},
     state::{
         AppStore, ConnectionState, DraftKey, UiAction, bindings::MessageBinding,
-        event::BackendEvent,
+        event::{BackendEvent, TeamRoleKind},
     },
     util::{
         formatting::now_unix_ms,
@@ -155,6 +158,34 @@ fn quick_switcher_remote_debounce(conversation_count: usize) -> Duration {
     }
 }
 
+fn unique_copy_destination(downloads_dir: &PathBuf, preferred_name: &str) -> PathBuf {
+    let candidate = downloads_dir.join(preferred_name);
+    if !candidate.exists() {
+        return candidate;
+    }
+    let stem = std::path::Path::new(preferred_name)
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or("attachment");
+    let ext = std::path::Path::new(preferred_name)
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or("");
+    for index in 1..500 {
+        let numbered = if ext.is_empty() {
+            format!("{stem} ({index})")
+        } else {
+            format!("{stem} ({index}).{ext}")
+        };
+        let path = downloads_dir.join(numbered);
+        if !path.exists() {
+            return path;
+        }
+    }
+    candidate
+}
+
 pub struct AppWindow {
     models: AppModels,
     app_store: AppStore,
@@ -177,6 +208,7 @@ pub struct AppWindow {
     timeline_row_render_cache: crate::views::timeline::TimelineRowRenderCache,
     thread_scroll: ScrollHandle,
     profile_scroll: ScrollHandle,
+    profile_social_scroll: ScrollHandle,
     timeline_unseen_count: usize,
     thread_unseen_count: usize,
     last_timeline_message_count: usize,
@@ -579,6 +611,7 @@ impl AppWindow {
             timeline_row_render_cache: crate::views::timeline::TimelineRowRenderCache::default(),
             thread_scroll: ScrollHandle::new(),
             profile_scroll: ScrollHandle::new(),
+            profile_social_scroll: ScrollHandle::new(),
             timeline_unseen_count: 0,
             thread_unseen_count: 0,
             last_timeline_message_count,
@@ -2821,6 +2854,21 @@ fn bench_composer_paste_payload(step: u64) -> String {
                             .is_none_or(|dismissed_id| dismissed_id != &pinned_item.id)
                     })
             });
+        self.models.conversation.details = snapshot
+            .timeline
+            .conversation_id
+            .as_ref()
+            .filter(|conversation_id| **conversation_id == self.models.conversation.summary.id)
+            .map(|_| {
+                build_channel_details(
+                    &self.models.conversation.summary,
+                    self.models.conversation.member_count,
+                    self.models.conversation.can_post,
+                    self.models.conversation.is_archived,
+                    &snapshot.backend,
+                    current_user_id.as_ref(),
+                )
+            });
         let has_pinned_banner = self.models.conversation.pinned_message.is_some();
         let pinned_banner_visibility_changed = previous_has_pinned_banner != has_pinned_banner;
 
@@ -3155,6 +3203,21 @@ fn bench_composer_paste_payload(step: u64) -> String {
         self.models.dismiss_overlays();
         self.jump_to_message_active = false;
         let route_changed = self.models.navigation.current != route;
+        // If the user switches to a different conversation, don't keep any right pane open.
+        // Panes like Details/Thread/Profile are scoped to the current conversation/user context
+        // and should be explicitly opened.
+        if route_changed
+            && conversation_id_from_navigated_route(&route).is_some()
+            && conversation_id_from_navigated_route(&self.models.navigation.current)
+                != conversation_id_from_navigated_route(&route)
+            && self.models.navigation.right_pane != RightPaneMode::Hidden
+        {
+            self.dispatch_ui_action(UiAction::CloseRightPane);
+            self.models.set_right_pane(RightPaneMode::Hidden);
+            self.models.profile_panel.user_id = None;
+            self.models.profile_panel.profile = None;
+            self.reset_thread_scroll_state();
+        }
         if route_changed {
             self.models.navigate_to(route.clone());
         }
@@ -3186,6 +3249,19 @@ fn bench_composer_paste_payload(step: u64) -> String {
         self.capture_live_inputs(cx);
         self.models.dismiss_overlays();
         let route_changed = self.models.navigation.current != route;
+        // Same as navigate_to: switching conversations should close any right pane.
+        if route_changed
+            && conversation_id_from_navigated_route(&route).is_some()
+            && conversation_id_from_navigated_route(&self.models.navigation.current)
+                != conversation_id_from_navigated_route(&route)
+            && self.models.navigation.right_pane != RightPaneMode::Hidden
+        {
+            self.dispatch_ui_action(UiAction::CloseRightPane);
+            self.models.set_right_pane(RightPaneMode::Hidden);
+            self.models.profile_panel.user_id = None;
+            self.models.profile_panel.profile = None;
+            self.reset_thread_scroll_state();
+        }
         if route_changed {
             self.models.navigate_to(route.clone());
         }
@@ -3793,7 +3869,9 @@ fn bench_composer_paste_payload(step: u64) -> String {
     }
 
     pub(crate) fn send_composer_message(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.models.composer.draft_text = self.composer_input.read(cx).text();
+        let composer_text = self.composer_input.read(cx).text();
+        self.models
+            .update_composer_draft_text(composer_text.clone());
         if let ComposerMode::Edit { message_id } = self.models.composer.mode.clone() {
             let edited_text = self.models.composer.draft_text.trim().to_string();
             if edited_text.is_empty() {
@@ -3823,8 +3901,22 @@ fn bench_composer_paste_payload(step: u64) -> String {
             }
             return;
         }
+        let draft_key = DraftKey::Conversation(self.models.composer.conversation_id.clone());
+        let store_draft_matches = self
+            .app_store
+            .snapshot()
+            .drafts
+            .get(&draft_key)
+            .map(|draft| draft.text.as_str())
+            == Some(composer_text.as_str());
+        if !store_draft_matches {
+            self.dispatch_ui_action(UiAction::UpdateDraft {
+                key: draft_key.clone(),
+                text: composer_text,
+            });
+        }
         self.dispatch_ui_action(UiAction::SendMessage {
-            key: DraftKey::Conversation(self.models.composer.conversation_id.clone()),
+            key: draft_key,
         });
         let (dispatch, pending) = self.models.send_composer_message();
         if matches!(dispatch, SendDispatch::NotSent) {
@@ -3847,12 +3939,27 @@ fn bench_composer_paste_payload(step: u64) -> String {
     }
 
     pub(crate) fn send_thread_reply(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.models.thread_pane.reply_draft = self.thread_input.read(cx).text();
+        let thread_text = self.thread_input.read(cx).text();
+        self.models.update_thread_reply_draft(thread_text.clone());
         let Some(root_id) = self.models.thread_pane.root_message_id.clone() else {
             return;
         };
+        let draft_key = DraftKey::Thread(root_id);
+        let store_draft_matches = self
+            .app_store
+            .snapshot()
+            .drafts
+            .get(&draft_key)
+            .map(|draft| draft.text.as_str())
+            == Some(thread_text.as_str());
+        if !store_draft_matches {
+            self.dispatch_ui_action(UiAction::UpdateDraft {
+                key: draft_key.clone(),
+                text: thread_text,
+            });
+        }
         self.dispatch_ui_action(UiAction::SendMessage {
-            key: DraftKey::Thread(root_id),
+            key: draft_key,
         });
         let (dispatch, pending) = self.models.send_thread_reply();
         if matches!(dispatch, SendDispatch::NotSent) {
@@ -4645,6 +4752,129 @@ fn bench_composer_paste_payload(step: u64) -> String {
 
     pub(crate) fn open_video_in_native_player(path: &str) {
         let _ = std::process::Command::new("open").arg(path).spawn();
+    }
+
+    pub(crate) fn save_attachment_copy(
+        &mut self,
+        source_path: &str,
+        suggested_name: &str,
+        cx: &mut Context<Self>,
+    ) {
+        let normalized = crate::views::normalize_local_source_path(source_path);
+        let source = PathBuf::from(normalized);
+        if !source.exists() {
+            self.models.push_toast("Attachment file is missing", None);
+            self.refresh(cx);
+            return;
+        }
+        let Some(home) = std::env::var_os("HOME") else {
+            self.models.push_toast("Unable to resolve home directory", None);
+            self.refresh(cx);
+            return;
+        };
+        let downloads_dir = PathBuf::from(home).join("Downloads");
+        if let Err(err) = std::fs::create_dir_all(&downloads_dir) {
+            self.models
+                .push_toast(format!("Failed to prepare Downloads: {err}"), None);
+            self.refresh(cx);
+            return;
+        }
+        let source_name = source
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("attachment");
+        let preferred = if suggested_name.trim().is_empty() {
+            source_name
+        } else {
+            suggested_name
+        };
+        let destination = unique_copy_destination(&downloads_dir, preferred);
+        match std::fs::copy(&source, &destination) {
+            Ok(_) => {
+                let _ = std::process::Command::new("open").arg(&destination).spawn();
+                self.models.push_toast(
+                    format!(
+                        "Saved to {}",
+                        destination
+                            .file_name()
+                            .and_then(|name| name.to_str())
+                            .unwrap_or("Downloads")
+                    ),
+                    None,
+                );
+            }
+            Err(err) => {
+                self.models
+                    .push_toast(format!("Failed to save attachment: {err}"), None);
+            }
+        }
+        self.refresh(cx);
+    }
+
+    pub(crate) fn download_attachment_and_open(
+        &mut self,
+        url: &str,
+        suggested_name: &str,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(home) = std::env::var_os("HOME") else {
+            self.models.push_toast("Unable to resolve home directory", None);
+            self.refresh(cx);
+            return;
+        };
+        let downloads_dir = PathBuf::from(home).join("Downloads");
+        if let Err(err) = std::fs::create_dir_all(&downloads_dir) {
+            self.models
+                .push_toast(format!("Failed to prepare Downloads: {err}"), None);
+            self.refresh(cx);
+            return;
+        }
+        let preferred = if suggested_name.trim().is_empty() {
+            "attachment"
+        } else {
+            suggested_name
+        };
+        let destination = unique_copy_destination(&downloads_dir, preferred);
+        let status = std::process::Command::new("curl")
+            .arg("-L")
+            .arg("--fail")
+            .arg("--silent")
+            .arg("--show-error")
+            .arg("--output")
+            .arg(&destination)
+            .arg(url)
+            .status();
+        match status {
+            Ok(status) if status.success() => {
+                let _ = std::process::Command::new("open").arg(&destination).spawn();
+                self.models.push_toast(
+                    format!(
+                        "Saved to {}",
+                        destination
+                            .file_name()
+                            .and_then(|name| name.to_str())
+                            .unwrap_or("Downloads")
+                    ),
+                    None,
+                );
+            }
+            Ok(_) | Err(_) => {
+                self.models.push_toast(
+                    "Direct download failed, opening source instead",
+                    None,
+                );
+                cx.open_url(url);
+            }
+        }
+        self.refresh(cx);
+    }
+
+    pub(crate) fn notify_attachment_not_ready(&mut self, cx: &mut Context<Self>) {
+        self.models.push_toast(
+            "File is not available yet. Try again in a moment.",
+            None,
+        );
+        self.refresh(cx);
     }
 
     const HOVER_SETTLE_DELAY: Duration = Duration::from_millis(50);
@@ -6435,6 +6665,7 @@ impl Render for AppWindow {
                 self.models.sidebar.width_px,
                 f32::from(window.viewport_size().width),
             );
+            let capabilities = current_backend_capabilities(&self.app_store.snapshot());
 
             let t_right = Instant::now();
             let right_pane = shell_layout.show_right_pane.then(|| {
@@ -6450,7 +6681,9 @@ impl Render for AppWindow {
                     &self.thread_input,
                     &self.thread_scroll,
                     &self.profile_scroll,
+                    &self.profile_social_scroll,
                     self.thread_unseen_count,
+                    &capabilities,
                     cx,
                 )
             });
@@ -6847,6 +7080,142 @@ fn shell_layout(
         } else {
             base_shell_width
         },
+    }
+}
+
+fn current_backend_capabilities(snapshot: &crate::state::state::UiState) -> BackendCapabilities {
+    snapshot
+        .backend
+        .accounts
+        .values()
+        .find(|account| matches!(account.connection_state, ConnectionState::Connected))
+        .or_else(|| snapshot.backend.accounts.values().next())
+        .map(|account| account.capabilities.clone())
+        .unwrap_or_default()
+}
+
+fn build_channel_details(
+    summary: &ConversationSummary,
+    member_count: u32,
+    can_post: bool,
+    is_archived: bool,
+    backend: &crate::state::state::BackendRuntimeState,
+    current_user_id: Option<&UserId>,
+) -> ChannelDetails {
+    let mut member_preview = Vec::new();
+    let team_role_map = backend
+        .conversation_team_ids
+        .get(&summary.id)
+        .and_then(|team_id| backend.team_roles.get(team_id));
+    let mut sorted_member_ids = team_role_map
+        .map(|roles| roles.keys().cloned().collect::<Vec<_>>())
+        .unwrap_or_default();
+    sorted_member_ids.sort_by(|left, right| left.0.cmp(&right.0));
+    for user_id in sorted_member_ids.into_iter().take(6) {
+        let profile = backend
+            .user_profiles
+            .get(&user_id)
+            .or_else(|| backend.user_profiles.get(&UserId::new(user_id.0.to_ascii_lowercase())));
+        let display_name = profile
+            .map(|profile| profile.display_name.trim())
+            .filter(|name| !name.is_empty())
+            .map(|name| name.to_string())
+            .unwrap_or_else(|| user_id.0.clone());
+        member_preview.push(ChannelMemberPreview {
+            user_id: user_id.clone(),
+            display_name,
+            avatar_asset: profile.and_then(|profile| profile.avatar_asset.clone()),
+            affinity: backend
+                .user_affinities
+                .get(&user_id)
+                .cloned()
+                .or_else(|| {
+                    backend
+                        .user_affinities
+                        .get(&UserId::new(user_id.0.to_ascii_lowercase()))
+                        .cloned()
+                })
+                .unwrap_or(Affinity::None),
+        });
+    }
+    if member_preview.is_empty() {
+        for username in summary
+            .title
+            .split(',')
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .take(6)
+        {
+            let lookup = UserId::new(username.to_ascii_lowercase());
+            let profile = backend
+                .user_profiles
+                .get(&lookup)
+                .or_else(|| backend.user_profiles.get(&UserId::new(username.to_string())));
+            let display_name = profile
+                .map(|profile| profile.display_name.trim())
+                .filter(|name| !name.is_empty())
+                .map(|name| name.to_string())
+                .unwrap_or_else(|| username.to_string());
+            member_preview.push(ChannelMemberPreview {
+                user_id: lookup.clone(),
+                display_name,
+                avatar_asset: profile.and_then(|profile| profile.avatar_asset.clone()),
+                affinity: backend
+                    .user_affinities
+                    .get(&lookup)
+                    .cloned()
+                    .or_else(|| {
+                        backend
+                            .user_affinities
+                            .get(&UserId::new(lookup.0.to_ascii_lowercase()))
+                            .cloned()
+                    })
+                    .unwrap_or(Affinity::None),
+            });
+        }
+    }
+
+    let role = current_user_id
+        .and_then(|user_id| team_role_map.and_then(|roles| roles.get(user_id)))
+        .copied();
+    let can_manage_members = matches!(role, Some(TeamRoleKind::Admin | TeamRoleKind::Owner));
+    let notification_level = if summary.muted {
+        NotificationLevel::Nothing
+    } else {
+        NotificationLevel::All
+    };
+    let topic = summary.topic.trim().to_string();
+
+    let derived_member_count = if let Some(roles) = team_role_map {
+        roles.len() as u32
+    } else if member_count > 0 {
+        member_count
+    } else {
+        member_preview.len() as u32
+    };
+
+    ChannelDetails {
+        conversation_id: summary.id.clone(),
+        title: summary.title.clone(),
+        topic: topic.clone(),
+        kind: summary.kind.clone(),
+        group: summary.group.clone(),
+        member_count: derived_member_count,
+        member_preview,
+        notification_level,
+        pinned_items: backend
+            .conversation_pins
+            .get(&summary.id)
+            .map(|pinned| pinned.items.clone())
+            .unwrap_or_default(),
+        can_edit_topic: can_manage_members,
+        can_manage_members,
+        can_archive: can_manage_members,
+        can_leave: matches!(summary.kind, ConversationKind::Channel),
+        can_post,
+        created_at: None,
+        description: (!topic.is_empty()).then_some(topic),
+        is_archived,
     }
 }
 
