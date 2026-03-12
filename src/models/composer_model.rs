@@ -10,10 +10,41 @@ pub enum ComposerMode {
     ReplyInThread { root_id: MessageId },
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AutocompleteCandidate {
+    MentionUser {
+        username: String,
+        display_name: String,
+        avatar_asset: Option<String>,
+    },
+    MentionBroadcast {
+        keyword: String,
+        description: String,
+    },
+    Emoji {
+        label: String,
+        insert_text: String,
+        glyph: Option<String>,
+    },
+}
+
+impl AutocompleteCandidate {
+    pub fn completion_text(&self) -> String {
+        match self {
+            Self::MentionUser { username, .. } => format!("@{username} "),
+            Self::MentionBroadcast { keyword, .. } => format!("@{keyword} "),
+            Self::Emoji { insert_text, .. } => format!("{insert_text} "),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AutocompleteState {
     pub trigger: char,
     pub query: String,
+    pub trigger_offset: usize,
+    pub selected_index: usize,
+    pub candidates: Vec<AutocompleteCandidate>,
 }
 
 #[derive(Clone, Debug)]

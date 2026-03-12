@@ -42,7 +42,7 @@ use crate::util::{
     deep_link::parse_keybase_chat_link,
     formatting::now_unix_ms,
     fuzzy::{
-        FuzzyMatch, PreparedFuzzyCandidate, PreparedFuzzyQuery, fuzzy_match_prepared,
+        FuzzyMatch, PreparedFuzzyCandidate, PreparedFuzzyQuery, fuzzy_match, fuzzy_match_prepared,
         prepare_fuzzy_candidate, prepare_fuzzy_query,
     },
 };
@@ -50,11 +50,11 @@ use crate::util::{
 use self::{
     app_model::{AppModel, Connectivity},
     call_model::CallModel,
-    composer_model::{AutocompleteState, ComposerMode, ComposerModel},
+    composer_model::{AutocompleteCandidate, AutocompleteState, ComposerMode, ComposerModel},
     conversation_model::ConversationModel,
     emoji_picker_model::{
-        EmojiPickerItem, EmojiPickerModel, push_recent_alias, skin_tone_from_setting_value,
-        skin_tone_to_setting_value,
+        EmojiPickerItem, EmojiPickerModel, push_recent_alias, search_emoji_items,
+        skin_tone_from_setting_value, skin_tone_to_setting_value,
     },
     file_upload_model::{FileUploadCandidate, FileUploadLightboxModel, UploadTarget},
     find_in_chat_model::FindInChatModel,
@@ -460,6 +460,9 @@ impl AppModels {
             autocomplete: Some(AutocompleteState {
                 trigger: '@',
                 query: "ali".to_string(),
+                trigger_offset: 0,
+                selected_index: 0,
+                candidates: Vec::new(),
             }),
         };
         let thread_pane = ThreadPaneModel {
@@ -1529,6 +1532,112 @@ impl AppModels {
     pub fn set_thread_autocomplete(&mut self, autocomplete: Option<AutocompleteState>) {
         self.thread_pane.reply_autocomplete = autocomplete;
         self.store_current_thread_draft();
+    }
+
+    pub fn mention_autocomplete_candidates(
+        &self,
+        query: &str,
+        max_results: usize,
+    ) -> Vec<AutocompleteCandidate> {
+        let show_broadcast = matches!(self.conversation.summary.kind, ConversationKind::Channel);
+        let Some(details) = self.conversation.details.as_ref() else {
+            return if show_broadcast {
+                mention_broadcast_candidates(query, max_results)
+            } else {
+                Vec::new()
+            };
+        };
+        let prepared = prepare_fuzzy_query(query);
+        let mut scored = Vec::new();
+        for member in &details.members {
+            let username = resolve_mention_username(
+                &member.user_id.0,
+                &member.display_name,
+                &self.quick_switcher_profile_names,
+            );
+            let display_name = self
+                .quick_switcher_profile_names
+                .get(&username.to_ascii_lowercase())
+                .cloned()
+                .unwrap_or_else(|| member.display_name.clone());
+            let score = if query.trim().is_empty() {
+                Some(0)
+            } else {
+                let username_match = fuzzy_match_prepared(
+                    prepared.as_ref().expect("checked non-empty query"),
+                    &prepare_fuzzy_candidate(&username),
+                )
+                .map(|result| result.score);
+                let display_match = fuzzy_match_prepared(
+                    prepared.as_ref().expect("checked non-empty query"),
+                    &prepare_fuzzy_candidate(&display_name),
+                )
+                .map(|result| result.score);
+                username_match.into_iter().chain(display_match).max()
+            };
+            let Some(score) = score else {
+                continue;
+            };
+            let affinity_rank = mention_affinity_rank(member.affinity);
+            scored.push((
+                score,
+                affinity_rank,
+                display_name.to_ascii_lowercase(),
+                AutocompleteCandidate::MentionUser {
+                    username,
+                    display_name,
+                    avatar_asset: member.avatar_asset.clone(),
+                },
+            ));
+        }
+        scored.sort_by(|left, right| {
+            right
+                .0
+                .cmp(&left.0)
+                .then_with(|| right.1.cmp(&left.1))
+                .then_with(|| left.2.cmp(&right.2))
+        });
+        let mut candidates = scored
+            .into_iter()
+            .map(|(_, _, _, candidate)| candidate)
+            .collect::<Vec<_>>();
+        if show_broadcast {
+            candidates.extend(mention_broadcast_candidates(query, max_results));
+        }
+        candidates.truncate(max_results.max(1));
+        candidates
+    }
+
+    pub fn emoji_autocomplete_candidates(
+        query: &str,
+        custom_items: &[EmojiPickerItem],
+        max_results: usize,
+    ) -> Vec<AutocompleteCandidate> {
+        search_emoji_items(query, custom_items, max_results)
+            .into_iter()
+            .map(|item| match item {
+                EmojiPickerItem::Stock(emoji) => {
+                    let glyph = emoji.as_str().to_string();
+                    let label = emoji
+                        .shortcode()
+                        .map(|shortcode| format!(":{shortcode}:"))
+                        .unwrap_or_else(|| emoji.name().to_string());
+                    AutocompleteCandidate::Emoji {
+                        label,
+                        insert_text: glyph.clone(),
+                        glyph: Some(glyph),
+                    }
+                }
+                EmojiPickerItem::Custom { alias, .. } => {
+                    let label = format!(":{alias}:");
+                    AutocompleteCandidate::Emoji {
+                        label: label.clone(),
+                        insert_text: label,
+                        glyph: None,
+                    }
+                }
+            })
+            .collect()
     }
 
     pub fn edit_message(&mut self, message_id: &MessageId) -> bool {
@@ -3324,6 +3433,70 @@ fn quick_switcher_message_label(
         .unwrap_or_else(|| conversation_id.0.clone())
 }
 
+fn mention_affinity_rank(affinity: Affinity) -> i32 {
+    match affinity {
+        Affinity::Positive => 2,
+        Affinity::None => 1,
+        Affinity::Broken => 0,
+    }
+}
+
+fn mention_broadcast_candidates(query: &str, max_results: usize) -> Vec<AutocompleteCandidate> {
+    let normalized = query.trim().to_ascii_lowercase();
+    let mut items = vec![
+        ("here", "Notify active members"),
+        ("channel", "Notify everyone in channel"),
+        ("everyone", "Notify everyone in channel"),
+    ]
+    .into_iter()
+    .filter(|(keyword, _)| {
+        normalized.is_empty()
+            || keyword.starts_with(&normalized)
+            || fuzzy_match(&normalized, keyword).is_some()
+    })
+    .map(
+        |(keyword, description)| AutocompleteCandidate::MentionBroadcast {
+            keyword: keyword.to_string(),
+            description: description.to_string(),
+        },
+    )
+    .collect::<Vec<_>>();
+    items.truncate(max_results.max(1));
+    items
+}
+
+fn resolve_mention_username(
+    raw_user_id: &str,
+    display_name: &str,
+    profile_names: &HashMap<String, String>,
+) -> String {
+    let raw = raw_user_id.trim();
+    let raw_lower = raw.to_ascii_lowercase();
+    if let Some((username, _)) = profile_names.get_key_value(&raw_lower) {
+        return username.clone();
+    }
+
+    let display_lower = display_name.trim().to_ascii_lowercase();
+    if !display_lower.is_empty()
+        && let Some((username, _)) = profile_names
+            .iter()
+            .find(|(_, full_name)| full_name.trim().eq_ignore_ascii_case(display_name))
+    {
+        return username.clone();
+    }
+
+    if raw.contains(' ') {
+        if let Some((username, _)) = profile_names
+            .iter()
+            .find(|(_, full_name)| full_name.trim().eq_ignore_ascii_case(raw))
+        {
+            return username.clone();
+        }
+    }
+
+    raw_lower
+}
+
 fn quick_switcher_decayed_affinity(affinity: f32, last_updated_ms: i64, now_ms: i64) -> f32 {
     if !affinity.is_finite() || affinity <= 0.0 {
         return 0.0;
@@ -3822,6 +3995,170 @@ mod tests {
                 .first()
                 .map(|result| result.conversation_id.0.as_str()),
             Some("conv_geoff_b")
+        );
+    }
+
+    #[test]
+    fn mention_autocomplete_matches_username_or_profile_name() {
+        use crate::domain::channel_details::{
+            ChannelDetails, ChannelMemberPreview, NotificationLevel,
+        };
+
+        let mut models = AppModels::empty_with_settings(SettingsModel::default());
+        let conversation_id = models.conversation.summary.id.clone();
+        let member = ChannelMemberPreview {
+            user_id: UserId::new("cameroncooper"),
+            display_name: "cameroncooper".to_string(),
+            avatar_asset: None,
+            affinity: Affinity::Positive,
+            is_team_admin_or_owner: false,
+        };
+        models.conversation.details = Some(ChannelDetails {
+            conversation_id,
+            title: "general".to_string(),
+            topic: String::new(),
+            kind: ConversationKind::Channel,
+            group: None,
+            member_count: 1,
+            members: vec![member.clone()],
+            member_preview: vec![member],
+            notification_level: NotificationLevel::All,
+            pinned_items: Vec::new(),
+            can_edit_topic: false,
+            can_manage_members: false,
+            can_archive: false,
+            can_leave: true,
+            can_post: true,
+            created_at: None,
+            description: None,
+            is_archived: false,
+        });
+        models.upsert_quick_switcher_profile_name(&UserId::new("cameroncooper"), "Cameron Cooper");
+
+        let by_username = models.mention_autocomplete_candidates("camer", 8);
+        assert!(by_username.iter().any(|candidate| {
+            matches!(
+                candidate,
+                AutocompleteCandidate::MentionUser { username, .. } if username == "cameroncooper"
+            )
+        }));
+
+        let by_profile = models.mention_autocomplete_candidates("cooper", 8);
+        assert!(by_profile.iter().any(|candidate| {
+            matches!(
+                candidate,
+                AutocompleteCandidate::MentionUser {
+                    username,
+                    display_name,
+                    ..
+                } if username == "cameroncooper" && display_name == "Cameron Cooper"
+            )
+        }));
+    }
+
+    #[test]
+    fn emoji_autocomplete_keeps_custom_as_shortcode() {
+        let custom_items = vec![EmojiPickerItem::Custom {
+            alias: "party_parrot".to_string(),
+            unicode: None,
+            asset_path: Some("/tmp/party_parrot.png".to_string()),
+        }];
+
+        let results = AppModels::emoji_autocomplete_candidates("party", &custom_items, 8);
+        let custom = results.into_iter().find(|candidate| {
+            matches!(
+                candidate,
+                AutocompleteCandidate::Emoji { label, .. } if label == ":party_parrot:"
+            )
+        });
+        assert!(custom.is_some());
+        assert_eq!(
+            custom
+                .expect("custom candidate should be present")
+                .completion_text(),
+            ":party_parrot: ".to_string()
+        );
+    }
+
+    #[test]
+    fn mention_autocomplete_resolves_display_name_to_username() {
+        use crate::domain::channel_details::{ChannelDetails, ChannelMemberPreview, NotificationLevel};
+
+        let mut models = AppModels::empty_with_settings(SettingsModel::default());
+        let conversation_id = models.conversation.summary.id.clone();
+        let member = ChannelMemberPreview {
+            user_id: UserId::new("cameron cooper"),
+            display_name: "Cameron Cooper".to_string(),
+            avatar_asset: None,
+            affinity: Affinity::Positive,
+            is_team_admin_or_owner: false,
+        };
+        models.conversation.details = Some(ChannelDetails {
+            conversation_id,
+            title: "general".to_string(),
+            topic: String::new(),
+            kind: ConversationKind::Channel,
+            group: None,
+            member_count: 1,
+            members: vec![member.clone()],
+            member_preview: vec![member],
+            notification_level: NotificationLevel::All,
+            pinned_items: Vec::new(),
+            can_edit_topic: false,
+            can_manage_members: false,
+            can_archive: false,
+            can_leave: true,
+            can_post: true,
+            created_at: None,
+            description: None,
+            is_archived: false,
+        });
+        models.upsert_quick_switcher_profile_name(&UserId::new("cameroncooper"), "Cameron Cooper");
+
+        let results = models.mention_autocomplete_candidates("camer", 8);
+        let candidate = results.into_iter().find_map(|candidate| match candidate {
+            AutocompleteCandidate::MentionUser {
+                username,
+                display_name,
+                ..
+            } => Some((username, display_name)),
+            _ => None,
+        });
+        assert_eq!(
+            candidate,
+            Some(("cameroncooper".to_string(), "Cameron Cooper".to_string()))
+        );
+    }
+
+    #[test]
+    fn mention_autocomplete_excludes_broadcast_in_dm() {
+        let models = AppModels::empty_with_settings(SettingsModel::default());
+        assert!(
+            matches!(models.conversation.summary.kind, ConversationKind::DirectMessage),
+            "empty models should default to DM conversation kind"
+        );
+
+        let results = models.mention_autocomplete_candidates("", 8);
+        assert!(
+            results
+                .iter()
+                .all(|candidate| !matches!(candidate, AutocompleteCandidate::MentionBroadcast { .. })),
+            "DM mention autocomplete should not include broadcast mentions"
+        );
+    }
+
+    #[test]
+    fn mention_autocomplete_includes_broadcast_in_channel_without_details() {
+        let mut models = AppModels::empty_with_settings(SettingsModel::default());
+        models.conversation.summary.kind = ConversationKind::Channel;
+        models.conversation.details = None;
+
+        let results = models.mention_autocomplete_candidates("", 8);
+        assert!(
+            results
+                .iter()
+                .any(|candidate| matches!(candidate, AutocompleteCandidate::MentionBroadcast { .. })),
+            "Channel mention autocomplete should include broadcast mentions even before details load"
         );
     }
 }

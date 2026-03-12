@@ -77,6 +77,7 @@ pub struct MessageReactionsForMessage {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum TeamRoleKind {
+    Member,
     Admin,
     Owner,
 }
@@ -227,6 +228,12 @@ pub enum BackendEvent {
         team_id: String,
         roles: Vec<TeamRoleEntry>,
         updated_ms: i64,
+    },
+    ConversationMembersUpdated {
+        conversation_id: ConversationId,
+        members: Vec<UserId>,
+        updated_ms: i64,
+        is_complete: bool,
     },
     ConversationUnreadChanged {
         conversation_id: ConversationId,

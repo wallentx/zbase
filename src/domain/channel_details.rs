@@ -18,6 +18,7 @@ pub struct ChannelMemberPreview {
     pub display_name: String,
     pub avatar_asset: Option<String>,
     pub affinity: Affinity,
+    pub is_team_admin_or_owner: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -28,6 +29,9 @@ pub struct ChannelDetails {
     pub kind: ConversationKind,
     pub group: Option<ConversationGroup>,
     pub member_count: u32,
+    /// Full member list (used by Members pane + @mention autocomplete).
+    pub members: Vec<ChannelMemberPreview>,
+    /// Small subset used for compact UI previews (e.g. Details pane).
     pub member_preview: Vec<ChannelMemberPreview>,
     pub notification_level: NotificationLevel,
     pub pinned_items: Vec<PinnedItem>,

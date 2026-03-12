@@ -14,6 +14,7 @@ actions!(
         OpenFilesPane,
         OpenSearchPane,
         OpenSearch,
+        AcceptAutocomplete,
         ConfirmPrimary,
         OpenQuickSwitcherRecent2,
         OpenQuickSwitcherRecent3,

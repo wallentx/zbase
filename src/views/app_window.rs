@@ -33,10 +33,12 @@ use crate::{
         backends::router::BackendRouter, local_store::LocalStore, settings_store::SettingsStore,
     },
     state::{
-        AppStore, ConnectionState, DraftKey, UiAction, bindings::MessageBinding,
+        AppStore, ConnectionState, DraftKey, UiAction,
+        bindings::MessageBinding,
         event::{BackendEvent, TeamRoleKind},
     },
     util::{
+        autocomplete_detect::{AutocompleteTriggerKind, TriggerMatch, detect_autocomplete_trigger},
         formatting::now_unix_ms,
         interactive_qos::mark_quick_switcher_input_activity,
         perf_harness::{PerfHarness, PerfTimer},
@@ -44,7 +46,7 @@ use crate::{
     },
     views::{
         MAIN_PANEL_MIN_WIDTH_PX, RIGHT_PANE_RESIZE_HANDLE_WIDTH_PX, SHELL_GAP_PX,
-        SHELL_HORIZONTAL_PADDING_PX, app_backdrop, badge, border,
+        SHELL_HORIZONTAL_PADDING_PX, app_backdrop, badge, border, composer::render_autocomplete_popup,
         calls::MiniCallDock,
         glass_surface_dark,
         input::TextField,
@@ -95,6 +97,21 @@ const MARK_READ_THROTTLE: Duration = Duration::from_millis(1200);
 const MAX_VIDEO_RENDER_CACHE_ENTRIES: usize = 8;
 const MAX_BACKEND_EVENTS_PER_DRAIN: usize = 48;
 const NON_TEXT_PLACEHOLDER_BODY: &str = "<non-text message>";
+const INLINE_AUTOCOMPLETE_MAX_RESULTS: usize = 8;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum InputAutocompleteTarget {
+    Composer,
+    Thread,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct AutocompleteDismissSignature {
+    trigger: char,
+    trigger_offset: usize,
+    cursor: usize,
+    query: String,
+}
 
 fn is_non_text_placeholder_message(message: &MessageRecord) -> bool {
     if message.event.is_some() {
@@ -248,6 +265,7 @@ pub struct AppWindow {
     og_result_sender: Sender<OgFetchResult>,
     og_result_receiver: Receiver<OgFetchResult>,
     last_mark_read_attempt: HashMap<String, (String, Instant)>,
+    window_is_focused: bool,
     hover_settle_seq: u64,
     quick_switcher_query_seq: u64,
     quick_switcher_last_local_query: String,
@@ -260,6 +278,8 @@ pub struct AppWindow {
     quick_switcher_indexing_completed_conversations: u64,
     quick_switcher_indexing_messages_indexed: u64,
     last_text_input_activity: Option<Instant>,
+    dismissed_composer_autocomplete: Option<AutocompleteDismissSignature>,
+    dismissed_thread_autocomplete: Option<AutocompleteDismissSignature>,
     resolved_theme: crate::app::theme::ThemeVariant,
     splash_open: bool,
     splash_shown_at: Instant,
@@ -649,6 +669,7 @@ impl AppWindow {
             og_result_sender,
             og_result_receiver,
             last_mark_read_attempt: HashMap::new(),
+            window_is_focused: false,
             hover_settle_seq: 0,
             quick_switcher_query_seq: 0,
             quick_switcher_last_local_query: String::new(),
@@ -661,6 +682,8 @@ impl AppWindow {
             quick_switcher_indexing_completed_conversations: 0,
             quick_switcher_indexing_messages_indexed: 0,
             last_text_input_activity: None,
+            dismissed_composer_autocomplete: None,
+            dismissed_thread_autocomplete: None,
             resolved_theme: crate::app::theme::ThemeVariant::Light,
             splash_open: true,
             splash_shown_at: Instant::now(),
@@ -669,6 +692,7 @@ impl AppWindow {
     }
 
     pub fn init(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.window_is_focused = window.is_window_active();
         if !self.bench_skip_backend {
             self.dispatch_ui_action(UiAction::StartApp);
             self.dispatch_ui_action(UiAction::Navigate(self.models.navigation.current.clone()));
@@ -677,6 +701,12 @@ impl AppWindow {
         self.sync_sidebar_view_state(cx);
 
         self.subscriptions = vec![
+            cx.observe_window_activation(window, |this, window, cx| {
+                this.window_is_focused = window.is_window_active();
+                if this.window_is_focused && this.request_mark_conversation_read_if_needed() {
+                    this.refresh(cx);
+                }
+            }),
             cx.observe_window_appearance(window, |this, _, cx| {
                 this.refresh(cx);
             }),
@@ -1679,6 +1709,7 @@ impl AppWindow {
                 });
             }
         }
+        self.sync_inline_autocomplete_state(cx);
 
         let elapsed = started_at.elapsed();
         self.perf_harness
@@ -1686,6 +1717,164 @@ impl AppWindow {
         if self.perf_harness.is_capturing() && elapsed.as_millis() > 2 {
             tracing::warn!("composer_input_observer took {elapsed:?}");
         }
+    }
+
+    fn sync_inline_autocomplete_state(&mut self, cx: &mut Context<Self>) {
+        self.sync_autocomplete_for_target(InputAutocompleteTarget::Composer, cx);
+        self.sync_autocomplete_for_target(InputAutocompleteTarget::Thread, cx);
+    }
+
+    fn sync_autocomplete_for_target(
+        &mut self,
+        target: InputAutocompleteTarget,
+        cx: &mut Context<Self>,
+    ) {
+        let (text, cursor, current_state) = match target {
+            InputAutocompleteTarget::Composer => (
+                self.composer_input.read(cx).text(),
+                self.composer_input.read(cx).cursor_offset(),
+                self.models.composer.autocomplete.clone(),
+            ),
+            InputAutocompleteTarget::Thread => (
+                self.thread_input.read(cx).text(),
+                self.thread_input.read(cx).cursor_offset(),
+                self.models.thread_pane.reply_autocomplete.clone(),
+            ),
+        };
+
+        let detected = detect_autocomplete_trigger(&text, cursor);
+        let detected_signature = detected.as_ref().map(|matched| AutocompleteDismissSignature {
+            trigger: match matched.kind {
+                AutocompleteTriggerKind::Mention => '@',
+                AutocompleteTriggerKind::Emoji => ':',
+            },
+            trigger_offset: matched.trigger_offset,
+            cursor,
+            query: matched.query.clone(),
+        });
+
+        // If the user dismissed autocomplete (Escape), keep it closed until the input context
+        // (trigger/query/cursor) changes.
+        let dismissed = match target {
+            InputAutocompleteTarget::Composer => self.dismissed_composer_autocomplete.clone(),
+            InputAutocompleteTarget::Thread => self.dismissed_thread_autocomplete.clone(),
+        };
+        if let Some(dismissed) = dismissed {
+            if detected_signature.as_ref() == Some(&dismissed) {
+                if current_state.is_some() {
+                    match target {
+                        InputAutocompleteTarget::Composer => self.models.set_composer_autocomplete(None),
+                        InputAutocompleteTarget::Thread => self.models.set_thread_autocomplete(None),
+                    }
+                }
+                return;
+            }
+            // Context changed; allow autocomplete to show again.
+            match target {
+                InputAutocompleteTarget::Composer => self.dismissed_composer_autocomplete = None,
+                InputAutocompleteTarget::Thread => self.dismissed_thread_autocomplete = None,
+            }
+        }
+
+        let next_state = detected
+            .and_then(|matched| self.build_autocomplete_state(matched))
+            .filter(|state| !state.candidates.is_empty());
+        if next_state == current_state {
+            return;
+        }
+        match target {
+            InputAutocompleteTarget::Composer => self.models.set_composer_autocomplete(next_state),
+            InputAutocompleteTarget::Thread => self.models.set_thread_autocomplete(next_state),
+        }
+    }
+
+    fn current_autocomplete_dismiss_signature(
+        &self,
+        target: InputAutocompleteTarget,
+        cx: &mut Context<Self>,
+    ) -> Option<AutocompleteDismissSignature> {
+        match target {
+            InputAutocompleteTarget::Composer => self.models.composer.autocomplete.as_ref().map(|state| {
+                AutocompleteDismissSignature {
+                    trigger: state.trigger,
+                    trigger_offset: state.trigger_offset,
+                    cursor: self.composer_input.read(cx).cursor_offset(),
+                    query: state.query.clone(),
+                }
+            }),
+            InputAutocompleteTarget::Thread => self
+                .models
+                .thread_pane
+                .reply_autocomplete
+                .as_ref()
+                .map(|state| AutocompleteDismissSignature {
+                    trigger: state.trigger,
+                    trigger_offset: state.trigger_offset,
+                    cursor: self.thread_input.read(cx).cursor_offset(),
+                    query: state.query.clone(),
+                }),
+        }
+    }
+
+    fn build_autocomplete_state(&self, matched: TriggerMatch) -> Option<AutocompleteState> {
+        let candidates = match matched.kind {
+            AutocompleteTriggerKind::Mention => self
+                .models
+                .mention_autocomplete_candidates(&matched.query, INLINE_AUTOCOMPLETE_MAX_RESULTS),
+            AutocompleteTriggerKind::Emoji => {
+                let custom_items = self.current_conversation_custom_emoji_items();
+                AppModels::emoji_autocomplete_candidates(
+                    &matched.query,
+                    &custom_items,
+                    INLINE_AUTOCOMPLETE_MAX_RESULTS,
+                )
+            }
+        };
+        if candidates.is_empty() {
+            return None;
+        }
+        Some(AutocompleteState {
+            trigger: match matched.kind {
+                AutocompleteTriggerKind::Mention => '@',
+                AutocompleteTriggerKind::Emoji => ':',
+            },
+            query: matched.query,
+            trigger_offset: matched.trigger_offset,
+            selected_index: 0,
+            candidates,
+        })
+    }
+
+    fn current_conversation_custom_emoji_items(&self) -> Vec<EmojiPickerItem> {
+        let snapshot = self.app_store.snapshot();
+        let supports_custom_emoji = snapshot
+            .backend
+            .accounts
+            .values()
+            .find(|account| matches!(account.connection_state, ConnectionState::Connected))
+            .or_else(|| snapshot.backend.accounts.values().next())
+            .map(|account| account.capabilities.supports_custom_emoji)
+            .unwrap_or(false);
+        if !supports_custom_emoji {
+            return Vec::new();
+        }
+        let Some(conversation_id) = snapshot.timeline.conversation_id.as_ref() else {
+            return Vec::new();
+        };
+        let mut custom_items = snapshot
+            .backend
+            .conversation_emojis
+            .get(conversation_id)
+            .into_iter()
+            .flat_map(|index| index.values())
+            .map(|emoji| EmojiPickerItem::Custom {
+                alias: emoji.alias.clone(),
+                unicode: emoji.unicode.clone(),
+                asset_path: emoji.asset_path.clone(),
+            })
+            .collect::<Vec<_>>();
+        custom_items.sort_by_key(|item| item.key());
+        custom_items
     }
 
     fn start_perf_capture(&mut self, label_override: Option<String>, cx: &mut Context<Self>) {
@@ -2700,7 +2889,7 @@ impl AppWindow {
                     .map(|roles_by_user| {
                         roles_by_user
                             .iter()
-                            .map(|(user_id, role)| {
+                            .filter_map(|(user_id, role)| {
                                 let mapped = match role {
                                     crate::state::event::TeamRoleKind::Admin => {
                                         TeamAuthorRole::Admin
@@ -2708,11 +2897,12 @@ impl AppWindow {
                                     crate::state::event::TeamRoleKind::Owner => {
                                         TeamAuthorRole::Owner
                                     }
+                                    crate::state::event::TeamRoleKind::Member => return None,
                                 };
-                                (
+                                Some((
                                     crate::domain::ids::UserId::new(user_id.0.to_ascii_lowercase()),
                                     mapped,
-                                )
+                                ))
                             })
                             .collect::<HashMap<_, _>>()
                     })
@@ -3692,6 +3882,9 @@ impl AppWindow {
     }
 
     fn request_mark_conversation_read_if_needed(&mut self) -> bool {
+        if !self.window_is_focused {
+            return false;
+        }
         let has_visible_message_rows = self
             .models
             .timeline
@@ -3912,9 +4105,7 @@ impl AppWindow {
                 text: composer_text,
             });
         }
-        self.dispatch_ui_action(UiAction::SendMessage {
-            key: draft_key,
-        });
+        self.dispatch_ui_action(UiAction::SendMessage { key: draft_key });
         let (dispatch, pending) = self.models.send_composer_message();
         if matches!(dispatch, SendDispatch::NotSent) {
             return;
@@ -3955,9 +4146,7 @@ impl AppWindow {
                 text: thread_text,
             });
         }
-        self.dispatch_ui_action(UiAction::SendMessage {
-            key: draft_key,
-        });
+        self.dispatch_ui_action(UiAction::SendMessage { key: draft_key });
         let (dispatch, pending) = self.models.send_thread_reply();
         if matches!(dispatch, SendDispatch::NotSent) {
             return;
@@ -3969,6 +4158,140 @@ impl AppWindow {
 
         if let Some(pending) = pending {
             self.schedule_pending_send(pending, cx);
+        }
+    }
+
+    fn autocomplete_target_for_focused_input(
+        &self,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> Option<InputAutocompleteTarget> {
+        if self.composer_input.focus_handle(cx).is_focused(window) {
+            return Some(InputAutocompleteTarget::Composer);
+        }
+        if self.thread_input.focus_handle(cx).is_focused(window) {
+            return Some(InputAutocompleteTarget::Thread);
+        }
+        None
+    }
+
+    fn move_autocomplete_selection(
+        &mut self,
+        target: InputAutocompleteTarget,
+        direction: isize,
+    ) -> bool {
+        let autocomplete = match target {
+            InputAutocompleteTarget::Composer => &mut self.models.composer.autocomplete,
+            InputAutocompleteTarget::Thread => &mut self.models.thread_pane.reply_autocomplete,
+        };
+        let Some(state) = autocomplete.as_mut() else {
+            return false;
+        };
+        let len = state.candidates.len();
+        if len == 0 {
+            return false;
+        }
+        let current = state.selected_index.min(len.saturating_sub(1));
+        let next = (current as isize + direction).rem_euclid(len as isize) as usize;
+        if next == state.selected_index {
+            return false;
+        }
+        state.selected_index = next;
+        true
+    }
+
+    fn clear_autocomplete_for_target(
+        &mut self,
+        target: InputAutocompleteTarget,
+        _cx: &mut Context<Self>,
+    ) -> bool {
+        match target {
+            InputAutocompleteTarget::Composer => {
+                if self.models.composer.autocomplete.is_none() {
+                    return false;
+                }
+                self.models.set_composer_autocomplete(None);
+                true
+            }
+            InputAutocompleteTarget::Thread => {
+                if self.models.thread_pane.reply_autocomplete.is_none() {
+                    return false;
+                }
+                self.models.set_thread_autocomplete(None);
+                true
+            }
+        }
+    }
+
+    fn accept_autocomplete_selection(
+        &mut self,
+        target: InputAutocompleteTarget,
+        selected_index_override: Option<usize>,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let state = match target {
+            InputAutocompleteTarget::Composer => self.models.composer.autocomplete.clone(),
+            InputAutocompleteTarget::Thread => self.models.thread_pane.reply_autocomplete.clone(),
+        };
+        let Some(state) = state else {
+            return false;
+        };
+        if state.candidates.is_empty() {
+            return false;
+        }
+        let selected_index = selected_index_override
+            .unwrap_or(state.selected_index)
+            .min(state.candidates.len().saturating_sub(1));
+        let Some(selected) = state.candidates.get(selected_index) else {
+            return false;
+        };
+        let completion = selected.completion_text();
+        match target {
+            InputAutocompleteTarget::Composer => {
+                let cursor = self.composer_input.read(cx).cursor_offset();
+                if state.trigger_offset > cursor {
+                    return false;
+                }
+                self.composer_input.update(cx, |input, cx| {
+                    input.replace_range(state.trigger_offset..cursor, &completion, cx);
+                });
+                self.models.set_composer_autocomplete(None);
+                self.models
+                    .update_composer_draft_text(self.composer_input.read(cx).text());
+            }
+            InputAutocompleteTarget::Thread => {
+                let cursor = self.thread_input.read(cx).cursor_offset();
+                if state.trigger_offset > cursor {
+                    return false;
+                }
+                self.thread_input.update(cx, |input, cx| {
+                    input.replace_range(state.trigger_offset..cursor, &completion, cx);
+                });
+                self.models.set_thread_autocomplete(None);
+                self.models
+                    .update_thread_reply_draft(self.thread_input.read(cx).text());
+            }
+        }
+        true
+    }
+
+    pub(crate) fn select_composer_autocomplete_index(
+        &mut self,
+        index: usize,
+        cx: &mut Context<Self>,
+    ) {
+        if self.accept_autocomplete_selection(InputAutocompleteTarget::Composer, Some(index), cx) {
+            self.refresh(cx);
+        }
+    }
+
+    pub(crate) fn select_thread_autocomplete_index(
+        &mut self,
+        index: usize,
+        cx: &mut Context<Self>,
+    ) {
+        if self.accept_autocomplete_selection(InputAutocompleteTarget::Thread, Some(index), cx) {
+            self.refresh(cx);
         }
     }
 
@@ -4636,6 +4959,9 @@ impl AppWindow {
             .set_composer_autocomplete(Some(AutocompleteState {
                 trigger: '@',
                 query: "alice".to_string(),
+                trigger_offset: 0,
+                selected_index: 0,
+                candidates: Vec::new(),
             }));
         self.refresh(cx);
     }
@@ -4646,6 +4972,9 @@ impl AppWindow {
         self.models.set_thread_autocomplete(Some(AutocompleteState {
             trigger: '@',
             query: "sam".to_string(),
+            trigger_offset: 0,
+            selected_index: 0,
+            candidates: Vec::new(),
         }));
         self.refresh(cx);
     }
@@ -4765,7 +5094,8 @@ impl AppWindow {
             return;
         }
         let Some(home) = std::env::var_os("HOME") else {
-            self.models.push_toast("Unable to resolve home directory", None);
+            self.models
+                .push_toast("Unable to resolve home directory", None);
             self.refresh(cx);
             return;
         };
@@ -4815,7 +5145,8 @@ impl AppWindow {
         cx: &mut Context<Self>,
     ) {
         let Some(home) = std::env::var_os("HOME") else {
-            self.models.push_toast("Unable to resolve home directory", None);
+            self.models
+                .push_toast("Unable to resolve home directory", None);
             self.refresh(cx);
             return;
         };
@@ -4856,10 +5187,8 @@ impl AppWindow {
                 );
             }
             Ok(_) | Err(_) => {
-                self.models.push_toast(
-                    "Direct download failed, opening source instead",
-                    None,
-                );
+                self.models
+                    .push_toast("Direct download failed, opening source instead", None);
                 cx.open_url(url);
             }
         }
@@ -4867,10 +5196,8 @@ impl AppWindow {
     }
 
     pub(crate) fn notify_attachment_not_ready(&mut self, cx: &mut Context<Self>) {
-        self.models.push_toast(
-            "File is not available yet. Try again in a moment.",
-            None,
-        );
+        self.models
+            .push_toast("File is not available yet. Try again in a moment.", None);
         self.refresh(cx);
     }
 
@@ -6024,6 +6351,70 @@ impl AppWindow {
             .into_any_element()
     }
 
+    fn render_inline_autocomplete_overlay(
+        &self,
+        shell_layout: &ShellLayout,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let viewport_width = f32::from(window.viewport_size().width);
+        let sidebar_total_width = self.models.sidebar.width_px + RIGHT_PANE_RESIZE_HANDLE_WIDTH_PX;
+        let right_pane_width = if shell_layout.show_right_pane
+            && !matches!(self.models.navigation.right_pane, RightPaneMode::Hidden)
+        {
+            self.models.thread_pane.width_px
+        } else {
+            0.0
+        };
+        let main_panel_width =
+            (viewport_width - sidebar_total_width - right_pane_width).max(MAIN_PANEL_MIN_WIDTH_PX);
+        let composer_popup_width = (main_panel_width - 32.0).clamp(240.0, 520.0);
+        let composer_popup_left = (sidebar_total_width + 16.0).max(8.0);
+
+        let thread_popup_width = (self.models.thread_pane.width_px - 32.0).clamp(220.0, 460.0);
+        let thread_popup_left = (viewport_width - self.models.thread_pane.width_px + 16.0).max(8.0);
+
+        div()
+            .absolute()
+            .inset_0()
+            .when_some(self.models.composer.autocomplete.as_ref(), |container, autocomplete| {
+                container.when(!autocomplete.candidates.is_empty(), |container| {
+                    container.child(
+                        div()
+                            .id("inline-autocomplete-overlay-composer")
+                            .absolute()
+                            .left(px(composer_popup_left))
+                            .bottom(px(54.0))
+                            .w(px(composer_popup_width))
+                            .child(render_autocomplete_popup(autocomplete, true, cx)),
+                    )
+                })
+            })
+            .when(
+                shell_layout.show_right_pane
+                    && matches!(self.models.navigation.right_pane, RightPaneMode::Thread),
+                |container| {
+                    container.when_some(
+                        self.models.thread_pane.reply_autocomplete.as_ref(),
+                        |container, autocomplete| {
+                            container.when(!autocomplete.candidates.is_empty(), |container| {
+                                container.child(
+                                    div()
+                                        .id("inline-autocomplete-overlay-thread")
+                                        .absolute()
+                                        .left(px(thread_popup_left))
+                                        .bottom(px(76.0))
+                                        .w(px(thread_popup_width))
+                                        .child(render_autocomplete_popup(autocomplete, false, cx)),
+                                )
+                            })
+                        },
+                    )
+                },
+            )
+            .into_any_element()
+    }
+
     pub(crate) fn quick_switch_to(
         &mut self,
         route: Route,
@@ -6324,6 +6715,19 @@ impl AppWindow {
         self.submit_search_input(window, cx);
     }
 
+    fn accept_autocomplete_action(
+        &mut self,
+        _: &commands::AcceptAutocomplete,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(target) = self.autocomplete_target_for_focused_input(window, cx)
+            && self.accept_autocomplete_selection(target, None, cx)
+        {
+            self.refresh(cx);
+        }
+    }
+
     fn confirm_primary_action(
         &mut self,
         _: &commands::ConfirmPrimary,
@@ -6342,6 +6746,12 @@ impl AppWindow {
             } else {
                 self.file_upload_send_current(window, cx);
             }
+            return;
+        }
+        if let Some(target) = self.autocomplete_target_for_focused_input(window, cx)
+            && self.accept_autocomplete_selection(target, None, cx)
+        {
+            self.refresh(cx);
             return;
         }
         if self.models.overlay.quick_switcher_open {
@@ -6393,9 +6803,15 @@ impl AppWindow {
     fn select_previous_action(
         &mut self,
         _: &commands::SelectPrevious,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if let Some(target) = self.autocomplete_target_for_focused_input(window, cx)
+            && self.move_autocomplete_selection(target, -1)
+        {
+            self.refresh(cx);
+            return;
+        }
         if self.models.overlay.quick_switcher_open {
             self.models.move_quick_switcher_selection(-1);
             self.refresh(cx);
@@ -6417,9 +6833,15 @@ impl AppWindow {
     fn select_next_action(
         &mut self,
         _: &commands::SelectNext,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if let Some(target) = self.autocomplete_target_for_focused_input(window, cx)
+            && self.move_autocomplete_selection(target, 1)
+        {
+            self.refresh(cx);
+            return;
+        }
         if self.models.overlay.quick_switcher_open {
             self.models.move_quick_switcher_selection(1);
             self.refresh(cx);
@@ -6594,6 +7016,24 @@ impl AppWindow {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if let Some(target) = self.autocomplete_target_for_focused_input(window, cx) {
+            let dismissed_signature = self.current_autocomplete_dismiss_signature(target, cx);
+            if self.clear_autocomplete_for_target(target, cx)
+        {
+                if let Some(signature) = dismissed_signature {
+                    match target {
+                        InputAutocompleteTarget::Composer => {
+                            self.dismissed_composer_autocomplete = Some(signature)
+                        }
+                        InputAutocompleteTarget::Thread => {
+                            self.dismissed_thread_autocomplete = Some(signature)
+                        }
+                    }
+                }
+            self.refresh(cx);
+            return;
+        }
+        }
         let had_overlay = self.models.overlay.new_chat_open
             || self.models.overlay.quick_switcher_open
             || self.models.overlay.command_palette_open
@@ -6715,6 +7155,7 @@ impl Render for AppWindow {
                 .on_action(cx.listener(Self::open_files_pane_action))
                 .on_action(cx.listener(Self::open_search_pane_action))
                 .on_action(cx.listener(Self::open_search_action))
+                .on_action(cx.listener(Self::accept_autocomplete_action))
                 .on_action(cx.listener(Self::confirm_primary_action))
                 .on_action(cx.listener(Self::select_previous_action))
                 .on_action(cx.listener(Self::select_next_action))
@@ -6905,6 +7346,7 @@ impl Render for AppWindow {
                     }
                     overlay
                 })
+                .child(self.render_inline_autocomplete_overlay(&shell_layout, window, cx))
                 .when_some(
                     self.models.overlay.sidebar_hover_tooltip.as_ref(),
                     |div, tooltip| div.child(render_sidebar_hover_tooltip(tooltip, window)),
@@ -7097,26 +7539,41 @@ fn build_channel_details(
     backend: &crate::state::state::BackendRuntimeState,
     current_user_id: Option<&UserId>,
 ) -> ChannelDetails {
-    let mut member_preview = Vec::new();
+    let mut members = Vec::new();
     let team_role_map = backend
         .conversation_team_ids
         .get(&summary.id)
         .and_then(|team_id| backend.team_roles.get(team_id));
-    let mut sorted_member_ids = team_role_map
-        .map(|roles| roles.keys().cloned().collect::<Vec<_>>())
+    let mut sorted_member_ids = backend
+        .conversation_members
+        .get(&summary.id)
+        .map(|state| state.members.clone())
         .unwrap_or_default();
+    if sorted_member_ids.is_empty() {
+        sorted_member_ids = match summary.kind {
+            ConversationKind::DirectMessage | ConversationKind::GroupDirectMessage => summary
+                .title
+                .split(',')
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(|username| UserId::new(username.to_ascii_lowercase()))
+                .collect(),
+            ConversationKind::Channel => Vec::new(),
+        };
+    }
     sorted_member_ids.sort_by(|left, right| left.0.cmp(&right.0));
-    for user_id in sorted_member_ids.into_iter().take(6) {
-        let profile = backend
-            .user_profiles
-            .get(&user_id)
-            .or_else(|| backend.user_profiles.get(&UserId::new(user_id.0.to_ascii_lowercase())));
+    for user_id in sorted_member_ids.into_iter() {
+        let profile = backend.user_profiles.get(&user_id).or_else(|| {
+            backend
+                .user_profiles
+                .get(&UserId::new(user_id.0.to_ascii_lowercase()))
+        });
         let display_name = profile
             .map(|profile| profile.display_name.trim())
             .filter(|name| !name.is_empty())
             .map(|name| name.to_string())
             .unwrap_or_else(|| user_id.0.clone());
-        member_preview.push(ChannelMemberPreview {
+        let preview = ChannelMemberPreview {
             user_id: user_id.clone(),
             display_name,
             avatar_asset: profile.and_then(|profile| profile.avatar_asset.clone()),
@@ -7131,44 +7588,27 @@ fn build_channel_details(
                         .cloned()
                 })
                 .unwrap_or(Affinity::None),
-        });
+            is_team_admin_or_owner: team_role_map.is_some_and(|roles| {
+                matches!(
+                    roles.get(&user_id),
+                    Some(TeamRoleKind::Admin | TeamRoleKind::Owner)
+                )
+            }),
+        };
+        members.push(preview);
     }
-    if member_preview.is_empty() {
-        for username in summary
-            .title
-            .split(',')
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .take(6)
-        {
-            let lookup = UserId::new(username.to_ascii_lowercase());
-            let profile = backend
-                .user_profiles
-                .get(&lookup)
-                .or_else(|| backend.user_profiles.get(&UserId::new(username.to_string())));
-            let display_name = profile
-                .map(|profile| profile.display_name.trim())
-                .filter(|name| !name.is_empty())
-                .map(|name| name.to_string())
-                .unwrap_or_else(|| username.to_string());
-            member_preview.push(ChannelMemberPreview {
-                user_id: lookup.clone(),
-                display_name,
-                avatar_asset: profile.and_then(|profile| profile.avatar_asset.clone()),
-                affinity: backend
-                    .user_affinities
-                    .get(&lookup)
-                    .cloned()
-                    .or_else(|| {
-                        backend
-                            .user_affinities
-                            .get(&UserId::new(lookup.0.to_ascii_lowercase()))
-                            .cloned()
-                    })
-                    .unwrap_or(Affinity::None),
-            });
-        }
-    }
+    // If we don't have a roster yet:
+    // - DMs/GDMs: we can reasonably derive from title.
+    // - Channels: we intentionally show empty until backend provides roster.
+
+    members.sort_by(|left, right| {
+        let left_name = left.display_name.trim().to_ascii_lowercase();
+        let right_name = right.display_name.trim().to_ascii_lowercase();
+        left_name
+            .cmp(&right_name)
+            .then_with(|| left.user_id.0.cmp(&right.user_id.0))
+    });
+    let member_preview = members.iter().take(6).cloned().collect::<Vec<_>>();
 
     let role = current_user_id
         .and_then(|user_id| team_role_map.and_then(|roles| roles.get(user_id)))
@@ -7181,12 +7621,13 @@ fn build_channel_details(
     };
     let topic = summary.topic.trim().to_string();
 
-    let derived_member_count = if let Some(roles) = team_role_map {
-        roles.len() as u32
+    let derived_member_count = if let Some(state) = backend.conversation_members.get(&summary.id)
+    {
+        state.members.len() as u32
     } else if member_count > 0 {
         member_count
     } else {
-        member_preview.len() as u32
+        members.len() as u32
     };
 
     ChannelDetails {
@@ -7196,6 +7637,7 @@ fn build_channel_details(
         kind: summary.kind.clone(),
         group: summary.group.clone(),
         member_count: derived_member_count,
+        members,
         member_preview,
         notification_level,
         pinned_items: backend
@@ -7643,8 +8085,9 @@ fn timeline_author_roles_signature(
             continue;
         };
         let role_value = match role {
-            crate::state::event::TeamRoleKind::Admin => 1u64,
-            crate::state::event::TeamRoleKind::Owner => 2u64,
+            crate::state::event::TeamRoleKind::Member => 1u64,
+            crate::state::event::TeamRoleKind::Admin => 2u64,
+            crate::state::event::TeamRoleKind::Owner => 3u64,
         };
         mix_sig(&mut sig, role_value);
     }

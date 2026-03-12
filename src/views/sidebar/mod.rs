@@ -310,13 +310,16 @@ impl Sidebar {
                 div.children(
                     visible_rows
                         .iter()
-                        .map(|row| Self::render_row(row, dm_avatar_assets, current_route, cx)),
+                        .map(|row| {
+                            Self::render_row(&section.id, row, dm_avatar_assets, current_route, cx)
+                        }),
                 )
             })
             .into_any_element()
     }
 
     fn render_row<H: SidebarHost>(
+        section_id: &SidebarSectionId,
         row: &SidebarRow,
         dm_avatar_assets: &HashMap<String, String>,
         current_route: &Route,
@@ -329,7 +332,12 @@ impl Sidebar {
         let route = row.route.clone();
 
         div()
-            .id(SharedString::from(format!("sidebar-{route_label}")))
+            // Rows can appear in multiple sections (e.g. Unread + Channels/DMs). Keep ids unique so
+            // hit-testing and click dispatch remain reliable.
+            .id(SharedString::from(format!(
+                "sidebar-{}-{route_label}",
+                section_id.0
+            )))
             .w_full()
             .rounded_md()
             .hover(|s| s.bg(subtle_surface()))

@@ -23,11 +23,10 @@ use crate::{
         RIGHT_PANE_RESIZE_HANDLE_WIDTH_PX, accent, accent_soft,
         app_window::{AppWindow, video_preview_cache_key},
         attachment_display_label, attachment_header_row, attachment_image_source,
-        attachment_lightbox_source,
-        attachment_open_target,
+        attachment_lightbox_source, attachment_open_target,
         avatar::{Avatar, default_avatar_background},
-        badge, border, chevron_down_icon, close_icon, danger, danger_soft, emoji_icon,
-        format_duration_ms, glass_surface_strong,
+        badge, border, chevron_down_icon, close_icon, crown_icon,
+        danger, danger_soft, emoji_icon, format_duration_ms, glass_surface_strong,
         inline_markdown::{InlineMarkdownConfig, apply_inline_markdown, remap_source_byte_range},
         input::TextField,
         is_dark_theme, mention_colors_for_user, mention_soft, panel_alt_bg, panel_alt_surface,
@@ -36,7 +35,7 @@ use crate::{
             InlineAttachment, LinkRange, SelectableText, StyledRange, resolve_selectable_text,
             resolve_selectable_text_inline, resolve_selectable_text_with_attachments,
         },
-        subtle_surface, text_primary, text_secondary,
+        subtle_surface, text_primary, text_secondary, warning,
         timeline::TimelineList,
         tint,
     },
@@ -102,20 +101,20 @@ impl RightPaneHost {
                 unseen_reply_count,
                 cx,
             ),
-            RightPaneMode::Details => render_details_panel(conversation, timeline, capabilities, cx),
+            RightPaneMode::Details => {
+                render_details_panel(conversation, timeline, capabilities, cx)
+            }
             RightPaneMode::Members => render_members_panel(conversation, cx),
             RightPaneMode::Files => render_files_panel(timeline, cx),
             RightPaneMode::Search => {
                 render_search_panel(conversation, search, video_render_cache, cx)
             }
-            RightPaneMode::Profile(_) => {
-                crate::views::profile::render_profile_panel(
-                    profile_panel,
-                    profile_scroll,
-                    profile_social_scroll,
-                    cx,
-                )
-            }
+            RightPaneMode::Profile(_) => crate::views::profile::render_profile_panel(
+                profile_panel,
+                profile_scroll,
+                profile_social_scroll,
+                cx,
+            ),
         };
 
         div()
@@ -1035,7 +1034,7 @@ fn pane_header(title: &str, close_id: &'static str, cx: &mut Context<AppWindow>)
 fn render_details_panel(
     conversation: &ConversationModel,
     timeline: &TimelineModel,
-    capabilities: &BackendCapabilities,
+    _capabilities: &BackendCapabilities,
     cx: &mut Context<AppWindow>,
 ) -> AnyElement {
     let details = conversation.details.as_ref();
@@ -1052,17 +1051,19 @@ fn render_details_panel(
     let member_count = details
         .map(|details| details.member_count)
         .unwrap_or(conversation.member_count);
-    let member_preview = details
-        .map(|details| details.member_preview.clone())
+    let members = details
+        .map(|details| details.members.clone())
         .unwrap_or_default();
+    let (bots, people): (Vec<_>, Vec<_>) = members
+        .into_iter()
+        .partition(|member| member.user_id.0.to_ascii_lowercase().ends_with("bot"));
+    let has_members = !people.is_empty();
+    let has_bots = !bots.is_empty();
     let member_count = if member_count == 0 {
-        member_preview.len() as u32
+        (people.len() + bots.len()) as u32
     } else {
         member_count
     };
-    let pinned_items = details
-        .map(|details| details.pinned_items.clone())
-        .unwrap_or_default();
     let group_name = details
         .and_then(|details| details.group.as_ref())
         .map(|group| group.display_name.clone())
@@ -1099,10 +1100,15 @@ fn render_details_panel(
                         .child(format!("#{}", conversation.summary.title)),
                 )
                 .when_some(group_name, |d, group| {
-                    d.child(div().text_sm().text_color(rgb(text_secondary())).child(group))
+                    d.child(
+                        div()
+                            .text_sm()
+                            .text_color(rgb(text_secondary()))
+                            .child(group),
+                    )
                 }),
         )
-        .when(!member_preview.is_empty(), |d| {
+        .when(has_members, |d| {
             d.child(
                 div()
                     .rounded_lg()
@@ -1118,11 +1124,84 @@ fn render_details_panel(
                             .text_color(rgb(text_primary()))
                             .child(format!("Members ({member_count})")),
                     )
-                    .children(member_preview.into_iter().enumerate().map(|(index, member)| {
+                    .children(people.into_iter().enumerate().map(|(index, member)| {
+                                let member_user_id = member.user_id.clone();
+                                let member_name = member.display_name.clone();
+                                div()
+                                    .id(("details-member-entry", index))
+                                    .rounded_md()
+                                    .bg(rgb(panel_alt_bg()))
+                                    .px_2()
+                                    .py_2()
+                                    .flex()
+                                    .items_center()
+                                    .justify_between()
+                                    .cursor(CursorStyle::PointingHand)
+                                    .hover(|s| s.bg(subtle_surface()))
+                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                        this.open_user_profile_panel(
+                                            member_user_id.clone(),
+                                            window,
+                                            cx,
+                                        );
+                                    }))
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .items_center()
+                                            .gap_2()
+                                            .child(Avatar::render(
+                                                &member_name,
+                                                member.avatar_asset.as_deref(),
+                                                28.,
+                                                default_avatar_background(&member_name),
+                                                text_primary(),
+                                            ))
+                                            .child(
+                                                div()
+                                                    .text_sm()
+                                                    .text_color(rgb(member_name_color(
+                                                        member.affinity,
+                                                    )))
+                                                    .child(member_name),
+                                            ),
+                                    )
+                                    .when(member.is_team_admin_or_owner, |row| {
+                                        row.child(
+                                            div()
+                                                .relative()
+                                                .top(px(-1.))
+                                                .flex()
+                                                .items_center()
+                                                .text_color(rgb(warning()))
+                                                .child(crown_icon(warning())),
+                                        )
+                                    })
+                                    .into_any_element()
+                            })),
+            )
+        })
+        .when(has_bots, |d| {
+            d.child(
+                div()
+                    .rounded_lg()
+                    .bg(panel_alt_surface())
+                    .p_4()
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .child(
+                        div()
+                            .text_sm()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(rgb(text_primary()))
+                            .child(format!("Bots ({})", bots.len())),
+                    )
+                    .children(bots.into_iter().enumerate().map(|(index, member)| {
                         let member_user_id = member.user_id.clone();
                         let member_name = member.display_name.clone();
                         div()
-                            .id(("details-member-entry", index))
+                            .id(("details-bot-entry", index))
                             .rounded_md()
                             .bg(rgb(panel_alt_bg()))
                             .px_2()
@@ -1154,11 +1233,22 @@ fn render_details_panel(
                                             .child(member_name),
                                     ),
                             )
+                            .when(member.is_team_admin_or_owner, |row| {
+                                row.child(
+                                    div()
+                                        .relative()
+                                        .top(px(-1.))
+                                        .flex()
+                                        .items_center()
+                                        .text_color(rgb(warning()))
+                                        .child(crown_icon(warning())),
+                                )
+                            })
                             .into_any_element()
                     })),
             )
         })
-        .when(capabilities.supports_pins && !pinned_items.is_empty(), |d| {
+        .when(!has_members && matches!(conversation.summary.kind, crate::domain::conversation::ConversationKind::Channel), |d| {
             d.child(
                 div()
                     .rounded_lg()
@@ -1172,24 +1262,18 @@ fn render_details_panel(
                             .text_sm()
                             .font_weight(FontWeight::SEMIBOLD)
                             .text_color(rgb(text_primary()))
-                            .child(format!("Pinned ({})", pinned_items.len())),
+                            .child("Members"),
                     )
-                    .children(pinned_items.into_iter().take(3).map(|item| {
-                        let preview = item
-                            .preview
-                            .and_then(|preview| preview.text)
-                            .filter(|text| !text.trim().is_empty())
-                            .unwrap_or_else(|| "Pinned message".to_string());
+                    .child(
                         div()
                             .rounded_md()
                             .bg(rgb(panel_alt_bg()))
                             .px_2()
-                            .py_1p5()
-                            .text_xs()
+                            .py_2()
+                            .text_sm()
                             .text_color(rgb(text_secondary()))
-                            .child(preview)
-                            .into_any_element()
-                    })),
+                            .child("Loading members…"),
+                    ),
             )
         })
         .child(
@@ -1219,69 +1303,81 @@ fn render_details_panel(
                             .child("No files shared yet."),
                     )
                 })
-                .children(shared_attachments.into_iter().enumerate().map(|(index, attachment)| {
-                    let open_target = attachment_open_target(&attachment);
-                    let fallback_open_target = attachment
-                        .source
-                        .as_ref()
-                        .or_else(|| attachment.preview.as_ref().map(|preview| &preview.source))
-                        .and_then(|source| match source {
-                            AttachmentSource::Url(url) => Some(url.clone()),
-                            AttachmentSource::LocalPath(_) => None,
-                        });
-                    let save_source = attachment
-                        .source
-                        .as_ref()
-                        .or_else(|| attachment.preview.as_ref().map(|preview| &preview.source))
-                        .and_then(|source| match source {
-                            AttachmentSource::LocalPath(path) => Some(path.clone()),
-                            _ => None,
-                        });
-                    let file_name = if attachment.name.trim().is_empty() {
-                        "attachment".to_string()
-                    } else {
-                        attachment.name.clone()
-                    };
-                    let truncated_name = truncate_with_ellipsis(&file_name, 56);
-                    div()
-                        .id(("details-shared-file", index))
-                        .rounded_md()
-                        .bg(rgb(panel_alt_bg()))
-                        .px_2()
-                        .py_1p5()
-                        .flex()
-                        .items_center()
-                        .min_w(px(0.))
-                        .cursor(CursorStyle::PointingHand)
-                        .hover(|s| s.bg(subtle_surface()))
-                        .on_click(cx.listener(move |this, _, window, cx| {
-                            if let Some(source_path) = save_source.clone() {
-                                this.save_attachment_copy(&source_path, &file_name, cx);
-                            } else if let Some(target) =
-                                open_target.clone().or_else(|| fallback_open_target.clone())
-                            {
-                                if target.starts_with("http://") || target.starts_with("https://")
-                                {
-                                    this.download_attachment_and_open(&target, &file_name, cx);
-                                } else {
-                                    this.open_url_or_deep_link(&target, window, cx);
-                                }
+                .children(
+                    shared_attachments
+                        .into_iter()
+                        .enumerate()
+                        .map(|(index, attachment)| {
+                            let open_target = attachment_open_target(&attachment);
+                            let fallback_open_target = attachment
+                                .source
+                                .as_ref()
+                                .or_else(|| {
+                                    attachment.preview.as_ref().map(|preview| &preview.source)
+                                })
+                                .and_then(|source| match source {
+                                    AttachmentSource::Url(url) => Some(url.clone()),
+                                    AttachmentSource::LocalPath(_) => None,
+                                });
+                            let save_source = attachment
+                                .source
+                                .as_ref()
+                                .or_else(|| {
+                                    attachment.preview.as_ref().map(|preview| &preview.source)
+                                })
+                                .and_then(|source| match source {
+                                    AttachmentSource::LocalPath(path) => Some(path.clone()),
+                                    _ => None,
+                                });
+                            let file_name = if attachment.name.trim().is_empty() {
+                                "attachment".to_string()
                             } else {
-                                this.notify_attachment_not_ready(cx);
-                            }
-                        }))
-                        .child(
+                                attachment.name.clone()
+                            };
+                            let truncated_name = truncate_with_ellipsis(&file_name, 56);
                             div()
-                                .id(("details-shared-file-open", index))
-                                .flex_1()
+                                .id(("details-shared-file", index))
+                                .rounded_md()
+                                .bg(rgb(panel_alt_bg()))
+                                .px_2()
+                                .py_1p5()
+                                .flex()
+                                .items_center()
                                 .min_w(px(0.))
-                                .overflow_hidden()
-                                .text_xs()
-                                .text_color(rgb(accent()))
-                                .child(truncated_name),
-                        )
-                        .into_any_element()
-                })),
+                                .cursor(CursorStyle::PointingHand)
+                                .hover(|s| s.bg(subtle_surface()))
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    if let Some(source_path) = save_source.clone() {
+                                        this.save_attachment_copy(&source_path, &file_name, cx);
+                                    } else if let Some(target) =
+                                        open_target.clone().or_else(|| fallback_open_target.clone())
+                                    {
+                                        if target.starts_with("http://")
+                                            || target.starts_with("https://")
+                                        {
+                                            this.download_attachment_and_open(
+                                                &target, &file_name, cx,
+                                            );
+                                        } else {
+                                            this.open_url_or_deep_link(&target, window, cx);
+                                        }
+                                    } else {
+                                        this.notify_attachment_not_ready(cx);
+                                    }
+                                }))
+                                .child(
+                                    div()
+                                        .id(("details-shared-file-open", index))
+                                        .flex_1()
+                                        .min_w(px(0.))
+                                        .overflow_hidden()
+                                        .text_xs()
+                                        .text_color(rgb(accent()))
+                                        .child(truncated_name),
+                                )
+                                .into_any_element()
+                        }),
+                ),
         )
         .into_any_element()
 }
@@ -1307,19 +1403,12 @@ fn render_members_panel(
     conversation: &ConversationModel,
     cx: &mut Context<AppWindow>,
 ) -> AnyElement {
-    let members = match conversation.summary.title.as_str() {
-        "design" => vec![
-            ("you", "You"),
-            ("sam_rivera", "Sam Rivera"),
-            ("alice_johnson", "Alice Johnson"),
-        ],
-        "Alice Johnson" => vec![("you", "You"), ("alice_johnson", "Alice Johnson")],
-        _ => vec![
-            ("you", "You"),
-            ("alice_johnson", "Alice Johnson"),
-            ("sam_rivera", "Sam Rivera"),
-        ],
-    };
+    let details = conversation.details.as_ref();
+    let members = details.map(|d| d.members.as_slice()).unwrap_or(&[]);
+    let (bots, people): (Vec<_>, Vec<_>) = members
+        .iter()
+        .cloned()
+        .partition(|member| member.user_id.0.to_ascii_lowercase().ends_with("bot"));
 
     div()
         .size_full()
@@ -1331,28 +1420,118 @@ fn render_members_panel(
         .flex_col()
         .gap_3()
         .child(pane_header("Members", "members-pane-close", cx))
-        .children(
-            members
-                .into_iter()
-                .enumerate()
-                .map(|(index, (id, member))| {
-                    let user_id = UserId::new(id.to_string());
-                    let label = member.to_string();
+        .when(members.is_empty(), |container| {
+            container.child(
+                div()
+                    .rounded_lg()
+                    .bg(panel_alt_surface())
+                    .p_4()
+                    .text_sm()
+                    .text_color(rgb(text_secondary()))
+                    .child("No member list available yet."),
+            )
+        })
+        .children(people.into_iter().enumerate().map(|(index, member)| {
+            let user_id = member.user_id.clone();
+            let label = member.display_name.clone();
+            div()
+                .id(("members-pane-row", index))
+                .rounded_lg()
+                .bg(panel_alt_surface())
+                .px_3()
+                .py_2()
+                .flex()
+                .items_center()
+                .gap_2()
+                .cursor(CursorStyle::PointingHand)
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.open_user_profile_card(user_id.clone(), cx);
+                }))
+                .child(Avatar::render(
+                    &label,
+                    member.avatar_asset.as_deref(),
+                    24.,
+                    default_avatar_background(&label),
+                    text_primary(),
+                ))
+                .child(
                     div()
-                        .id(("members-pane-row", index))
+                        .flex()
+                        .items_center()
+                        .gap_1()
+                        .text_sm()
+                        .text_color(rgb(member_name_color(member.affinity)))
+                        .child(label),
+                )
+                .when(member.is_team_admin_or_owner, |row| {
+                    row.child(
+                        div()
+                            .relative()
+                            .top(px(-1.))
+                            .flex()
+                            .items_center()
+                            .text_color(rgb(warning()))
+                            .child(crown_icon(warning())),
+                    )
+                })
+                .into_any_element()
+        }))
+        .when(!bots.is_empty(), |container| {
+            container
+                .child(
+                    div()
+                        .pt_2()
+                        .text_sm()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(rgb(text_primary()))
+                        .child(format!("Bots ({})", bots.len())),
+                )
+                .children(bots.into_iter().enumerate().map(|(index, member)| {
+                    let user_id = member.user_id.clone();
+                    let label = member.display_name.clone();
+                    div()
+                        .id(("members-pane-bot-row", index))
                         .rounded_lg()
                         .bg(panel_alt_surface())
                         .px_3()
                         .py_2()
-                        .text_sm()
+                        .flex()
+                        .items_center()
+                        .gap_2()
                         .cursor(CursorStyle::PointingHand)
                         .on_click(cx.listener(move |this, _, _, cx| {
                             this.open_user_profile_card(user_id.clone(), cx);
                         }))
-                        .child(label)
+                        .child(Avatar::render(
+                            &label,
+                            member.avatar_asset.as_deref(),
+                            24.,
+                            default_avatar_background(&label),
+                            text_primary(),
+                        ))
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap_1()
+                                .text_sm()
+                                .text_color(rgb(member_name_color(member.affinity)))
+                                .child(label),
+                        )
+                        .when(member.is_team_admin_or_owner, |row| {
+                            row.child(
+                                div()
+                                    .relative()
+                                    .top(px(-1.))
+                                    .flex()
+                                    .items_center()
+                                    .text_color(rgb(warning()))
+                                    .child(crown_icon(warning())),
+                            )
+                        })
                         .into_any_element()
-                }),
-        )
+                }))
+        })
         .into_any_element()
 }
 

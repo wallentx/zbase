@@ -379,6 +379,28 @@ impl TextField {
         }
     }
 
+    pub fn replace_range(
+        &mut self,
+        range: Range<usize>,
+        replacement: &str,
+        cx: &mut Context<Self>,
+    ) {
+        let clamped_start = range.start.min(self.content.len());
+        let clamped_end = range.end.min(self.content.len()).max(clamped_start);
+        let clamped = clamped_start..clamped_end;
+        let replaced_len = clamped.end.saturating_sub(clamped.start);
+        let inserted_len = replacement.len();
+        self.push_undo_snapshot(undo_edit_kind(replaced_len, inserted_len), false);
+        self.replace_content_range(clamped.clone(), replacement);
+        let cursor = clamped.start + replacement.len();
+        self.selected_range = cursor..cursor;
+        self.selection_reversed = false;
+        self.marked_range = None;
+        self.mark_content_edited();
+        self.clear_layout_cache();
+        cx.notify();
+    }
+
     fn push_undo_snapshot(&mut self, kind: UndoEditKind, coalesce: bool) {
         if coalesce
             && !text_field_undo_coalesce_disabled()
@@ -712,7 +734,8 @@ impl TextField {
             // word/line range. Avoid shrinking it on mouse-up when releasing within that range.
             if self.selected_range.is_empty() {
                 self.select_to(up_offset, cx);
-            } else if !(self.selected_range.start <= up_offset && up_offset <= self.selected_range.end)
+            } else if !(self.selected_range.start <= up_offset
+                && up_offset <= self.selected_range.end)
             {
                 self.select_to(up_offset, cx);
             }
@@ -808,7 +831,7 @@ impl TextField {
         )))
     }
 
-    fn cursor_offset(&self) -> usize {
+    pub fn cursor_offset(&self) -> usize {
         if self.selection_reversed {
             self.selected_range.start
         } else {

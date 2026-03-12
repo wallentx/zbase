@@ -20,7 +20,8 @@ use gpui::{
     ScrollHandle, StatefulInteractiveElement, Styled, div, px, rgb,
 };
 
-const ENV_PROFILE_DISABLE_SOCIAL_VIRTUALIZATION: &str = "ZBASE_PROFILE_DISABLE_SOCIAL_VIRTUALIZATION";
+const ENV_PROFILE_DISABLE_SOCIAL_VIRTUALIZATION: &str =
+    "ZBASE_PROFILE_DISABLE_SOCIAL_VIRTUALIZATION";
 const SOCIAL_VIRTUALIZATION_MIN_ENTRIES: usize = 200;
 
 pub fn render_profile_panel(
@@ -71,18 +72,14 @@ pub fn render_profile_panel(
     let team_showcase = profile.map(profile_team_showcase).unwrap_or(&[]);
     let custom_fields = profile.map(profile_custom_fields).unwrap_or(&[]);
     let social_entries = social_graph_entries(social_graph, profile_panel.active_social_tab);
-    let use_social_virtualization =
-        social_entries.len() >= SOCIAL_VIRTUALIZATION_MIN_ENTRIES && !social_virtualization_disabled();
-    let (
-        social_start_index,
-        social_end_index,
-        social_top_spacer_px,
-        social_bottom_spacer_px,
-    ) = if use_social_virtualization {
-        social_entry_window(social_entries.len(), profile_social_scroll)
-    } else {
-        (0, social_entries.len(), 0.0, 0.0)
-    };
+    let use_social_virtualization = social_entries.len() >= SOCIAL_VIRTUALIZATION_MIN_ENTRIES
+        && !social_virtualization_disabled();
+    let (social_start_index, social_end_index, social_top_spacer_px, social_bottom_spacer_px) =
+        if use_social_virtualization {
+            social_entry_window(social_entries.len(), profile_social_scroll)
+        } else {
+            (0, social_entries.len(), 0.0, 0.0)
+        };
     let visible_social_entries = &social_entries[social_start_index..social_end_index];
 
     div()
@@ -310,10 +307,9 @@ pub fn render_profile_panel(
                             )
                         },
                     )
-                    .child(
-                        {
-                            let render_entry = |index: usize,
-                                                entry: &crate::domain::profile::SocialGraphEntry| {
+                    .child({
+                        let render_entry =
+                            |index: usize, entry: &crate::domain::profile::SocialGraphEntry| {
                                 let entry_user_id = entry.user_id.clone();
                                 let entry_name = if entry.display_name.trim().is_empty() {
                                     entry.user_id.0.clone()
@@ -362,49 +358,49 @@ pub fn render_profile_panel(
                                     .into_any_element()
                             };
 
-                            if use_social_virtualization {
-                                let mut list = div()
-                                    .id("profile-social-list-scroll")
-                                    .flex()
-                                    .flex_col()
-                                    .overflow_y_scroll()
-                                    .scrollbar_width(px(6.))
-                                    .track_scroll(profile_social_scroll)
-                                    .on_scroll_wheel(cx.listener(|_, _, _, cx| {
-                                        cx.stop_propagation();
-                                    }))
-                                    .max_h(px(420.))
-                                    .min_h(px(0.));
+                        if use_social_virtualization {
+                            let mut list = div()
+                                .id("profile-social-list-scroll")
+                                .flex()
+                                .flex_col()
+                                .overflow_y_scroll()
+                                .scrollbar_width(px(6.))
+                                .track_scroll(profile_social_scroll)
+                                .on_scroll_wheel(cx.listener(|_, _, _, cx| {
+                                    cx.stop_propagation();
+                                }))
+                                .max_h(px(420.))
+                                .min_h(px(0.));
 
-                                if social_top_spacer_px > 0.0 {
-                                    list = list.child(div().h(px(social_top_spacer_px)));
-                                }
-
-                                list = list.children(
-                                    visible_social_entries.iter().enumerate().map(
-                                        |(visible_offset, entry)| {
-                                            let index = social_start_index + visible_offset;
-                                            render_entry(index, entry)
-                                        },
-                                    ),
-                                );
-
-                                if social_bottom_spacer_px > 0.0 {
-                                    list = list.child(div().h(px(social_bottom_spacer_px)));
-                                }
-
-                                list.into_any_element()
-                            } else {
-                                div()
-                                    .flex()
-                                    .flex_col()
-                                    .children(social_entries.iter().enumerate().map(
-                                        |(index, entry)| render_entry(index, entry),
-                                    ))
-                                    .into_any_element()
+                            if social_top_spacer_px > 0.0 {
+                                list = list.child(div().h(px(social_top_spacer_px)));
                             }
-                        },
-                    ),
+
+                            list = list.children(visible_social_entries.iter().enumerate().map(
+                                |(visible_offset, entry)| {
+                                    let index = social_start_index + visible_offset;
+                                    render_entry(index, entry)
+                                },
+                            ));
+
+                            if social_bottom_spacer_px > 0.0 {
+                                list = list.child(div().h(px(social_bottom_spacer_px)));
+                            }
+
+                            list.into_any_element()
+                        } else {
+                            div()
+                                .flex()
+                                .flex_col()
+                                .children(
+                                    social_entries
+                                        .iter()
+                                        .enumerate()
+                                        .map(|(index, entry)| render_entry(index, entry)),
+                                )
+                                .into_any_element()
+                        }
+                    }),
             )
         })
         .into_any_element()

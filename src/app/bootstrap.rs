@@ -84,6 +84,11 @@ pub fn run() {
             KeyBinding::new("cmd-j", commands::OpenSearch, Some("Workspace")),
             KeyBinding::new("cmd-f", commands::ToggleFindInChat, Some("Workspace")),
             KeyBinding::new("enter", commands::ConfirmPrimary, Some("Workspace")),
+            KeyBinding::new(
+                "tab",
+                commands::AcceptAutocomplete,
+                Some("MultilineTextField"),
+            ),
             KeyBinding::new("up", commands::SelectPrevious, Some("Workspace")),
             KeyBinding::new("down", commands::SelectNext, Some("Workspace")),
             KeyBinding::new("tab", commands::SelectNext, Some("QuickSwitcherTextField")),
@@ -115,7 +120,11 @@ pub fn run() {
             KeyBinding::new("ctrl-h", Backspace, Some("QuickSwitcherTextField")),
             KeyBinding::new("ctrl-b", Left, Some("QuickSwitcherTextField")),
             KeyBinding::new("ctrl-f", Right, Some("QuickSwitcherTextField")),
-            KeyBinding::new("alt-b", MoveToPreviousWordStart, Some("QuickSwitcherTextField")),
+            KeyBinding::new(
+                "alt-b",
+                MoveToPreviousWordStart,
+                Some("QuickSwitcherTextField"),
+            ),
             KeyBinding::new("alt-f", MoveToNextWordEnd, Some("QuickSwitcherTextField")),
             KeyBinding::new(
                 "alt-left",

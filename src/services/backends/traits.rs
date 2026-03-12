@@ -38,6 +38,10 @@ pub enum RoutedBackendCommand {
         account_id: AccountId,
         conversation: ProviderConversationRef,
     },
+    LoadConversationMembers {
+        account_id: AccountId,
+        conversation: ProviderConversationRef,
+    },
     LoadThread {
         account_id: AccountId,
         conversation: ProviderConversationRef,

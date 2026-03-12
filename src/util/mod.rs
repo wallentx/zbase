@@ -1,4 +1,5 @@
 pub mod async_load;
+pub mod autocomplete_detect;
 pub mod debounce;
 pub mod deep_link;
 pub mod formatting;
