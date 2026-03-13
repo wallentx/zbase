@@ -437,7 +437,10 @@ impl AppModels {
             permalink: "slack://acme/general/p/msg_001".to_string(),
             fragments: vec![
                 MessageFragment::Text("Here is the shell layout for the GPUI port.".to_string()),
-                MessageFragment::Code("AppWindow -> BodySplit -> TimelineList".to_string()),
+                MessageFragment::Code {
+                    text: "AppWindow -> BodySplit -> TimelineList".to_string(),
+                    lang: None,
+                },
             ],
             source_text: None,
             attachments: vec![AttachmentSummary {
@@ -2681,7 +2684,10 @@ fn demo_search_results(
                     MessageFragment::Text(
                         "Here is the shell layout for the GPUI port.".to_string(),
                     ),
-                    MessageFragment::Code("AppWindow -> BodySplit -> TimelineList".to_string()),
+                    MessageFragment::Code {
+                        text: "AppWindow -> BodySplit -> TimelineList".to_string(),
+                        lang: None,
+                    },
                 ],
                 source_text: None,
                 attachments: vec![AttachmentSummary {
@@ -2856,7 +2862,10 @@ fn general_timeline() -> TimelineModel {
                         MessageFragment::Text(
                             "Here is the shell layout for the GPUI port.".to_string(),
                         ),
-                        MessageFragment::Code("AppWindow -> BodySplit -> TimelineList".to_string()),
+                        MessageFragment::Code {
+                            text: "AppWindow -> BodySplit -> TimelineList".to_string(),
+                            lang: None,
+                        },
                     ],
                     source_text: None,
                     attachments: vec![AttachmentSummary {
@@ -3047,7 +3056,7 @@ fn flatten_fragments(fragments: &[MessageFragment]) -> String {
         .iter()
         .map(|fragment| match fragment {
             MessageFragment::Text(text)
-            | MessageFragment::Code(text)
+            | MessageFragment::Code { text, .. }
             | MessageFragment::Quote(text) => text.clone(),
             MessageFragment::InlineCode(text) => format!("`{text}`"),
             MessageFragment::Emoji { alias, .. } => format!(":{alias}:"),
@@ -4082,7 +4091,9 @@ mod tests {
 
     #[test]
     fn mention_autocomplete_resolves_display_name_to_username() {
-        use crate::domain::channel_details::{ChannelDetails, ChannelMemberPreview, NotificationLevel};
+        use crate::domain::channel_details::{
+            ChannelDetails, ChannelMemberPreview, NotificationLevel,
+        };
 
         let mut models = AppModels::empty_with_settings(SettingsModel::default());
         let conversation_id = models.conversation.summary.id.clone();
@@ -4134,15 +4145,19 @@ mod tests {
     fn mention_autocomplete_excludes_broadcast_in_dm() {
         let models = AppModels::empty_with_settings(SettingsModel::default());
         assert!(
-            matches!(models.conversation.summary.kind, ConversationKind::DirectMessage),
+            matches!(
+                models.conversation.summary.kind,
+                ConversationKind::DirectMessage
+            ),
             "empty models should default to DM conversation kind"
         );
 
         let results = models.mention_autocomplete_candidates("", 8);
         assert!(
-            results
-                .iter()
-                .all(|candidate| !matches!(candidate, AutocompleteCandidate::MentionBroadcast { .. })),
+            results.iter().all(|candidate| !matches!(
+                candidate,
+                AutocompleteCandidate::MentionBroadcast { .. }
+            )),
             "DM mention autocomplete should not include broadcast mentions"
         );
     }
@@ -4155,9 +4170,10 @@ mod tests {
 
         let results = models.mention_autocomplete_candidates("", 8);
         assert!(
-            results
-                .iter()
-                .any(|candidate| matches!(candidate, AutocompleteCandidate::MentionBroadcast { .. })),
+            results.iter().any(|candidate| matches!(
+                candidate,
+                AutocompleteCandidate::MentionBroadcast { .. }
+            )),
             "Channel mention autocomplete should include broadcast mentions even before details load"
         );
     }

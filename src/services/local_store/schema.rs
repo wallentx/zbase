@@ -150,6 +150,8 @@ pub enum CachedMessageFragment {
     },
     Code {
         text: String,
+        #[serde(default)]
+        lang: Option<String>,
     },
     Quote {
         text: String,
@@ -185,7 +187,10 @@ impl CachedMessageFragment {
                 url: url.clone(),
                 display: display.clone(),
             },
-            MessageFragment::Code(text) => Self::Code { text: text.clone() },
+            MessageFragment::Code { text, lang } => Self::Code {
+                text: text.clone(),
+                lang: lang.clone(),
+            },
             MessageFragment::Quote(text) => Self::Quote { text: text.clone() },
         }
     }
@@ -218,7 +223,10 @@ impl CachedMessageFragment {
                 url: url.clone(),
                 display: display.clone(),
             }),
-            Self::Code { text } => Some(MessageFragment::Code(text.clone())),
+            Self::Code { text, lang } => Some(MessageFragment::Code {
+                text: text.clone(),
+                lang: lang.clone(),
+            }),
             Self::Quote { text } => Some(MessageFragment::Quote(text.clone())),
         }
     }
@@ -732,7 +740,7 @@ fn cached_attachment_source_from_string(raw: &str) -> Option<AttachmentSource> {
 fn message_fragment_body_text(fragment: &MessageFragment) -> String {
     match fragment {
         MessageFragment::Text(text)
-        | MessageFragment::Code(text)
+        | MessageFragment::Code { text, .. }
         | MessageFragment::Quote(text) => text.clone(),
         MessageFragment::InlineCode(text) => format!("`{text}`"),
         MessageFragment::Emoji { alias, .. } => format!(":{alias}:"),
@@ -790,7 +798,10 @@ mod tests {
                     url: "https://example.com".to_string(),
                     display: "example".to_string(),
                 },
-                MessageFragment::Code("let x = 1;".to_string()),
+                MessageFragment::Code {
+                    text: "let x = 1;".to_string(),
+                    lang: None,
+                },
                 MessageFragment::Quote("quoted".to_string()),
             ],
             source_text: None,

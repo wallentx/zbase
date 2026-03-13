@@ -2,7 +2,7 @@ use crate::{
     domain::{
         affinity::Affinity,
         attachment::{AttachmentKind, AttachmentSource},
-        ids::UserId,
+        ids::{MessageId, UserId},
         message::{BroadcastKind, LinkPreview, MessageFragment, MessageSendState},
     },
     models::timeline_model::{
@@ -266,6 +266,7 @@ impl TimelineList {
         timeline: &TimelineModel,
         row: &TimelineRow,
         video_render_cache: &HashMap<String, Arc<RenderImage>>,
+        code_highlight_cache: &mut crate::views::code_highlight::CodeHighlightCache,
         selectable_texts: &mut HashMap<String, Entity<SelectableText>>,
         cx: &mut Context<AppWindow>,
     ) -> AnyElement {
@@ -278,6 +279,7 @@ impl TimelineList {
             None,
             None,
             video_render_cache,
+            code_highlight_cache,
             selectable_texts,
             cx,
         )
@@ -288,6 +290,7 @@ impl TimelineList {
         row: &TimelineRow,
         thread_media_max_width: f32,
         video_render_cache: &HashMap<String, Arc<RenderImage>>,
+        code_highlight_cache: &mut crate::views::code_highlight::CodeHighlightCache,
         selectable_texts: &mut HashMap<String, Entity<SelectableText>>,
         cx: &mut Context<AppWindow>,
     ) -> AnyElement {
@@ -300,6 +303,7 @@ impl TimelineList {
             Some(thread_media_max_width),
             None,
             video_render_cache,
+            code_highlight_cache,
             selectable_texts,
             cx,
         )
@@ -312,6 +316,7 @@ impl TimelineList {
         row_render_cache: &mut TimelineRowRenderCache,
         find_query: Option<&str>,
         video_render_cache: &HashMap<String, Arc<RenderImage>>,
+        code_highlight_cache: &mut crate::views::code_highlight::CodeHighlightCache,
         selectable_texts: &mut HashMap<String, Entity<SelectableText>>,
         cx: &mut Context<AppWindow>,
     ) -> AnyElement {
@@ -327,6 +332,7 @@ impl TimelineList {
                 None,
                 find_query,
                 video_render_cache,
+                code_highlight_cache,
                 selectable_texts,
                 cx,
             );
@@ -342,6 +348,7 @@ impl TimelineList {
             None,
             find_query,
             video_render_cache,
+            code_highlight_cache,
             selectable_texts,
             cx,
         )
@@ -356,6 +363,7 @@ impl TimelineList {
         thread_media_max_width: Option<f32>,
         find_query: Option<&str>,
         video_render_cache: &HashMap<String, Arc<RenderImage>>,
+        code_highlight_cache: &mut crate::views::code_highlight::CodeHighlightCache,
         selectable_texts: &mut HashMap<String, Entity<SelectableText>>,
         cx: &mut Context<AppWindow>,
     ) -> AnyElement {
@@ -455,6 +463,7 @@ impl TimelineList {
                     is_last_message,
                     find_query,
                     video_render_cache,
+                    code_highlight_cache,
                     selectable_texts,
                     cx,
                 )
@@ -478,6 +487,7 @@ impl TimelineList {
         is_last_message: bool,
         find_query: Option<&str>,
         video_render_cache: &HashMap<String, Arc<RenderImage>>,
+        code_highlight_cache: &mut crate::views::code_highlight::CodeHighlightCache,
         selectable_texts: &mut HashMap<String, Entity<SelectableText>>,
         cx: &mut Context<AppWindow>,
     ) -> AnyElement {
@@ -573,27 +583,37 @@ impl TimelineList {
                     "reply-indicator-{}",
                     row.message.id.0
                 )))
-                .on_click(cx.listener(move |this, _, window, cx| {
-                    this.open_thread(thread_target.clone(), window, cx);
-                }))
-                .on_mouse_move(cx.listener(|this, _, _, cx| {
-                    this.clear_hovered_message(cx);
-                    cx.stop_propagation();
-                }))
-                .cursor(gpui::CursorStyle::PointingHand)
                 .flex()
                 .items_center()
                 .gap_1()
-                .child(thread_icon(text_secondary()));
-
-            content = content.child(
-                reply_indicator.child(
+                .child(
                     div()
-                        .text_xs()
-                        .text_color(rgb(text_secondary()))
-                        .child("Replied in thread"),
-                ),
-            );
+                        .id(SharedString::from(format!(
+                            "reply-indicator-hit-{}",
+                            row.message.id.0
+                        )))
+                        .cursor(gpui::CursorStyle::PointingHand)
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.open_thread(thread_target.clone(), window, cx);
+                        }))
+                        .on_mouse_move(cx.listener(|this, _, _, cx| {
+                            this.clear_hovered_message(cx);
+                            cx.stop_propagation();
+                        }))
+                        .flex()
+                        .items_center()
+                        .gap_1()
+                        .flex_shrink_0()
+                        .child(thread_icon(text_secondary()))
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(rgb(text_secondary()))
+                                .child("Replied in thread"),
+                        ),
+                );
+
+            content = content.child(reply_indicator);
         }
 
         let is_highlighted = timeline.highlighted_message_id.as_ref() == Some(&row.message.id)
@@ -636,6 +656,7 @@ impl TimelineList {
                 video_render_cache,
                 message_memo,
                 timeline.quick_react_recent.as_ref(),
+                code_highlight_cache,
                 selectable_texts,
                 cx,
             ));
@@ -651,11 +672,6 @@ impl TimelineList {
                 )))
                 .on_mouse_move(
                     cx.listener(move |this, event: &gpui::MouseMoveEvent, _, cx| {
-                        if this.cursor_over_selectable_link(event.position, cx) {
-                            this.clear_hovered_message(cx);
-                            cx.stop_propagation();
-                            return;
-                        }
                         let cursor_x: f32 = event.position.x.into();
                         let cursor_y: f32 = event.position.y.into();
                         this.clear_reaction_hover_tooltip(cx);
@@ -715,11 +731,6 @@ impl TimelineList {
                 )))
                 .on_mouse_move(
                     cx.listener(move |this, event: &gpui::MouseMoveEvent, _, cx| {
-                        if this.cursor_over_selectable_link(event.position, cx) {
-                            this.clear_hovered_message(cx);
-                            cx.stop_propagation();
-                            return;
-                        }
                         let cursor_x: f32 = event.position.x.into();
                         let cursor_y: f32 = event.position.y.into();
                         this.clear_reaction_hover_tooltip(cx);
@@ -791,6 +802,7 @@ impl TimelineList {
         video_render_cache: &HashMap<String, Arc<RenderImage>>,
         message_memo: Option<&MessageRenderMemo>,
         quick_react_recent: Option<&QuickReactRecent>,
+        code_highlight_cache: &mut crate::views::code_highlight::CodeHighlightCache,
         selectable_texts: &mut HashMap<String, Entity<SelectableText>>,
         cx: &mut Context<AppWindow>,
     ) -> AnyElement {
@@ -812,6 +824,7 @@ impl TimelineList {
             .min_w(px(0.))
             .flex()
             .flex_col()
+            .items_start()
             .gap_0p5()
             .when(highlighted, |container| {
                 container.rounded_md().bg(tint(accent_soft(), 0.55))
@@ -834,17 +847,22 @@ impl TimelineList {
                 if image_attachment_message || media_link_only_message {
                     div().into_any_element()
                 } else {
-                    Self::render_message_fragments(
-                        message,
-                        find_query,
-                        affinity_index,
-                        current_user_id,
-                        emoji_index,
-                        emoji_source_index,
-                        message_memo,
-                        selectable_texts,
-                        cx,
-                    )
+                    div()
+                        .w_full()
+                        .min_w(px(0.))
+                        .child(Self::render_message_fragments(
+                            message,
+                            find_query,
+                            affinity_index,
+                            current_user_id,
+                            emoji_index,
+                            emoji_source_index,
+                            message_memo,
+                            code_highlight_cache,
+                            selectable_texts,
+                            cx,
+                        ))
+                        .into_any_element()
                 }
             })
             .when(!message.link_previews.is_empty(), |container| {
@@ -855,12 +873,14 @@ impl TimelineList {
                     300.0
                 };
                 container.child(Self::render_link_previews(
+                    message.id.clone(),
                     &message.id.0,
                     &message.link_previews,
                     message.attachments.is_empty() && message.thread_reply_count == 0,
                     link_preview_max_width,
                     link_preview_max_height,
                     video_render_cache,
+                    is_thread,
                     cx,
                 ))
             })
@@ -922,12 +942,24 @@ impl TimelineList {
                                             .h(px(media_height))
                                             .when_some(lightbox_source, |thumb, lightbox_source| {
                                                 let caption_text = lightbox_caption.clone();
+                                                let hover_message_id = message.id.clone();
                                                 thumb
                                                     .cursor(gpui::CursorStyle::PointingHand)
-                                                    .on_mouse_move(cx.listener(|this, _, _, cx| {
-                                                        this.clear_hovered_message(cx);
+                                                    .on_mouse_move(cx.listener(
+                                                        move |this, event: &gpui::MouseMoveEvent, _, cx| {
+                                                            let cursor_x: f32 = event.position.x.into();
+                                                            let cursor_y: f32 = event.position.y.into();
+                                                            this.clear_reaction_hover_tooltip(cx);
+                                                            this.set_hovered_message_with_cursor_anchor(
+                                                                hover_message_id.clone(),
+                                                                cursor_x,
+                                                                cursor_y,
+                                                                is_thread,
+                                                                cx,
+                                                            );
                                                         cx.stop_propagation();
-                                                    }))
+                                                        },
+                                                    ))
                                                     .on_click(cx.listener(move |this, _, _, cx| {
                                                         this.open_image_lightbox(
                                                             lightbox_source.clone(),
@@ -1014,9 +1046,21 @@ impl TimelineList {
                                             .overflow_hidden()
                                             .flex_shrink_0()
                                             .cursor(gpui::CursorStyle::PointingHand)
-                                            .on_mouse_move(cx.listener(|this, _, _, cx| {
-                                                this.clear_hovered_message(cx);
+                                            .on_mouse_move(cx.listener({
+                                                let hover_message_id = message.id.clone();
+                                                move |this, event: &gpui::MouseMoveEvent, _, cx| {
+                                                    let cursor_x: f32 = event.position.x.into();
+                                                    let cursor_y: f32 = event.position.y.into();
+                                                    this.clear_reaction_hover_tooltip(cx);
+                                                    this.set_hovered_message_with_cursor_anchor(
+                                                        hover_message_id.clone(),
+                                                        cursor_x,
+                                                        cursor_y,
+                                                        is_thread,
+                                                        cx,
+                                                    );
                                                 cx.stop_propagation();
+                                                }
                                             }))
                                             .when_some(video_path, |el, path| {
                                                 el.on_click(cx.listener(move |_, _, _, _| {
@@ -1251,7 +1295,7 @@ impl TimelineList {
                                 message.id.0
                             )))
                             .on_click(cx.listener(move |this, _, _, cx| {
-                                this.clear_hovered_message(cx);
+                                this.clear_hovered_message_immediate(cx);
                                 this.quick_react(msg_id.clone(), unicode_str.clone(), cx);
                             }))
                             .w(px(26.))
@@ -1280,7 +1324,7 @@ impl TimelineList {
                                         message.id.0
                                     )))
                                     .on_click(cx.listener(move |this, _, _, cx| {
-                                        this.clear_hovered_message(cx);
+                                        this.clear_hovered_message_immediate(cx);
                                         this.quick_react(msg_id.clone(), emoji_text.clone(), cx);
                                     }))
                                     .w(px(26.))
@@ -1305,7 +1349,7 @@ impl TimelineList {
                                         message.id.0
                                     )))
                                     .on_click(cx.listener(move |this, _, _, cx| {
-                                        this.clear_hovered_message(cx);
+                                        this.clear_hovered_message_immediate(cx);
                                         this.quick_react(msg_id.clone(), emoji_alias.clone(), cx);
                                     }))
                                     .w(px(26.))
@@ -1357,7 +1401,7 @@ impl TimelineList {
                         &message.id.0,
                         plus_icon(text_secondary()),
                         cx.listener(move |this, _, _, cx| {
-                            this.clear_hovered_message(cx);
+                            this.clear_hovered_message_immediate(cx);
                             this.react_to_message(message_id_for_picker.clone(), cx);
                         }),
                     ))
@@ -1373,7 +1417,7 @@ impl TimelineList {
                         &message.id.0,
                         thread_icon(text_secondary()),
                         cx.listener(move |this, _, window, cx| {
-                            this.clear_hovered_message(cx);
+                            this.clear_hovered_message_immediate(cx);
                             this.open_thread(message_id_for_thread_btn.clone(), window, cx);
                         }),
                     ))
@@ -1382,7 +1426,7 @@ impl TimelineList {
                         &message.id.0,
                         copy_icon(text_secondary()),
                         cx.listener(move |this, _, _, cx| {
-                            this.clear_hovered_message(cx);
+                            this.clear_hovered_message_immediate(cx);
                             this.copy_message_link(message_id_for_copy_link_btn.clone(), cx);
                         }),
                     ))
@@ -1391,7 +1435,7 @@ impl TimelineList {
                         &message.id.0,
                         clipboard_icon(text_secondary()),
                         cx.listener(move |this, _, _, cx| {
-                            this.clear_hovered_message(cx);
+                            this.clear_hovered_message_immediate(cx);
                             this.copy_message_text(message_id_for_copy_text_btn.clone(), cx);
                         }),
                     ))
@@ -1401,7 +1445,7 @@ impl TimelineList {
                             &message.id.0,
                             trash_icon(danger()),
                             cx.listener(move |this, _, _, cx| {
-                                this.clear_hovered_message(cx);
+                                this.clear_hovered_message_immediate(cx);
                                 this.delete_message(message_id_for_delete_btn.clone(), cx);
                             }),
                         ))
@@ -1409,14 +1453,14 @@ impl TimelineList {
 
                 const TOOLBAR_W: f32 = 260.0;
                 const TOOLBAR_H: f32 = 30.0;
-                const TOOLBAR_Y_GAP: f32 = 8.0;
+                const TOOLBAR_X_GAP: f32 = 10.0;
 
                 let toolbar_left = hover_anchor_x
                     .zip(hover_window_left)
                     .zip(hover_window_width)
                     .map(|((anchor_x, window_left), window_width)| {
                         let local_x = anchor_x - window_left;
-                        let mut left = local_x - (TOOLBAR_W * 0.5);
+                        let mut left = local_x + TOOLBAR_X_GAP;
                         if window_width.is_finite() && window_width > 0.0 {
                             let max_left = (window_width - TOOLBAR_W).max(0.0);
                             left = left.clamp(0.0, max_left);
@@ -1426,17 +1470,9 @@ impl TimelineList {
                         left
                     });
 
-                let toolbar_top =
-                    hover_anchor_y
-                        .zip(hover_window_top)
-                        .map(|(anchor_y, window_top)| {
-                            let above = anchor_y - window_top - TOOLBAR_H - TOOLBAR_Y_GAP;
-                            if above >= 0.0 {
-                                above
-                            } else {
-                                anchor_y - window_top + TOOLBAR_Y_GAP
-                            }
-                        });
+                let toolbar_top = hover_anchor_y
+                    .zip(hover_window_top)
+                    .map(|(anchor_y, window_top)| (anchor_y - window_top).max(0.0));
 
                 let toolbar_visible = is_hovered && hover_toolbar_settled;
                 let toolbar_wrapper = div()
@@ -1446,7 +1482,12 @@ impl TimelineList {
                     .when_some(toolbar_top, |d, top| d.top(px(top)))
                     .when(toolbar_top.is_none(), |d| d.top(px(-14.)))
                     .when(toolbar_visible, |d| d.block_mouse_except_scroll())
-                    .on_mouse_move(cx.listener(move |_, _, _, cx| {
+                    .on_mouse_down(gpui::MouseButton::Left, cx.listener(|this, _, _, cx| {
+                        this.cancel_hover_clear();
+                        cx.stop_propagation();
+                    }))
+                    .on_mouse_move(cx.listener(move |this, _, _, cx| {
+                        this.cancel_hover_clear();
                         cx.stop_propagation();
                     }))
                     .when(!toolbar_visible, |d| d.opacity(0.))
@@ -1463,21 +1504,32 @@ impl TimelineList {
                                 "timeline-thread-badge-{}",
                                 message.id.0
                             )))
-                            .on_click(cx.listener(move |this, _, window, cx| {
-                                this.open_thread(thread_root_id.clone(), window, cx);
-                            }))
-                            .on_mouse_move(cx.listener(|this, _, _, cx| {
-                                this.clear_hovered_message(cx);
-                                cx.stop_propagation();
-                            }))
-                            .cursor(gpui::CursorStyle::PointingHand)
-                            .text_xs()
-                            .text_color(rgb(accent()))
                             .flex()
                             .items_center()
                             .gap_1()
-                            .child(thread_icon(accent()))
-                            .child("View thread"),
+                            .child(
+                                div()
+                                    .id(SharedString::from(format!(
+                                        "timeline-thread-badge-hit-{}",
+                                        message.id.0
+                                    )))
+                                    .cursor(gpui::CursorStyle::PointingHand)
+                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                        this.open_thread(thread_root_id.clone(), window, cx);
+                                    }))
+                                    .on_mouse_move(cx.listener(|this, _, _, cx| {
+                                        this.clear_hovered_message(cx);
+                                        cx.stop_propagation();
+                                    }))
+                                    .text_xs()
+                                    .text_color(rgb(accent()))
+                                    .flex()
+                                    .items_center()
+                                    .gap_1()
+                                    .flex_shrink_0()
+                                    .child(thread_icon(accent()))
+                                    .child("View thread"),
+                            ),
                     )
                 },
             )
@@ -1495,7 +1547,7 @@ impl TimelineList {
             .iter()
             .map(|fragment| match fragment {
                 MessageFragment::Text(text)
-                | MessageFragment::Code(text)
+                | MessageFragment::Code { text, .. }
                 | MessageFragment::Quote(text) => text.clone(),
                 MessageFragment::InlineCode(text) => format!("`{text}`"),
                 MessageFragment::Emoji { alias, .. } => format!(":{alias}:"),
@@ -1519,6 +1571,7 @@ impl TimelineList {
         emoji_index: &HashMap<String, InlineEmojiRender>,
         emoji_source_index: &HashMap<String, InlineEmojiRender>,
         message_memo: Option<&MessageRenderMemo>,
+        code_highlight_cache: &mut crate::views::code_highlight::CodeHighlightCache,
         selectable_texts: &mut HashMap<String, Entity<SelectableText>>,
         cx: &mut Context<AppWindow>,
     ) -> AnyElement {
@@ -1610,6 +1663,7 @@ impl TimelineList {
                 emoji_source_index,
                 emoji_only,
                 find_query,
+                code_highlight_cache,
                 precomputed_segments,
                 selectable_texts,
                 cx,
@@ -1635,18 +1689,21 @@ impl TimelineList {
         div()
             .flex()
             .flex_col()
+            .items_start()
             .gap_0p5()
             .children(rendered)
             .into_any_element()
     }
 
     fn render_link_previews(
+        message_id: MessageId,
         message_key: &str,
         previews: &[LinkPreview],
         tight_bottom_spacing: bool,
         media_max_width: f32,
         media_max_height: f32,
         video_render_cache: &HashMap<String, Arc<RenderImage>>,
+        is_thread: bool,
         cx: &mut Context<AppWindow>,
     ) -> AnyElement {
         const MAX_VISIBLE: usize = 3;
@@ -1656,6 +1713,7 @@ impl TimelineList {
             .take(MAX_VISIBLE)
             .cloned()
             .collect::<Vec<_>>();
+        let message_id = message_id.clone();
         div()
             .flex()
             .flex_col()
@@ -1663,186 +1721,221 @@ impl TimelineList {
             .gap_1()
             .pt_1()
             .when(!tight_bottom_spacing, |container| container.pb_0p5())
-            .children(visible.into_iter().enumerate().map(|(index, preview)| {
-                let url = preview.url.clone();
-                let element_id =
-                    SharedString::from(format!("timeline-link-preview-{message_key}-{index}"));
-                let image_element_id = SharedString::from(format!(
-                    "timeline-link-preview-image-{message_key}-{index}"
-                ));
-                let is_giphy = {
-                    let lower = preview.url.to_ascii_lowercase();
-                    lower.contains("giphy.com") || lower.contains("gph.is")
-                };
+            .children(
+                visible
+                    .into_iter()
+                    .enumerate()
+                    .map(move |(index, preview)| {
+                        let message_id = message_id.clone();
+                        let url = preview.url.clone();
+                        let element_id = SharedString::from(format!(
+                            "timeline-link-preview-{message_key}-{index}"
+                        ));
+                        let image_element_id = SharedString::from(format!(
+                            "timeline-link-preview-image-{message_key}-{index}"
+                        ));
+                        let is_giphy = {
+                            let lower = preview.url.to_ascii_lowercase();
+                            lower.contains("giphy.com") || lower.contains("gph.is")
+                        };
 
-                if preview.is_media {
-                    let media_source = preview
-                        .thumbnail_asset
-                        .clone()
-                        .unwrap_or_else(|| preview.url.clone());
-                    let (media_width, media_height) = Self::media_frame_size(
-                        preview.media_width,
-                        preview.media_height,
-                        media_max_width,
-                        media_max_height,
-                    );
-                    return div()
-                        .id(element_id)
-                        .on_click(cx.listener(move |this, _, window, cx| {
-                            this.open_url_or_deep_link(&url, window, cx);
-                        }))
-                        .on_mouse_move(cx.listener(|this, _, _, cx| {
-                            this.clear_hovered_message(cx);
-                            cx.stop_propagation();
-                        }))
-                        .cursor(gpui::CursorStyle::PointingHand)
-                        .rounded_md()
-                        .overflow_hidden()
-                        .w(px(media_width))
-                        .h(px(media_height))
-                        .relative()
-                        .child({
-                            let decoded_video = if preview.is_video {
-                                let key_url =
-                                    preview.video_url.as_deref().unwrap_or(preview.url.as_str());
-                                let cache_key = video_preview_cache_key(key_url);
-                                video_render_cache.get(&cache_key).cloned()
-                            } else {
-                                None
-                            };
-                            if let Some(render_image) = decoded_video {
-                                img(ImageSource::Render(render_image))
-                                    .id(image_element_id.clone())
-                                    .w(px(media_width))
-                                    .h(px(media_height))
-                                    .rounded_md()
-                                    .object_fit(ObjectFit::Contain)
-                                    .flex_shrink_0()
-                                    .min_w(px(16.))
-                                    .min_h(px(16.))
-                            } else {
-                                img(SharedString::from(media_source))
-                                    .id(image_element_id.clone())
-                                    .w(px(media_width))
-                                    .h(px(media_height))
-                                    .rounded_md()
-                                    .object_fit(ObjectFit::Contain)
-                                    .flex_shrink_0()
-                                    .min_w(px(16.))
-                                    .min_h(px(16.))
-                                    .with_fallback({
-                                        let site = preview
-                                            .site
-                                            .clone()
-                                            .unwrap_or_else(|| "media".to_string());
-                                        move || {
+                        if preview.is_media {
+                            let media_source = preview
+                                .thumbnail_asset
+                                .clone()
+                                .unwrap_or_else(|| preview.url.clone());
+                            let (media_width, media_height) = Self::media_frame_size(
+                                preview.media_width,
+                                preview.media_height,
+                                media_max_width,
+                                media_max_height,
+                            );
+                            return div()
+                                .id(element_id)
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    this.open_url_or_deep_link(&url, window, cx);
+                                }))
+                                .on_mouse_move(cx.listener(
+                                    move |this, event: &gpui::MouseMoveEvent, _, cx| {
+                                        let cursor_x: f32 = event.position.x.into();
+                                        let cursor_y: f32 = event.position.y.into();
+                                        this.clear_reaction_hover_tooltip(cx);
+                                        this.set_hovered_message_with_cursor_anchor(
+                                            message_id.clone(),
+                                            cursor_x,
+                                            cursor_y,
+                                            is_thread,
+                                            cx,
+                                        );
+                                        cx.stop_propagation();
+                                    },
+                                ))
+                                .cursor(gpui::CursorStyle::PointingHand)
+                                .rounded_md()
+                                .overflow_hidden()
+                                .w(px(media_width))
+                                .h(px(media_height))
+                                .relative()
+                                .child({
+                                    let decoded_video = if preview.is_video {
+                                        let key_url = preview
+                                            .video_url
+                                            .as_deref()
+                                            .unwrap_or(preview.url.as_str());
+                                        let cache_key = video_preview_cache_key(key_url);
+                                        video_render_cache.get(&cache_key).cloned()
+                                    } else {
+                                        None
+                                    };
+                                    if let Some(render_image) = decoded_video {
+                                        img(ImageSource::Render(render_image))
+                                            .id(image_element_id.clone())
+                                            .w(px(media_width))
+                                            .h(px(media_height))
+                                            .rounded_md()
+                                            .object_fit(ObjectFit::Contain)
+                                            .flex_shrink_0()
+                                            .min_w(px(16.))
+                                            .min_h(px(16.))
+                                    } else {
+                                        img(SharedString::from(media_source))
+                                            .id(image_element_id.clone())
+                                            .w(px(media_width))
+                                            .h(px(media_height))
+                                            .rounded_md()
+                                            .object_fit(ObjectFit::Contain)
+                                            .flex_shrink_0()
+                                            .min_w(px(16.))
+                                            .min_h(px(16.))
+                                            .with_fallback({
+                                                let site = preview
+                                                    .site
+                                                    .clone()
+                                                    .unwrap_or_else(|| "media".to_string());
+                                                move || {
+                                                    div()
+                                                        .text_xs()
+                                                        .text_color(rgb(text_secondary()))
+                                                        .child(site.clone())
+                                                        .into_any_element()
+                                                }
+                                            })
+                                    }
+                                })
+                                .when(preview.is_video, |container| {
+                                    let key_url = preview
+                                        .video_url
+                                        .as_deref()
+                                        .unwrap_or(preview.url.as_str());
+                                    let cache_key = video_preview_cache_key(key_url);
+                                    let has_decoded_video =
+                                        video_render_cache.contains_key(&cache_key);
+                                    if has_decoded_video {
+                                        container
+                                    } else {
+                                        container.child(
                                             div()
+                                                .absolute()
+                                                .right_1()
+                                                .bottom_1()
+                                                .px_1p5()
+                                                .py_0p5()
+                                                .rounded_sm()
+                                                .bg(glass_surface_dark())
+                                                .border_1()
+                                                .border_color(shell_border())
                                                 .text_xs()
-                                                .text_color(rgb(text_secondary()))
-                                                .child(site.clone())
-                                                .into_any_element()
-                                        }
-                                    })
-                            }
-                        })
-                        .when(preview.is_video, |container| {
-                            let key_url =
-                                preview.video_url.as_deref().unwrap_or(preview.url.as_str());
-                            let cache_key = video_preview_cache_key(key_url);
-                            let has_decoded_video = video_render_cache.contains_key(&cache_key);
-                            if has_decoded_video {
-                                container
-                            } else {
+                                                .text_color(rgb(text_primary()))
+                                                .child("video"),
+                                        )
+                                    }
+                                })
+                                .into_any_element();
+                        }
+
+                        let site = preview.site.clone().unwrap_or_else(|| "link".to_string());
+                        let has_title = preview.title.is_some();
+                        let title = if is_giphy {
+                            preview
+                                .title
+                                .clone()
+                                .filter(|value| !value.trim().is_empty())
+                                .unwrap_or_else(|| "GIPHY".to_string())
+                        } else {
+                            preview.title.unwrap_or_else(|| preview.url.clone())
+                        };
+                        let thumbnail = preview.thumbnail_asset.clone();
+                        div()
+                            .id(element_id)
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.open_url_or_deep_link(&url, window, cx);
+                            }))
+                            .on_mouse_move(cx.listener(
+                                move |this, event: &gpui::MouseMoveEvent, _, cx| {
+                                    let cursor_x: f32 = event.position.x.into();
+                                    let cursor_y: f32 = event.position.y.into();
+                                    this.clear_reaction_hover_tooltip(cx);
+                                    this.set_hovered_message_with_cursor_anchor(
+                                        message_id.clone(),
+                                        cursor_x,
+                                        cursor_y,
+                                        is_thread,
+                                        cx,
+                                    );
+                                    cx.stop_propagation();
+                                },
+                            ))
+                            .cursor(gpui::CursorStyle::PointingHand)
+                            .border_l_2()
+                            .border_color(rgb(accent()))
+                            .pl_2()
+                            .py_0p5()
+                            .flex()
+                            .flex_col()
+                            .gap_0p5()
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(rgb(text_secondary()))
+                                    .child(site),
+                            )
+                            .child(div().text_sm().text_color(rgb(text_primary())).child(title))
+                            .when(has_title && !is_giphy, |container| {
                                 container.child(
                                     div()
-                                        .absolute()
-                                        .right_1()
-                                        .bottom_1()
-                                        .px_1p5()
-                                        .py_0p5()
-                                        .rounded_sm()
-                                        .bg(glass_surface_dark())
-                                        .border_1()
-                                        .border_color(shell_border())
                                         .text_xs()
-                                        .text_color(rgb(text_primary()))
-                                        .child("video"),
+                                        .text_color(rgb(accent()))
+                                        .child(preview.url.clone()),
                                 )
-                            }
-                        })
-                        .into_any_element();
-                }
-
-                let site = preview.site.clone().unwrap_or_else(|| "link".to_string());
-                let has_title = preview.title.is_some();
-                let title = if is_giphy {
-                    preview
-                        .title
-                        .clone()
-                        .filter(|value| !value.trim().is_empty())
-                        .unwrap_or_else(|| "GIPHY".to_string())
-                } else {
-                    preview.title.unwrap_or_else(|| preview.url.clone())
-                };
-                let thumbnail = preview.thumbnail_asset.clone();
-                div()
-                    .id(element_id)
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        this.open_url_or_deep_link(&url, window, cx);
-                    }))
-                    .on_mouse_move(cx.listener(|this, _, _, cx| {
-                        this.clear_hovered_message(cx);
-                        cx.stop_propagation();
-                    }))
-                    .cursor(gpui::CursorStyle::PointingHand)
-                    .border_l_2()
-                    .border_color(rgb(accent()))
-                    .pl_2()
-                    .py_0p5()
-                    .flex()
-                    .flex_col()
-                    .gap_0p5()
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(rgb(text_secondary()))
-                            .child(site),
-                    )
-                    .child(div().text_sm().text_color(rgb(text_primary())).child(title))
-                    .when(has_title && !is_giphy, |container| {
-                        container.child(
-                            div()
-                                .text_xs()
-                                .text_color(rgb(accent()))
-                                .child(preview.url.clone()),
-                        )
-                    })
-                    .when_some(thumbnail, |container, thumb_path| {
-                        let max_thumb_height = media_max_height.min(200.0);
-                        let (tw, th) = if let (Some(w), Some(h)) =
-                            (preview.media_width, preview.media_height)
-                            && w > 0
-                            && h > 0
-                        {
-                            let w = w as f32;
-                            let h = h as f32;
-                            let scale = (media_max_width / w).min(max_thumb_height / h).min(1.0);
-                            (w * scale, h * scale)
-                        } else {
-                            (media_max_width, max_thumb_height)
-                        };
-                        container.child(
-                            img(ImageSource::from(std::path::PathBuf::from(thumb_path)))
-                                .id(image_element_id)
-                                .mt_0p5()
-                                .w(px(tw))
-                                .h(px(th))
-                                .rounded_md()
-                                .object_fit(ObjectFit::Contain),
-                        )
-                    })
-                    .into_any_element()
-            }))
+                            })
+                            .when_some(thumbnail, |container, thumb_path| {
+                                let max_thumb_height = media_max_height.min(200.0);
+                                let (tw, th) = if let (Some(w), Some(h)) =
+                                    (preview.media_width, preview.media_height)
+                                    && w > 0
+                                    && h > 0
+                                {
+                                    let w = w as f32;
+                                    let h = h as f32;
+                                    let scale =
+                                        (media_max_width / w).min(max_thumb_height / h).min(1.0);
+                                    (w * scale, h * scale)
+                                } else {
+                                    (media_max_width, max_thumb_height)
+                                };
+                                container.child(
+                                    img(ImageSource::from(std::path::PathBuf::from(thumb_path)))
+                                        .id(image_element_id)
+                                        .mt_0p5()
+                                        .w(px(tw))
+                                        .h(px(th))
+                                        .rounded_md()
+                                        .object_fit(ObjectFit::Contain),
+                                )
+                            })
+                            .into_any_element()
+                    }),
+            )
             .when(hidden > 0, |container| {
                 container.child(
                     div()
@@ -2036,7 +2129,7 @@ impl TimelineList {
                         url: url.clone(),
                     });
                 }
-                MessageFragment::Code(text) | MessageFragment::Quote(text) => {
+                MessageFragment::Code { text, .. } | MessageFragment::Quote(text) => {
                     combined.push_str(text);
                 }
             }
@@ -2245,7 +2338,7 @@ impl TimelineList {
                         url: url.clone(),
                     });
                 }
-                MessageFragment::Code(text) | MessageFragment::Quote(text) => {
+                MessageFragment::Code { text, .. } | MessageFragment::Quote(text) => {
                     combined.push_str(text);
                 }
             }
@@ -2333,6 +2426,7 @@ impl TimelineList {
         emoji_source_index: &HashMap<String, InlineEmojiRender>,
         emoji_only: bool,
         find_query: Option<&str>,
+        code_highlight_cache: &mut crate::views::code_highlight::CodeHighlightCache,
         precomputed_segments: Option<&[InlineTextSegment]>,
         selectable_texts: &mut HashMap<String, Entity<SelectableText>>,
         cx: &mut Context<AppWindow>,
@@ -2628,23 +2722,54 @@ impl TimelineList {
                     .child(selectable)
                     .into_any_element()
             }
-            MessageFragment::Code(code) => div()
-                .w_full()
-                .min_w(px(0.))
-                .rounded_md()
-                .bg(rgb(mention_soft()))
-                .px_2()
-                .py_1()
-                .text_sm()
-                .child(resolve_selectable_text(
-                    selectable_texts,
-                    format!("timeline-{message_key}-code-{index}"),
-                    code.clone(),
-                    Vec::new(),
-                    Vec::new(),
-                    cx,
-                ))
-                .into_any_element(),
+            MessageFragment::Code { text: code, lang } => {
+                let theme = crate::views::current_theme();
+                let mut styled_ranges = Vec::new();
+                if let Some(resolved_lang) =
+                    crate::views::code_highlight::resolve_language(lang.as_deref(), code)
+                {
+                    let key =
+                        crate::views::code_highlight::highlight_key(theme, resolved_lang, code);
+                    if let Some(cached) = code_highlight_cache.get(&key) {
+                        styled_ranges = (*cached).clone();
+                    } else if code_highlight_cache.mark_inflight(key) {
+                        let code = code.clone();
+                        cx.spawn(
+                            move |this: gpui::WeakEntity<AppWindow>, cx: &mut gpui::AsyncApp| {
+                                let mut async_app = cx.clone();
+                                async move {
+                                    let ranges = crate::views::code_highlight::highlight(
+                                        &code,
+                                        resolved_lang,
+                                        theme,
+                                    );
+                                    let _ = this.update(&mut async_app, move |this, cx| {
+                                        this.code_highlight_cache.insert(key, ranges);
+                                        cx.notify();
+                                    });
+                                }
+                            },
+                        )
+                        .detach();
+                    }
+                }
+
+                div()
+                    .rounded_md()
+                    .bg(rgb(panel_alt_bg()))
+                    .px_2()
+                    .py_1()
+                    .text_sm()
+                    .child(resolve_selectable_text_inline(
+                        selectable_texts,
+                        format!("timeline-{message_key}-code-{index}"),
+                        code.clone(),
+                        Vec::new(),
+                        styled_ranges,
+                        cx,
+                    ))
+                    .into_any_element()
+            }
             MessageFragment::Quote(quote) => div()
                 .w_full()
                 .min_w(px(0.))

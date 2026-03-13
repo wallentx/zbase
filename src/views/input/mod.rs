@@ -203,6 +203,7 @@ pub struct TextField {
     last_bounds: Option<Bounds<Pixels>>,
     is_selecting: bool,
     field_kind: TextFieldKind,
+    autocomplete_navigation_enabled: bool,
     scroll_y: Pixels,
     pub up_at_top_triggered: bool,
     pub pasted_image: Option<Vec<u8>>,
@@ -294,6 +295,7 @@ impl TextField {
             last_bounds: None,
             is_selecting: false,
             field_kind,
+            autocomplete_navigation_enabled: false,
             scroll_y: px(0.),
             up_at_top_triggered: false,
             pasted_image: None,
@@ -316,6 +318,14 @@ impl TextField {
 
     pub fn is_multiline(&self) -> bool {
         self.field_kind.is_multiline()
+    }
+
+    pub fn set_autocomplete_navigation_enabled(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        if self.autocomplete_navigation_enabled == enabled {
+            return;
+        }
+        self.autocomplete_navigation_enabled = enabled;
+        cx.notify();
     }
 
     pub fn set_text(&mut self, text: impl Into<String>, cx: &mut Context<Self>) {
@@ -526,7 +536,11 @@ impl TextField {
         }
     }
 
-    fn up(&mut self, _: &Up, _: &mut Window, cx: &mut Context<Self>) {
+    fn up(&mut self, _: &Up, window: &mut Window, cx: &mut Context<Self>) {
+        if self.autocomplete_navigation_enabled {
+            window.dispatch_action(Box::new(crate::app::commands::SelectPrevious), cx);
+            return;
+        }
         if self.content.trim().is_empty() {
             self.up_at_top_triggered = true;
             cx.notify();
@@ -540,7 +554,11 @@ impl TextField {
         }
     }
 
-    fn down(&mut self, _: &Down, _: &mut Window, cx: &mut Context<Self>) {
+    fn down(&mut self, _: &Down, window: &mut Window, cx: &mut Context<Self>) {
+        if self.autocomplete_navigation_enabled {
+            window.dispatch_action(Box::new(crate::app::commands::SelectNext), cx);
+            return;
+        }
         self.move_vertical(1.0, cx);
     }
 

@@ -3,9 +3,9 @@ use crate::{
         AutocompleteCandidate, AutocompleteState, ComposerMode, ComposerModel,
     },
     views::{
-        accent, accent_soft, app_window::AppWindow, emoji_icon, input::TextField, is_dark_theme,
-        modal_surface, paperclip_icon, shell_border, shell_border_strong, text_primary,
-        text_secondary, tint, card_shadow,
+        accent, accent_soft, app_window::AppWindow, card_shadow, emoji_icon, input::TextField,
+        is_dark_theme, modal_surface, paperclip_icon, shell_border, shell_border_strong,
+        text_primary, text_secondary, tint,
     },
 };
 use gpui::prelude::FluentBuilder;

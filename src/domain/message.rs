@@ -53,7 +53,10 @@ pub enum MessageFragment {
         url: String,
         display: String,
     },
-    Code(String),
+    Code {
+        text: String,
+        lang: Option<String>,
+    },
     Quote(String),
 }
 
