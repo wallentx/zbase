@@ -1636,11 +1636,55 @@ fn add_pending_message_to_state(
     }
 }
 
+fn message_body_text_for_matching(msg: &MessageRecord) -> Option<String> {
+    msg.source_text
+        .as_ref()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            let t: String = msg
+                .fragments
+                .iter()
+                .filter_map(|f| match f {
+                    MessageFragment::Text(s) => Some(s.as_str()),
+                    _ => None,
+                })
+                .collect();
+            let t = t.trim();
+            if t.is_empty() {
+                None
+            } else {
+                Some(t.to_string())
+            }
+        })
+}
+
 fn upsert_message_in_state(state: &mut UiState, message: MessageRecord) {
     if state.timeline.conversation_id.as_ref() != Some(&message.conversation_id) {
         // Keep the active timeline stable; incoming events for other conversations
         // should not force navigation.
         return;
+    }
+
+    // If we're upserting our own message (e.g. from MessageUpserted when outbox wasn't
+    // matched), remove a matching pending so we don't show the same message twice.
+    let current_user = current_user_id(state);
+    if message.author_id == current_user {
+        if let Some(incoming_body) = message_body_text_for_matching(&message) {
+            let pending_id_to_remove = state
+                .timeline
+                .messages
+                .iter()
+                .rev()
+                .find(|m| {
+                    m.id.0.starts_with("local:")
+                        && message_body_text_for_matching(m).as_ref() == Some(&incoming_body)
+                })
+                .map(|m| m.id.clone());
+            if let Some(pending_id) = pending_id_to_remove {
+                replace_pending_message_id(state, &pending_id, &message.id);
+            }
+        }
     }
 
     apply_message_reactions(state, &message);

@@ -25,8 +25,8 @@ use crate::{
         attachment_display_label, attachment_header_row, attachment_image_source,
         attachment_lightbox_source, attachment_open_target,
         avatar::{Avatar, default_avatar_background},
-        badge, border, chevron_down_icon, close_icon, crown_icon,
-        danger, danger_soft, emoji_icon, format_duration_ms, glass_surface_strong,
+        badge, border, chevron_down_icon, close_icon, crown_icon, danger, danger_soft, emoji_icon,
+        format_duration_ms, glass_surface_strong,
         inline_markdown::{InlineMarkdownConfig, apply_inline_markdown, remap_source_byte_range},
         input::TextField,
         is_dark_theme, mention_colors_for_user, mention_soft, panel_alt_bg, panel_alt_surface,
@@ -35,9 +35,9 @@ use crate::{
             InlineAttachment, LinkRange, SelectableText, StyledRange, resolve_selectable_text,
             resolve_selectable_text_inline, resolve_selectable_text_with_attachments,
         },
-        subtle_surface, text_primary, text_secondary, warning,
+        subtle_surface, text_primary, text_secondary,
         timeline::TimelineList,
-        tint,
+        tint, warning,
     },
 };
 use gpui::prelude::FluentBuilder;
@@ -80,6 +80,7 @@ impl RightPaneHost {
         search: &SearchModel,
         timeline: &TimelineModel,
         video_render_cache: &HashMap<String, Arc<RenderImage>>,
+        code_highlight_cache: &mut crate::views::code_highlight::CodeHighlightCache,
         selectable_texts: &mut HashMap<String, Entity<SelectableText>>,
         reply_input: &Entity<TextField>,
         thread_scroll: &ScrollHandle,
@@ -95,6 +96,7 @@ impl RightPaneHost {
                 thread,
                 timeline,
                 video_render_cache,
+                code_highlight_cache,
                 selectable_texts,
                 reply_input,
                 thread_scroll,
@@ -172,6 +174,7 @@ impl ThreadPane {
         thread: &ThreadPaneModel,
         timeline: &TimelineModel,
         video_render_cache: &HashMap<String, Arc<RenderImage>>,
+        code_highlight_cache: &mut crate::views::code_highlight::CodeHighlightCache,
         selectable_texts: &mut HashMap<String, Entity<SelectableText>>,
         reply_input: &Entity<TextField>,
         thread_scroll: &ScrollHandle,
@@ -253,6 +256,7 @@ impl ThreadPane {
                                 &timeline_row,
                                 thread_media_max_width,
                                 video_render_cache,
+                                code_highlight_cache,
                                 selectable_texts,
                                 cx,
                             )
@@ -344,7 +348,7 @@ fn plain_text_from_fragments(fragments: &[MessageFragment]) -> String {
         match fragment {
             MessageFragment::Text(value)
             | MessageFragment::InlineCode(value)
-            | MessageFragment::Code(value)
+            | MessageFragment::Code { text: value, .. }
             | MessageFragment::Quote(value) => text.push_str(value),
             MessageFragment::Emoji { alias, .. } => text.push_str(&format!(":{alias}:")),
             MessageFragment::Mention(user_id) => text.push_str(&format!("@{}", user_id.0)),
@@ -652,7 +656,7 @@ fn message_caption_text(message: &MessageRecord) -> Option<String> {
         .iter()
         .map(|fragment| match fragment {
             MessageFragment::Text(text)
-            | MessageFragment::Code(text)
+            | MessageFragment::Code { text, .. }
             | MessageFragment::Quote(text) => text.clone(),
             MessageFragment::InlineCode(text) => format!("`{text}`"),
             MessageFragment::Emoji { alias, .. } => format!(":{alias}:"),
@@ -1125,60 +1129,54 @@ fn render_details_panel(
                             .child(format!("Members ({member_count})")),
                     )
                     .children(people.into_iter().enumerate().map(|(index, member)| {
-                                let member_user_id = member.user_id.clone();
-                                let member_name = member.display_name.clone();
+                        let member_user_id = member.user_id.clone();
+                        let member_name = member.display_name.clone();
+                        div()
+                            .id(("details-member-entry", index))
+                            .rounded_md()
+                            .bg(rgb(panel_alt_bg()))
+                            .px_2()
+                            .py_2()
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .cursor(CursorStyle::PointingHand)
+                            .hover(|s| s.bg(subtle_surface()))
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.open_user_profile_panel(member_user_id.clone(), window, cx);
+                            }))
+                            .child(
                                 div()
-                                    .id(("details-member-entry", index))
-                                    .rounded_md()
-                                    .bg(rgb(panel_alt_bg()))
-                                    .px_2()
-                                    .py_2()
                                     .flex()
                                     .items_center()
-                                    .justify_between()
-                                    .cursor(CursorStyle::PointingHand)
-                                    .hover(|s| s.bg(subtle_surface()))
-                                    .on_click(cx.listener(move |this, _, window, cx| {
-                                        this.open_user_profile_panel(
-                                            member_user_id.clone(),
-                                            window,
-                                            cx,
-                                        );
-                                    }))
+                                    .gap_2()
+                                    .child(Avatar::render(
+                                        &member_name,
+                                        member.avatar_asset.as_deref(),
+                                        28.,
+                                        default_avatar_background(&member_name),
+                                        text_primary(),
+                                    ))
                                     .child(
                                         div()
-                                            .flex()
-                                            .items_center()
-                                            .gap_2()
-                                            .child(Avatar::render(
-                                                &member_name,
-                                                member.avatar_asset.as_deref(),
-                                                28.,
-                                                default_avatar_background(&member_name),
-                                                text_primary(),
-                                            ))
-                                            .child(
-                                                div()
-                                                    .text_sm()
-                                                    .text_color(rgb(member_name_color(
-                                                        member.affinity,
-                                                    )))
-                                                    .child(member_name),
-                                            ),
-                                    )
-                                    .when(member.is_team_admin_or_owner, |row| {
-                                        row.child(
-                                            div()
-                                                .relative()
-                                                .top(px(-1.))
-                                                .flex()
-                                                .items_center()
-                                                .text_color(rgb(warning()))
-                                                .child(crown_icon(warning())),
-                                        )
-                                    })
-                                    .into_any_element()
-                            })),
+                                            .text_sm()
+                                            .text_color(rgb(member_name_color(member.affinity)))
+                                            .child(member_name),
+                                    ),
+                            )
+                            .when(member.is_team_admin_or_owner, |row| {
+                                row.child(
+                                    div()
+                                        .relative()
+                                        .top(px(-1.))
+                                        .flex()
+                                        .items_center()
+                                        .text_color(rgb(warning()))
+                                        .child(crown_icon(warning())),
+                                )
+                            })
+                            .into_any_element()
+                    })),
             )
         })
         .when(has_bots, |d| {
@@ -1248,34 +1246,41 @@ fn render_details_panel(
                     })),
             )
         })
-        .when(!has_members && matches!(conversation.summary.kind, crate::domain::conversation::ConversationKind::Channel), |d| {
-            d.child(
-                div()
-                    .rounded_lg()
-                    .bg(panel_alt_surface())
-                    .p_4()
-                    .flex()
-                    .flex_col()
-                    .gap_2()
-                    .child(
-                        div()
-                            .text_sm()
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(rgb(text_primary()))
-                            .child("Members"),
-                    )
-                    .child(
-                        div()
-                            .rounded_md()
-                            .bg(rgb(panel_alt_bg()))
-                            .px_2()
-                            .py_2()
-                            .text_sm()
-                            .text_color(rgb(text_secondary()))
-                            .child("Loading members…"),
-                    ),
-            )
-        })
+        .when(
+            !has_members
+                && matches!(
+                    conversation.summary.kind,
+                    crate::domain::conversation::ConversationKind::Channel
+                ),
+            |d| {
+                d.child(
+                    div()
+                        .rounded_lg()
+                        .bg(panel_alt_surface())
+                        .p_4()
+                        .flex()
+                        .flex_col()
+                        .gap_2()
+                        .child(
+                            div()
+                                .text_sm()
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(rgb(text_primary()))
+                                .child("Members"),
+                        )
+                        .child(
+                            div()
+                                .rounded_md()
+                                .bg(rgb(panel_alt_bg()))
+                                .px_2()
+                                .py_2()
+                                .text_sm()
+                                .text_color(rgb(text_secondary()))
+                                .child("Loading members…"),
+                        ),
+                )
+            },
+        )
         .child(
             div()
                 .rounded_lg()
@@ -1703,7 +1708,7 @@ fn render_inline_fragments(
                     }
                 }
             }
-            MessageFragment::Code(text) | MessageFragment::Quote(text) => {
+            MessageFragment::Code { text, .. } | MessageFragment::Quote(text) => {
                 combined.push_str(text);
             }
             MessageFragment::InlineCode(code) => {
@@ -1984,7 +1989,7 @@ fn render_inline_fragments_with_asset_emojis(
                     url: url.clone(),
                 });
             }
-            MessageFragment::Code(text) | MessageFragment::Quote(text) => {
+            MessageFragment::Code { text, .. } | MessageFragment::Quote(text) => {
                 combined.push_str(text);
             }
         }
@@ -2131,7 +2136,7 @@ fn render_fragment(
                 .child(selectable)
                 .into_any_element()
         }
-        MessageFragment::Code(text) | MessageFragment::Quote(text) => {
+        MessageFragment::Code { text, .. } | MessageFragment::Quote(text) => {
             let selectable = if compact_inline {
                 resolve_selectable_text_inline(
                     selectable_texts,
@@ -2775,11 +2780,15 @@ fn build_thread_message_rows(
         )
     }
 
-    let mut messages = thread.replies.clone();
+    let mut root_message_fallback = None;
     if let Some(root_id) = thread.root_message_id.as_ref()
-        && !messages.iter().any(|message| &message.id == root_id)
-        && let Some(root_message) = find_message_record(timeline, root_id)
+        && !thread.replies.iter().any(|message| &message.id == root_id)
     {
+        root_message_fallback = find_message_record(timeline, root_id);
+    }
+
+    let mut messages = thread.replies.iter().collect::<Vec<_>>();
+    if let Some(root_message) = root_message_fallback.as_ref() {
         messages.push(root_message);
     }
 
@@ -2788,6 +2797,7 @@ fn build_thread_message_rows(
     messages.retain(|message| seen_ids.insert(message.id.clone()));
     messages.retain(|message| !is_non_text_placeholder_message(message));
 
+    let author_lookup = build_thread_author_lookup(timeline);
     let mut rows = Vec::with_capacity(messages.len());
     let mut previous_message: Option<(UserId, Option<i64>)> = None;
     for message in messages {
@@ -2811,7 +2821,10 @@ fn build_thread_message_rows(
                 });
 
         rows.push(MessageRow {
-            author: resolve_thread_author_summary(timeline, &message.author_id),
+            author: author_lookup
+                .get(&message.author_id)
+                .cloned()
+                .unwrap_or_else(|| fallback_thread_author_summary(&message.author_id)),
             message: message.clone(),
             show_header,
         });
@@ -2820,16 +2833,23 @@ fn build_thread_message_rows(
     rows
 }
 
-fn resolve_thread_author_summary(timeline: &TimelineModel, author_id: &UserId) -> UserSummary {
-    let normalized_author = UserId::new(author_id.0.to_ascii_lowercase());
+fn build_thread_author_lookup(timeline: &TimelineModel) -> HashMap<UserId, UserSummary> {
+    let mut lookup = HashMap::new();
     for row in &timeline.rows {
         let TimelineRow::Message(message_row) = row else {
             continue;
         };
-        if message_row.author.id == *author_id || message_row.author.id == normalized_author {
-            return message_row.author.clone();
-        }
+        let author = message_row.author.clone();
+        lookup
+            .entry(author.id.clone())
+            .or_insert_with(|| author.clone());
+        let normalized_author_id = UserId::new(author.id.0.to_ascii_lowercase());
+        lookup.entry(normalized_author_id).or_insert(author);
     }
+    lookup
+}
+
+fn fallback_thread_author_summary(author_id: &UserId) -> UserSummary {
     UserSummary {
         id: author_id.clone(),
         display_name: author_id.0.clone(),

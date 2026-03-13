@@ -282,11 +282,17 @@ impl ChatBackend for KeybaseBackend {
                 conversation,
                 root_message,
             } => {
+                let load_thread_started_at = Instant::now();
+                let mut reindex_us = 0u128;
+                let mut warm_recent_us = 0u128;
+                let mut root_fallback_us = 0u128;
+
                 self.ensure_listener_started();
                 let conversation_id = canonical_conversation_id_from_provider_ref(&conversation);
                 let requested_root = provider_message_ref_to_message_id(&root_message)
                     .unwrap_or_else(|| MessageId::new(root_message.0.clone()));
                 let sender_for_debug = self.inbound_sender.clone();
+                let edge_repair_started_at = Instant::now();
                 let conversation_edge_migrated = self
                     .local_store
                     .is_thread_edge_conversation_migrated(&conversation_id)
@@ -319,6 +325,8 @@ impl ChatBackend for KeybaseBackend {
                         );
                     }
                 }
+                let edge_repair_us = edge_repair_started_at.elapsed().as_micros();
+                let root_resolution_started_at = Instant::now();
                 let canonical_root = self
                     .local_store
                     .get_message(&conversation_id, &requested_root)
@@ -333,11 +341,14 @@ impl ChatBackend for KeybaseBackend {
                         )
                     })
                     .unwrap_or_else(|| requested_root.clone());
+                let root_resolution_us = root_resolution_started_at.elapsed().as_micros();
                 let mut effective_root = canonical_root.clone();
+                let initial_load_started_at = Instant::now();
                 let mut messages = self
                     .local_store
                     .load_thread_messages(&conversation_id, &effective_root)
                     .unwrap_or_default();
+                let initial_local_load_us = initial_load_started_at.elapsed().as_micros();
                 if let Some(sender) = sender_for_debug.as_ref() {
                     maybe_emit_thread_debug_snapshot(
                         sender,
@@ -349,6 +360,7 @@ impl ChatBackend for KeybaseBackend {
                     );
                 }
                 if messages.len() <= 1 {
+                    let reindex_started_at = Instant::now();
                     rebuild_thread_index_from_cached_messages(
                         &self.local_store,
                         &conversation_id,
@@ -358,6 +370,7 @@ impl ChatBackend for KeybaseBackend {
                         .local_store
                         .load_thread_messages(&conversation_id, &effective_root)
                         .unwrap_or_default();
+                    reindex_us = reindex_started_at.elapsed().as_micros();
                     if let Some(sender) = sender_for_debug.as_ref() {
                         maybe_emit_thread_debug_snapshot(
                             sender,
@@ -373,6 +386,7 @@ impl ChatBackend for KeybaseBackend {
                             provider_ref_to_conversation_id_bytes(&conversation)
                         && let Some(path) = socket_path()
                     {
+                        let warm_recent_started_at = Instant::now();
                         let _ = warm_recent_conversation_messages_for_thread(
                             &self.local_store,
                             &self.search_index,
@@ -389,6 +403,7 @@ impl ChatBackend for KeybaseBackend {
                             .local_store
                             .load_thread_messages(&conversation_id, &effective_root)
                             .unwrap_or_default();
+                        warm_recent_us = warm_recent_started_at.elapsed().as_micros();
                         if let Some(sender) = sender_for_debug.as_ref() {
                             maybe_emit_thread_debug_snapshot(
                                 sender,
@@ -401,11 +416,13 @@ impl ChatBackend for KeybaseBackend {
                         }
                     }
                     if messages.len() <= 1 && effective_root != requested_root {
+                        let root_fallback_started_at = Instant::now();
                         effective_root = requested_root.clone();
                         messages = self
                             .local_store
                             .load_thread_messages(&conversation_id, &effective_root)
                             .unwrap_or_default();
+                        root_fallback_us = root_fallback_started_at.elapsed().as_micros();
                         if let Some(sender) = sender_for_debug.as_ref() {
                             maybe_emit_thread_debug_snapshot(
                                 sender,
@@ -426,6 +443,26 @@ impl ChatBackend for KeybaseBackend {
                         &requested_root,
                         &effective_root,
                         "load_thread.before_emit",
+                    );
+                }
+
+                if thread_open_profile_enabled() {
+                    let total_us = load_thread_started_at.elapsed().as_micros();
+                    warn!(
+                        target: "zbase.thread.open.perf",
+                        phase = "backend_load_thread",
+                        conversation_id = %conversation_id.0,
+                        requested_root = %requested_root.0,
+                        effective_root = %effective_root.0,
+                        total_us = total_us as i64,
+                        edge_repair_us = edge_repair_us as i64,
+                        root_resolution_us = root_resolution_us as i64,
+                        initial_local_load_us = initial_local_load_us as i64,
+                        reindex_us = reindex_us as i64,
+                        warm_recent_us = warm_recent_us as i64,
+                        root_fallback_us = root_fallback_us as i64,
+                        emitted_message_count = messages.len() as i64,
+                        "thread_open_measurement"
                     );
                 }
 
@@ -2744,7 +2781,10 @@ fn run_load_conversation_members(sender: Sender<BackendEvent>, conversation_id: 
                 &sender,
                 "zbase.internal.get_participants_failed",
                 Value::Map(vec![
-                    (Value::from("conversation_id"), Value::from(conversation_id.0.clone())),
+                    (
+                        Value::from("conversation_id"),
+                        Value::from(conversation_id.0.clone()),
+                    ),
                     (Value::from("error"), Value::from(error.to_string())),
                 ]),
             );
@@ -2757,7 +2797,10 @@ fn run_load_conversation_members(sender: Sender<BackendEvent>, conversation_id: 
             &sender,
             "zbase.internal.get_participants_unparseable",
             Value::Map(vec![
-                (Value::from("conversation_id"), Value::from(conversation_id.0.clone())),
+                (
+                    Value::from("conversation_id"),
+                    Value::from(conversation_id.0.clone()),
+                ),
                 (
                     Value::from("response_kind"),
                     Value::from(format!("{:?}", response)),
@@ -2767,10 +2810,7 @@ fn run_load_conversation_members(sender: Sender<BackendEvent>, conversation_id: 
         return;
     };
 
-    let mut members = usernames
-        .into_iter()
-        .map(UserId::new)
-        .collect::<Vec<_>>();
+    let mut members = usernames.into_iter().map(UserId::new).collect::<Vec<_>>();
     members.sort_by(|left, right| left.0.cmp(&right.0));
     members.dedup_by(|left, right| left.0.eq_ignore_ascii_case(&right.0));
     let _ = sender.send(BackendEvent::ConversationMembersUpdated {
@@ -2788,7 +2828,9 @@ fn parse_conversation_participants_usernames(value: &Value) -> Option<Vec<String
         items
     } else if let Some(result) = map_get_any(value, &["result", "Result"]).and_then(as_array) {
         result
-    } else if let Some(result) = map_get_any(value, &["participants", "Participants"]).and_then(as_array) {
+    } else if let Some(result) =
+        map_get_any(value, &["participants", "Participants"]).and_then(as_array)
+    {
         result
     } else {
         return None;
@@ -4465,6 +4507,20 @@ fn load_conversation_perf_log_all_enabled() -> bool {
     })
 }
 
+fn thread_open_profile_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("ZBASE_THREAD_OPEN_PROFILE")
+            .ok()
+            .is_some_and(|raw| {
+                matches!(
+                    raw.trim().to_ascii_lowercase().as_str(),
+                    "1" | "true" | "yes" | "on"
+                )
+            })
+    })
+}
+
 fn spawn_hydrate_timeline_attachments(
     sender: &Sender<BackendEvent>,
     local_store: &Arc<LocalStore>,
@@ -4894,18 +4950,21 @@ fn run_backfill_thread_history(
 }
 
 fn should_emit_thread_debug(root_id: &MessageId) -> bool {
-    if let Ok(flag) = std::env::var("ZBASE_THREAD_DEBUG")
-        && matches!(flag.trim(), "0" | "false" | "off")
-    {
-        return false;
-    }
     if let Ok(configured) = std::env::var("ZBASE_THREAD_DEBUG_ROOT_ID") {
         let value = configured.trim();
         if !value.is_empty() {
             return value == root_id.0;
         }
     }
-    true
+    std::env::var("ZBASE_THREAD_DEBUG")
+        .ok()
+        .map(|raw| {
+            matches!(
+                raw.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
 }
 
 fn to_value_array(ids: &[String], limit: usize) -> Value {
@@ -8167,7 +8226,7 @@ fn message_plain_text(message: &MessageRecord) -> String {
         .iter()
         .map(|fragment| match fragment {
             MessageFragment::Text(text)
-            | MessageFragment::Code(text)
+            | MessageFragment::Code { text, .. }
             | MessageFragment::Quote(text) => text.clone(),
             MessageFragment::InlineCode(text) => format!("`{text}`"),
             MessageFragment::Emoji { alias, .. } => format!(":{alias}:"),
@@ -8194,7 +8253,7 @@ fn message_attachment_filename_tokens(message: &MessageRecord) -> String {
 fn message_contains_shortcode(message: &MessageRecord) -> bool {
     message.fragments.iter().any(|fragment| match fragment {
         MessageFragment::Text(text)
-        | MessageFragment::Code(text)
+        | MessageFragment::Code { text, .. }
         | MessageFragment::Quote(text) => {
             text.contains(':') && text.chars().filter(|ch| *ch == ':').count() >= 2
         }
@@ -12424,7 +12483,7 @@ fn fragments_include_structured_spans(fragments: &[MessageFragment]) -> bool {
             fragment,
             MessageFragment::Text(_)
                 | MessageFragment::InlineCode(_)
-                | MessageFragment::Code(_)
+                | MessageFragment::Code { .. }
                 | MessageFragment::Quote(_)
         )
     })
@@ -12600,10 +12659,17 @@ fn parse_code_fragment_at(body: &str, backtick_index: usize) -> Option<(MessageF
         if end <= start {
             return None;
         }
-        let content_start = if body[start..end].starts_with('\n') {
-            start + 1
+        let fence_body = &body[start..end];
+        let (lang, content_start) = if let Some(nl_rel) = fence_body.find('\n') {
+            let info = fence_body[..nl_rel].trim();
+            let lang = info
+                .split_whitespace()
+                .next()
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_ascii_lowercase());
+            (lang, start + nl_rel + 1)
         } else {
-            start
+            (None, start)
         };
         let content_end = if end > content_start && body[..end].ends_with('\n') {
             end - 1
@@ -12611,7 +12677,10 @@ fn parse_code_fragment_at(body: &str, backtick_index: usize) -> Option<(MessageF
             end
         };
         return Some((
-            MessageFragment::Code(body[content_start..content_end].to_string()),
+            MessageFragment::Code {
+                text: body[content_start..content_end].to_string(),
+                lang,
+            },
             end + 3,
         ));
     }
@@ -13167,7 +13236,7 @@ fn quote_line_continues_from_fragments(fragments: &[MessageFragment]) -> bool {
         match fragment {
             MessageFragment::Quote(text) => return !text.ends_with('\n'),
             MessageFragment::Text(_) => return false,
-            MessageFragment::Code(text) | MessageFragment::InlineCode(text) => {
+            MessageFragment::Code { text, .. } | MessageFragment::InlineCode(text) => {
                 if text.contains('\n') {
                     return false;
                 }
@@ -17607,7 +17676,7 @@ mod tests {
         let fragments = parse_plain_mentions_from_text("Use ```\n:lol:\n``` literally and :troll:");
         assert!(fragments.iter().any(|fragment| matches!(
             fragment,
-            MessageFragment::Code(code) if code == ":lol:"
+            MessageFragment::Code { text: code, .. } if code == ":lol:"
         )));
         assert!(
             !fragments.iter().any(|fragment| matches!(
@@ -17636,7 +17705,7 @@ mod tests {
         )));
         assert!(fragments.iter().any(|fragment| matches!(
             fragment,
-            MessageFragment::Code(code) if code == ":lol:"
+            MessageFragment::Code { text: code, .. } if code == ":lol:"
         )));
         assert!(
             !fragments.iter().any(|fragment| matches!(

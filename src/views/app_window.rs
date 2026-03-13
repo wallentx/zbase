@@ -46,8 +46,9 @@ use crate::{
     },
     views::{
         MAIN_PANEL_MIN_WIDTH_PX, RIGHT_PANE_RESIZE_HANDLE_WIDTH_PX, SHELL_GAP_PX,
-        SHELL_HORIZONTAL_PADDING_PX, app_backdrop, badge, border, composer::render_autocomplete_popup,
+        SHELL_HORIZONTAL_PADDING_PX, app_backdrop, badge, border,
         calls::MiniCallDock,
+        composer::render_autocomplete_popup,
         glass_surface_dark,
         input::TextField,
         is_dark_theme,
@@ -87,7 +88,11 @@ const ENV_BENCH_SCRIPT: &str = "ZBASE_BENCH_SCRIPT";
 const ENV_BENCH_SCRIPT_TICK_MS: &str = "ZBASE_BENCH_SCRIPT_TICK_MS";
 const ENV_BENCH_TIMELINE_MESSAGES: &str = "ZBASE_BENCH_TIMELINE_MESSAGES";
 const ENV_BENCH_PROFILE_USER: &str = "ZBASE_BENCH_PROFILE_USER";
+const ENV_BENCH_THREAD_CONVERSATION_ID: &str = "ZBASE_BENCH_THREAD_CONVERSATION_ID";
+const ENV_BENCH_THREAD_ROOT_ID: &str = "ZBASE_BENCH_THREAD_ROOT_ID";
+const ENV_BENCH_THREAD_ROOT_IDS: &str = "ZBASE_BENCH_THREAD_ROOT_IDS";
 const ENV_BENCH_EXIT_ON_STOP: &str = "ZBASE_BENCH_EXIT_ON_STOP";
+const ENV_THREAD_OPEN_PROFILE: &str = "ZBASE_THREAD_OPEN_PROFILE";
 const BACKEND_POLL_BOOT_INTERVAL: Duration = Duration::from_millis(16);
 const BACKEND_POLL_READY_INTERVAL: Duration = Duration::from_millis(200);
 const QUICK_SWITCHER_REMOTE_MIN_QUERY_CHARS: usize = 2;
@@ -98,6 +103,7 @@ const MAX_VIDEO_RENDER_CACHE_ENTRIES: usize = 8;
 const MAX_BACKEND_EVENTS_PER_DRAIN: usize = 48;
 const NON_TEXT_PLACEHOLDER_BODY: &str = "<non-text message>";
 const INLINE_AUTOCOMPLETE_MAX_RESULTS: usize = 8;
+const AUTOCOMPLETE_NAV_DEBOUNCE: Duration = Duration::from_millis(35);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum InputAutocompleteTarget {
@@ -225,6 +231,7 @@ pub struct AppWindow {
     sidebar_resize_drag: Option<SidebarResizeState>,
     timeline_list_state: ListState,
     timeline_row_render_cache: crate::views::timeline::TimelineRowRenderCache,
+    pub(crate) code_highlight_cache: crate::views::code_highlight::CodeHighlightCache,
     thread_scroll: ScrollHandle,
     profile_scroll: ScrollHandle,
     profile_social_scroll: ScrollHandle,
@@ -253,6 +260,9 @@ pub struct AppWindow {
     bench_script_step: u64,
     bench_profile_user_id: Option<UserId>,
     bench_profile_initialized: bool,
+    bench_thread_conversation_id: Option<ConversationId>,
+    bench_thread_root_id: Option<MessageId>,
+    bench_thread_root_ids: Vec<MessageId>,
     perf_exit_on_stop: bool,
     sync_cache: SyncCache,
     pending_backend_events: VecDeque<BackendEvent>,
@@ -267,6 +277,8 @@ pub struct AppWindow {
     last_mark_read_attempt: HashMap<String, (String, Instant)>,
     window_is_focused: bool,
     hover_settle_seq: u64,
+    hover_clear_seq: u64,
+    hover_clear_pending: bool,
     quick_switcher_query_seq: u64,
     quick_switcher_last_local_query: String,
     quick_switcher_last_local_matched_entry_indices: Arc<Vec<usize>>,
@@ -280,6 +292,7 @@ pub struct AppWindow {
     last_text_input_activity: Option<Instant>,
     dismissed_composer_autocomplete: Option<AutocompleteDismissSignature>,
     dismissed_thread_autocomplete: Option<AutocompleteDismissSignature>,
+    last_autocomplete_nav: Option<(InputAutocompleteTarget, isize, Instant)>,
     resolved_theme: crate::app::theme::ThemeVariant,
     splash_open: bool,
     splash_shown_at: Instant,
@@ -372,6 +385,7 @@ enum BenchScriptScenario {
     SyncHeavy,
     ComposerTyping,
     ComposerPaste,
+    ThreadOpen,
 }
 
 impl BenchScriptScenario {
@@ -386,6 +400,7 @@ impl BenchScriptScenario {
                 Some(Self::ComposerTyping)
             }
             "composer_paste" | "composer-paste" | "paste" => Some(Self::ComposerPaste),
+            "thread_open" | "thread-open" | "thread" => Some(Self::ThreadOpen),
             _ => None,
         }
     }
@@ -397,6 +412,7 @@ impl BenchScriptScenario {
             Self::SyncHeavy => "sync_heavy",
             Self::ComposerTyping => "composer_typing",
             Self::ComposerPaste => "composer_paste",
+            Self::ThreadOpen => "thread_open",
         }
     }
 }
@@ -604,6 +620,18 @@ impl AppWindow {
         let initial_timeline_row_count = models.timeline.rows.len();
         let bench_script = BenchScriptConfig::from_env();
         let bench_profile_user_id = env_nonempty(ENV_BENCH_PROFILE_USER).map(UserId::new);
+        let bench_thread_conversation_id =
+            env_nonempty(ENV_BENCH_THREAD_CONVERSATION_ID).map(ConversationId::new);
+        let bench_thread_root_id = env_nonempty(ENV_BENCH_THREAD_ROOT_ID).map(MessageId::new);
+        let bench_thread_root_ids = env_nonempty(ENV_BENCH_THREAD_ROOT_IDS)
+            .map(|raw| {
+                raw.split(',')
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(MessageId::new)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
         let (video_result_sender, video_result_receiver) = mpsc::channel();
         let (og_result_sender, og_result_receiver) = mpsc::channel();
 
@@ -631,6 +659,7 @@ impl AppWindow {
                 px(1920.),
             ),
             timeline_row_render_cache: crate::views::timeline::TimelineRowRenderCache::default(),
+            code_highlight_cache: crate::views::code_highlight::CodeHighlightCache::default(),
             thread_scroll: ScrollHandle::new(),
             profile_scroll: ScrollHandle::new(),
             profile_social_scroll: ScrollHandle::new(),
@@ -657,6 +686,9 @@ impl AppWindow {
             bench_script_step: 0,
             bench_profile_user_id,
             bench_profile_initialized: false,
+            bench_thread_conversation_id,
+            bench_thread_root_id,
+            bench_thread_root_ids,
             perf_exit_on_stop: env_flag(ENV_BENCH_EXIT_ON_STOP),
             sync_cache: SyncCache::default(),
             pending_backend_events: VecDeque::new(),
@@ -671,6 +703,8 @@ impl AppWindow {
             last_mark_read_attempt: HashMap::new(),
             window_is_focused: false,
             hover_settle_seq: 0,
+            hover_clear_seq: 0,
+            hover_clear_pending: false,
             quick_switcher_query_seq: 0,
             quick_switcher_last_local_query: String::new(),
             quick_switcher_last_local_matched_entry_indices: Arc::new(Vec::new()),
@@ -684,6 +718,7 @@ impl AppWindow {
             last_text_input_activity: None,
             dismissed_composer_autocomplete: None,
             dismissed_thread_autocomplete: None,
+            last_autocomplete_nav: None,
             resolved_theme: crate::app::theme::ThemeVariant::Light,
             splash_open: true,
             splash_shown_at: Instant::now(),
@@ -1724,6 +1759,26 @@ impl AppWindow {
         self.sync_autocomplete_for_target(InputAutocompleteTarget::Thread, cx);
     }
 
+    fn set_autocomplete_navigation_enabled_for_target(
+        &mut self,
+        target: InputAutocompleteTarget,
+        enabled: bool,
+        cx: &mut Context<Self>,
+    ) {
+        match target {
+            InputAutocompleteTarget::Composer => {
+                self.composer_input.update(cx, |field, cx| {
+                    field.set_autocomplete_navigation_enabled(enabled, cx);
+                });
+            }
+            InputAutocompleteTarget::Thread => {
+                self.thread_input.update(cx, |field, cx| {
+                    field.set_autocomplete_navigation_enabled(enabled, cx);
+                });
+            }
+        }
+    }
+
     fn sync_autocomplete_for_target(
         &mut self,
         target: InputAutocompleteTarget,
@@ -1743,15 +1798,17 @@ impl AppWindow {
         };
 
         let detected = detect_autocomplete_trigger(&text, cursor);
-        let detected_signature = detected.as_ref().map(|matched| AutocompleteDismissSignature {
-            trigger: match matched.kind {
-                AutocompleteTriggerKind::Mention => '@',
-                AutocompleteTriggerKind::Emoji => ':',
-            },
-            trigger_offset: matched.trigger_offset,
-            cursor,
-            query: matched.query.clone(),
-        });
+        let detected_signature = detected
+            .as_ref()
+            .map(|matched| AutocompleteDismissSignature {
+                trigger: match matched.kind {
+                    AutocompleteTriggerKind::Mention => '@',
+                    AutocompleteTriggerKind::Emoji => ':',
+                },
+                trigger_offset: matched.trigger_offset,
+                cursor,
+                query: matched.query.clone(),
+            });
 
         // If the user dismissed autocomplete (Escape), keep it closed until the input context
         // (trigger/query/cursor) changes.
@@ -1763,10 +1820,15 @@ impl AppWindow {
             if detected_signature.as_ref() == Some(&dismissed) {
                 if current_state.is_some() {
                     match target {
-                        InputAutocompleteTarget::Composer => self.models.set_composer_autocomplete(None),
-                        InputAutocompleteTarget::Thread => self.models.set_thread_autocomplete(None),
+                        InputAutocompleteTarget::Composer => {
+                            self.models.set_composer_autocomplete(None)
+                        }
+                        InputAutocompleteTarget::Thread => {
+                            self.models.set_thread_autocomplete(None)
+                        }
                     }
                 }
+                self.set_autocomplete_navigation_enabled_for_target(target, false, cx);
                 return;
             }
             // Context changed; allow autocomplete to show again.
@@ -1776,9 +1838,21 @@ impl AppWindow {
             }
         }
 
-        let next_state = detected
+        let mut next_state = detected
             .and_then(|matched| self.build_autocomplete_state(matched))
             .filter(|state| !state.candidates.is_empty());
+        if let (Some(next), Some(current)) = (next_state.as_mut(), current_state.as_ref()) {
+            // Preserve selection when only the highlighted row changed (e.g. Up/Down navigation).
+            // The input observer can re-run this sync even without text edits.
+            if next.trigger == current.trigger
+                && next.trigger_offset == current.trigger_offset
+                && next.query == current.query
+                && next.candidates == current.candidates
+            {
+                let max_ix = next.candidates.len().saturating_sub(1);
+                next.selected_index = current.selected_index.min(max_ix);
+            }
+        }
         if next_state == current_state {
             return;
         }
@@ -1786,6 +1860,21 @@ impl AppWindow {
             InputAutocompleteTarget::Composer => self.models.set_composer_autocomplete(next_state),
             InputAutocompleteTarget::Thread => self.models.set_thread_autocomplete(next_state),
         }
+        let enabled = match target {
+            InputAutocompleteTarget::Composer => self
+                .models
+                .composer
+                .autocomplete
+                .as_ref()
+                .is_some_and(|state| !state.candidates.is_empty()),
+            InputAutocompleteTarget::Thread => self
+                .models
+                .thread_pane
+                .reply_autocomplete
+                .as_ref()
+                .is_some_and(|state| !state.candidates.is_empty()),
+        };
+        self.set_autocomplete_navigation_enabled_for_target(target, enabled, cx);
     }
 
     fn current_autocomplete_dismiss_signature(
@@ -1794,14 +1883,16 @@ impl AppWindow {
         cx: &mut Context<Self>,
     ) -> Option<AutocompleteDismissSignature> {
         match target {
-            InputAutocompleteTarget::Composer => self.models.composer.autocomplete.as_ref().map(|state| {
-                AutocompleteDismissSignature {
-                    trigger: state.trigger,
-                    trigger_offset: state.trigger_offset,
-                    cursor: self.composer_input.read(cx).cursor_offset(),
-                    query: state.query.clone(),
-                }
-            }),
+            InputAutocompleteTarget::Composer => {
+                self.models.composer.autocomplete.as_ref().map(|state| {
+                    AutocompleteDismissSignature {
+                        trigger: state.trigger,
+                        trigger_offset: state.trigger_offset,
+                        cursor: self.composer_input.read(cx).cursor_offset(),
+                        query: state.query.clone(),
+                    }
+                })
+            }
             InputAutocompleteTarget::Thread => self
                 .models
                 .thread_pane
@@ -2030,6 +2121,101 @@ impl AppWindow {
                 self.sync_drafts_from_inputs(cx);
                 self.refresh(cx);
             }
+            BenchScriptScenario::ThreadOpen => {
+                self.run_bench_thread_open_tick(cx);
+            }
+        }
+    }
+
+    fn ensure_bench_thread_conversation(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some(conversation_id) = self.bench_thread_conversation_id.clone() else {
+            return true;
+        };
+        if self.app_store.snapshot().timeline.conversation_id.as_ref() == Some(&conversation_id) {
+            return true;
+        }
+
+        let route =
+            route_for_conversation_id(&self.models.app.active_workspace_id, &conversation_id);
+        self.models.navigate_to(route.clone());
+        self.dispatch_ui_action(UiAction::Navigate(route.clone()));
+        self.models.expand_section_for_route(&route);
+        self.reset_timeline_scroll_state();
+        self.reset_thread_scroll_state();
+        self.sync_inputs_from_models(cx);
+        self.refresh(cx);
+        false
+    }
+
+    fn bench_thread_root_candidate(&self) -> Option<MessageId> {
+        let mut best: Option<(MessageId, u32)> = None;
+        for row in &self.models.timeline.rows {
+            let crate::models::timeline_model::TimelineRow::Message(message_row) = row else {
+                continue;
+            };
+            let replies = message_row.message.thread_reply_count;
+            if replies == 0 {
+                continue;
+            }
+            let message_id = message_row.message.id.clone();
+            best = match best {
+                Some((best_id, best_replies))
+                    if best_replies > replies
+                        || (best_replies == replies
+                            && message_id_is_after(&best_id, &message_id)) =>
+                {
+                    Some((best_id, best_replies))
+                }
+                _ => Some((message_id, replies)),
+            };
+        }
+        best.map(|(message_id, _)| message_id)
+    }
+
+    fn run_bench_thread_open_tick(&mut self, cx: &mut Context<Self>) {
+        if !self.ensure_bench_thread_conversation(cx) {
+            return;
+        }
+        if !self.bench_script_step.is_multiple_of(24) {
+            return;
+        }
+        let root_id = if self.bench_thread_root_ids.is_empty() {
+            self.bench_thread_root_id
+                .clone()
+                .or_else(|| self.bench_thread_root_candidate())
+        } else {
+            let open_ix = (self.bench_script_step / 24) as usize;
+            self.bench_thread_root_ids
+                .get(open_ix % self.bench_thread_root_ids.len())
+                .cloned()
+        };
+        let Some(root_id) = root_id else {
+            return;
+        };
+
+        let started_at = Instant::now();
+        self.ensure_message_binding_for_active_conversation(&root_id);
+        self.models.open_thread(root_id.clone());
+        self.dispatch_ui_action(UiAction::OpenThread {
+            root_id: root_id.clone(),
+        });
+        self.reset_thread_scroll_state();
+        self.pending_thread_scroll_to_bottom = true;
+        self.sync_inputs_from_models(cx);
+        self.refresh(cx);
+
+        if env_flag(ENV_THREAD_OPEN_PROFILE) {
+            let elapsed = started_at.elapsed();
+            tracing::warn!(
+                target: "zbase.thread.open.perf",
+                phase = "bench_open_thread_tick",
+                root_id = %root_id.0,
+                elapsed_ms = elapsed.as_millis() as i64,
+                elapsed_us = elapsed.as_micros() as i64,
+                replies_after_open = self.models.thread_pane.replies.len() as i64,
+                loading = self.models.thread_pane.loading,
+                "thread_open_measurement"
+            );
         }
     }
 
@@ -2105,7 +2291,10 @@ impl AppWindow {
 
             let mut fragments = vec![MessageFragment::Text(text)];
             if idx % 29 == 0 {
-                fragments.push(MessageFragment::Code("cargo check -q".to_string()));
+                fragments.push(MessageFragment::Code {
+                    text: "cargo check -q".to_string(),
+                    lang: None,
+                });
             }
 
             let message_id = MessageId::new(format!("bench-msg-{idx:06}"));
@@ -2373,6 +2562,15 @@ impl AppWindow {
     fn dispatch_ui_action(&mut self, action: UiAction) {
         let t0 = Instant::now();
         let is_update_draft = matches!(&action, UiAction::UpdateDraft { .. });
+        let open_thread_root = match &action {
+            UiAction::OpenThread { root_id } => Some(root_id.clone()),
+            _ => None,
+        };
+        let profile_open_thread = open_thread_root.is_some() && env_flag(ENV_THREAD_OPEN_PROFILE);
+        let mut backend_apply_elapsed = Duration::default();
+        let mut backend_reduce_elapsed = Duration::default();
+        let mut backend_apply_calls = 0usize;
+        let mut backend_event_count = 0usize;
         if is_update_draft {
             let _ = self.app_store.dispatch_ui(action);
             self.perf_harness
@@ -2381,20 +2579,28 @@ impl AppWindow {
         }
         let is_quick_switcher_search = matches!(&action, UiAction::QuickSwitcherSearch { .. });
         let is_find_in_chat_search = matches!(&action, UiAction::FindInChatSearch { .. });
+        let is_open_thread = open_thread_root.is_some();
         let should_sync_models = !matches!(
             &action,
             UiAction::SetSearchQuery(_)
                 | UiAction::SetSidebarFilter(_)
                 | UiAction::UpdateDraft { .. }
+                | UiAction::OpenThread { .. }
                 | UiAction::QuickSwitcherSearch { .. }
                 | UiAction::FindInChatSearch { .. }
         );
         let mut pending_effects = self.app_store.dispatch_ui(action);
 
         loop {
+            let apply_started_at = profile_open_thread.then(Instant::now);
             let Ok(events) = self.backend_router.apply_effects(&pending_effects) else {
                 break;
             };
+            if let Some(apply_started_at) = apply_started_at {
+                backend_apply_elapsed += apply_started_at.elapsed();
+                backend_apply_calls = backend_apply_calls.saturating_add(1);
+                backend_event_count = backend_event_count.saturating_add(events.len());
+            }
 
             if events.is_empty() {
                 break;
@@ -2466,7 +2672,11 @@ impl AppWindow {
                         continue;
                     }
                 }
+                let reduce_started_at = profile_open_thread.then(Instant::now);
                 pending_effects.extend(self.app_store.dispatch_backend(event));
+                if let Some(reduce_started_at) = reduce_started_at {
+                    backend_reduce_elapsed += reduce_started_at.elapsed();
+                }
             }
 
             if pending_effects.is_empty() {
@@ -2474,12 +2684,45 @@ impl AppWindow {
             }
         }
 
-        if should_sync_models {
+        let sync_started_at = profile_open_thread.then(Instant::now);
+        if is_open_thread {
+            self.sync_thread_pane_from_store();
+        } else if should_sync_models {
             self.sync_models_from_store();
         }
+        let sync_elapsed = sync_started_at.map(|started_at| started_at.elapsed());
         let elapsed = t0.elapsed();
         self.perf_harness
             .record_duration(PerfTimer::DispatchUiAction, elapsed);
+        if let Some(root_id) = open_thread_root.as_ref()
+            && env_flag(ENV_THREAD_OPEN_PROFILE)
+        {
+            tracing::warn!(
+                target: "zbase.thread.open.perf",
+                phase = "dispatch_ui_open_thread",
+                root_id = %root_id.0,
+                elapsed_ms = elapsed.as_millis() as i64,
+                elapsed_us = elapsed.as_micros() as i64,
+                loading = self.models.thread_pane.loading,
+                replies = self.models.thread_pane.replies.len() as i64,
+                "thread_open_measurement"
+            );
+            if let Some(sync_elapsed) = sync_elapsed {
+                tracing::warn!(
+                    target: "zbase.thread.open.perf",
+                    phase = "dispatch_ui_open_thread_breakdown",
+                    root_id = %root_id.0,
+                    total_us = elapsed.as_micros() as i64,
+                    backend_apply_us = backend_apply_elapsed.as_micros() as i64,
+                    backend_reduce_us = backend_reduce_elapsed.as_micros() as i64,
+                    sync_models_us = sync_elapsed.as_micros() as i64,
+                    backend_apply_calls = backend_apply_calls as i64,
+                    backend_event_count = backend_event_count as i64,
+                    should_sync_models = should_sync_models,
+                    "thread_open_measurement"
+                );
+            }
+        }
         if self.perf_harness.is_capturing() && elapsed.as_millis() > 1 {
             let action_label = if is_quick_switcher_search {
                 "QuickSwitcherSearch".to_string()
@@ -3089,7 +3332,7 @@ impl AppWindow {
             let mut rows: Vec<crate::models::timeline_model::TimelineRow> = Vec::new();
             let unread_marker = snapshot.timeline.unread_marker.clone();
             let mut unread_divider_inserted = unread_marker.is_none();
-            let mut previous_message: Option<(UserId, Option<i64>)> = None;
+            let mut previous_message: Option<(UserId, Option<i64>, bool)> = None;
 
             for message in &timeline_messages {
                 if !unread_divider_inserted
@@ -3188,8 +3431,13 @@ impl AppWindow {
                     .unwrap_or_default();
 
                 let show_header = previous_message.as_ref().is_none_or(
-                    |(previous_author, previous_timestamp_ms)| {
+                    |(previous_author, previous_timestamp_ms, previous_was_thread_reply_stub)| {
                         if previous_author != &message.author_id {
+                            return true;
+                        }
+                        // Don't group a main-chat message immediately after a thread-reply stub
+                        // ("Replied in thread") from the same author.
+                        if *previous_was_thread_reply_stub && message.reply_to.is_none() {
                             return true;
                         }
                         let (Some(previous_timestamp_ms), Some(current_timestamp_ms)) =
@@ -3219,7 +3467,11 @@ impl AppWindow {
                         show_header,
                     },
                 ));
-                previous_message = Some((message.author_id.clone(), message.timestamp_ms));
+                previous_message = Some((
+                    message.author_id.clone(),
+                    message.timestamp_ms,
+                    message.reply_to.is_some(),
+                ));
             }
 
             self.models.timeline.typing_text = snapshot.timeline.typing_text.clone();
@@ -3310,6 +3562,15 @@ impl AppWindow {
                 self.models.timeline.rows.len(),
             );
         }
+    }
+
+    fn sync_thread_pane_from_store(&mut self) {
+        let snapshot = self.app_store.snapshot();
+        self.models.thread_pane.open = snapshot.thread.open;
+        self.models.thread_pane.root_message_id = snapshot.thread.root_message_id.clone();
+        self.models.thread_pane.replies = snapshot.thread.replies.clone();
+        self.models.thread_pane.reply_draft = snapshot.thread.reply_draft.clone();
+        self.models.thread_pane.loading = snapshot.thread.loading;
     }
 
     fn persist_settings(&mut self) {
@@ -3825,6 +4086,7 @@ impl AppWindow {
                 &mut self.timeline_row_render_cache,
                 find_query,
                 &self.video_render_cache,
+                &mut self.code_highlight_cache,
                 &mut self.selectable_texts,
                 cx,
             )
@@ -4180,6 +4442,17 @@ impl AppWindow {
         target: InputAutocompleteTarget,
         direction: isize,
     ) -> bool {
+        let now = Instant::now();
+        if let Some((last_target, last_direction, last_at)) = self.last_autocomplete_nav {
+            if last_target == target
+                && last_direction == direction
+                && now.duration_since(last_at) < AUTOCOMPLETE_NAV_DEBOUNCE
+            {
+                return false;
+            }
+        }
+        self.last_autocomplete_nav = Some((target, direction, now));
+
         let autocomplete = match target {
             InputAutocompleteTarget::Composer => &mut self.models.composer.autocomplete,
             InputAutocompleteTarget::Thread => &mut self.models.thread_pane.reply_autocomplete,
@@ -4741,7 +5014,7 @@ impl AppWindow {
         target: UploadTarget,
         cx: &mut Context<Self>,
     ) {
-        self.clear_hovered_message(cx);
+        self.clear_hovered_message_immediate(cx);
         if !self.models.open_file_upload_lightbox(paths, target) {
             return;
         }
@@ -5070,7 +5343,7 @@ impl AppWindow {
         height: Option<u32>,
         cx: &mut Context<Self>,
     ) {
-        self.clear_hovered_message(cx);
+        self.clear_hovered_message_immediate(cx);
         self.models
             .open_image_lightbox(source, caption, width, height);
         self.refresh(cx);
@@ -5201,14 +5474,17 @@ impl AppWindow {
         self.refresh(cx);
     }
 
-    const HOVER_SETTLE_DELAY: Duration = Duration::from_millis(50);
-    const HOVER_DISMISS_RADIUS: f32 = 50.0;
+    const HOVER_SETTLE_DELAY: Duration = Duration::from_millis(100);
+    /// Delay before hiding the quick reaction strip after the mouse leaves the row,
+    /// so the user can move to the strip (which may be outside the row) without it disappearing.
+    const HOVER_CLEAR_DELAY: Duration = Duration::from_millis(300);
 
     pub(crate) fn set_hovered_message(&mut self, message_id: MessageId, cx: &mut Context<Self>) {
         if self.timeline_interactions_blocked_by_overlay() {
-            self.clear_hovered_message(cx);
+            self.clear_hovered_message_immediate(cx);
             return;
         }
+        self.cancel_hover_clear();
         let mut needs_refresh = false;
         if self.models.overlay.sidebar_hover_tooltip.is_some() {
             self.models.hide_sidebar_hover_tooltip();
@@ -5244,9 +5520,10 @@ impl AppWindow {
         cx: &mut Context<Self>,
     ) {
         if self.timeline_interactions_blocked_by_overlay() {
-            self.clear_hovered_message(cx);
+            self.clear_hovered_message_immediate(cx);
             return;
         }
+        self.cancel_hover_clear();
         let mut needs_refresh = false;
         if self.models.overlay.sidebar_hover_tooltip.is_some() {
             self.models.hide_sidebar_hover_tooltip();
@@ -5267,26 +5544,18 @@ impl AppWindow {
             self.models.timeline.hovered_message_window_left = None;
             self.models.timeline.hovered_message_window_top = None;
             self.models.timeline.hovered_message_window_width = None;
-            self.models.timeline.hover_toolbar_settled = false;
             needs_refresh = true;
+            // Require a new hover-settle delay when switching rows.
+            self.models.timeline.hover_toolbar_settled = false;
             self.schedule_hover_settle(cx);
-        } else if self.models.timeline.hover_toolbar_settled {
-            let anchor_x = self.models.timeline.hovered_message_anchor_x.unwrap_or(0.0);
-            let anchor_y = self.models.timeline.hovered_message_anchor_y.unwrap_or(0.0);
-            let dx = cursor_x - anchor_x;
-            let dy = cursor_y - anchor_y;
-            let distance = (dx * dx + dy * dy).sqrt();
-            if distance > Self::HOVER_DISMISS_RADIUS {
-                self.models.timeline.hover_toolbar_settled = false;
+        } else {
+            // While waiting for the settle delay, keep updating the anchor and restart the timer.
+            // Once the toolbar has appeared, freeze its position until the pointer leaves the row.
+            if !self.models.timeline.hover_toolbar_settled {
                 self.models.timeline.hovered_message_anchor_x = Some(cursor_x);
                 self.models.timeline.hovered_message_anchor_y = Some(cursor_y);
-                needs_refresh = true;
                 self.schedule_hover_settle(cx);
             }
-        } else {
-            self.models.timeline.hovered_message_anchor_x = Some(cursor_x);
-            self.models.timeline.hovered_message_anchor_y = Some(cursor_y);
-            self.schedule_hover_settle(cx);
         }
         if needs_refresh {
             self.refresh(cx);
@@ -5366,7 +5635,45 @@ impl AppWindow {
             .any(|entity| entity.read(cx).has_selection())
     }
 
+    /// Schedules the quick reaction strip to hide after a short delay, so the user can
+    /// move the mouse to the strip (which may be outside the row) without it disappearing.
     pub(crate) fn clear_hovered_message(&mut self, cx: &mut Context<Self>) {
+        self.schedule_hover_clear(cx);
+    }
+
+    /// Cancels any pending delayed hide of the strip. Call when the mouse enters the row
+    /// or the strip so the strip stays visible.
+    pub(crate) fn cancel_hover_clear(&mut self) {
+        self.hover_clear_seq = self.hover_clear_seq.wrapping_add(1);
+        self.hover_clear_pending = false;
+    }
+
+    fn schedule_hover_clear(&mut self, cx: &mut Context<Self>) {
+        if self.models.timeline.hovered_message_id.is_none() || self.hover_clear_pending {
+            return;
+        }
+        self.hover_clear_pending = true;
+        self.hover_clear_seq = self.hover_clear_seq.wrapping_add(1);
+        let seq = self.hover_clear_seq;
+        cx.spawn(move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
+            let background = cx.background_executor().clone();
+            let mut async_app = cx.clone();
+            async move {
+                background.timer(Self::HOVER_CLEAR_DELAY).await;
+                let _ = this.update(&mut async_app, |this, cx| {
+                    this.hover_clear_pending = false;
+                    if this.hover_clear_seq == seq {
+                        this.clear_hovered_message_immediate(cx);
+                    }
+                });
+            }
+        })
+        .detach();
+    }
+
+    /// Hides the strip immediately. Use for clicks and overlay open, not for mouse leave.
+    pub(crate) fn clear_hovered_message_immediate(&mut self, cx: &mut Context<Self>) {
+        self.cancel_hover_clear();
         let mut needs_refresh = false;
         if self.models.timeline.hovered_message_id.is_some() {
             self.models.timeline.hovered_message_id = None;
@@ -5514,7 +5821,7 @@ impl AppWindow {
                     .filter_map(|fragment| match fragment {
                         MessageFragment::Text(value)
                         | MessageFragment::InlineCode(value)
-                        | MessageFragment::Code(value)
+                        | MessageFragment::Code { text: value, .. }
                         | MessageFragment::Quote(value) => Some(value.as_str()),
                         _ => None,
                     })
@@ -5744,7 +6051,7 @@ impl AppWindow {
         }
         self.models.toggle_quick_switcher();
         if self.models.overlay.quick_switcher_open {
-            self.clear_hovered_message(cx);
+            self.clear_hovered_message_immediate(cx);
         }
         self.quick_switcher_query_seq = self.quick_switcher_query_seq.wrapping_add(1);
         self.sync_inputs_from_models(cx);
@@ -5813,7 +6120,7 @@ impl AppWindow {
         }
         self.models.toggle_command_palette();
         if self.models.overlay.command_palette_open {
-            self.clear_hovered_message(cx);
+            self.clear_hovered_message_immediate(cx);
         }
         self.refresh(cx);
     }
@@ -5834,6 +6141,7 @@ impl AppWindow {
         if self.splash_open {
             self.keybase_inspector.open = false;
             self.models.dismiss_overlays();
+            self.clear_hovered_message_immediate(cx);
         }
         self.refresh(cx);
     }
@@ -6377,19 +6685,22 @@ impl AppWindow {
         div()
             .absolute()
             .inset_0()
-            .when_some(self.models.composer.autocomplete.as_ref(), |container, autocomplete| {
-                container.when(!autocomplete.candidates.is_empty(), |container| {
-                    container.child(
-                        div()
-                            .id("inline-autocomplete-overlay-composer")
-                            .absolute()
-                            .left(px(composer_popup_left))
-                            .bottom(px(54.0))
-                            .w(px(composer_popup_width))
-                            .child(render_autocomplete_popup(autocomplete, true, cx)),
-                    )
-                })
-            })
+            .when_some(
+                self.models.composer.autocomplete.as_ref(),
+                |container, autocomplete| {
+                    container.when(!autocomplete.candidates.is_empty(), |container| {
+                        container.child(
+                            div()
+                                .id("inline-autocomplete-overlay-composer")
+                                .absolute()
+                                .left(px(composer_popup_left))
+                                .bottom(px(54.0))
+                                .w(px(composer_popup_width))
+                                .child(render_autocomplete_popup(autocomplete, true, cx)),
+                        )
+                    })
+                },
+            )
             .when(
                 shell_layout.show_right_pane
                     && matches!(self.models.navigation.right_pane, RightPaneMode::Thread),
@@ -7018,8 +7329,7 @@ impl AppWindow {
     ) {
         if let Some(target) = self.autocomplete_target_for_focused_input(window, cx) {
             let dismissed_signature = self.current_autocomplete_dismiss_signature(target, cx);
-            if self.clear_autocomplete_for_target(target, cx)
-        {
+            if self.clear_autocomplete_for_target(target, cx) {
                 if let Some(signature) = dismissed_signature {
                     match target {
                         InputAutocompleteTarget::Composer => {
@@ -7030,9 +7340,9 @@ impl AppWindow {
                         }
                     }
                 }
-            self.refresh(cx);
-            return;
-        }
+                self.refresh(cx);
+                return;
+            }
         }
         let had_overlay = self.models.overlay.new_chat_open
             || self.models.overlay.quick_switcher_open
@@ -7048,7 +7358,7 @@ impl AppWindow {
             && !is_editing
             && matches!(
                 self.models.navigation.right_pane,
-                RightPaneMode::Thread | RightPaneMode::Profile(_)
+                RightPaneMode::Thread | RightPaneMode::Profile(_) | RightPaneMode::Details
             );
         if !had_overlay && is_editing {
             self.cancel_edit(cx);
@@ -7069,7 +7379,7 @@ impl AppWindow {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.clear_hovered_message(cx);
+        self.clear_hovered_message_immediate(cx);
     }
 }
 
@@ -7077,14 +7387,7 @@ impl Render for AppWindow {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let render_t0 = Instant::now();
         if !window.is_window_hovered() && self.models.timeline.hovered_message_id.is_some() {
-            self.models.timeline.hovered_message_id = None;
-            self.models.timeline.hovered_message_is_thread = None;
-            self.models.timeline.hovered_message_anchor_x = None;
-            self.models.timeline.hovered_message_anchor_y = None;
-            self.models.timeline.hovered_message_window_left = None;
-            self.models.timeline.hovered_message_window_top = None;
-            self.models.timeline.hovered_message_window_width = None;
-            self.models.timeline.hover_toolbar_settled = false;
+            self.schedule_hover_clear(cx);
         }
         let resolved_theme = resolve_theme(&self.models.settings.theme_mode, window.appearance());
         let theme_changed = self.resolved_theme != resolved_theme;
@@ -7112,6 +7415,7 @@ impl Render for AppWindow {
                     &self.models.search,
                     &self.models.timeline,
                     &self.video_render_cache,
+                    &mut self.code_highlight_cache,
                     &mut self.selectable_texts,
                     &self.thread_input,
                     &self.thread_scroll,
@@ -7188,6 +7492,17 @@ impl Render for AppWindow {
                     this.clear_hovered_message(cx);
                     this.clear_sidebar_hover_tooltip(cx);
                 }))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _, _, cx| {
+                        // Click-away: dismiss hover toolbar when clicking anywhere outside it.
+                        if this.models.timeline.hover_toolbar_settled
+                            && this.models.timeline.hovered_message_id.is_some()
+                        {
+                            this.clear_hovered_message_immediate(cx);
+                        }
+                    }),
+                )
                 .on_mouse_up(
                     MouseButton::Left,
                     cx.listener(Self::finish_thread_resize_drag),
@@ -7621,8 +7936,7 @@ fn build_channel_details(
     };
     let topic = summary.topic.trim().to_string();
 
-    let derived_member_count = if let Some(state) = backend.conversation_members.get(&summary.id)
-    {
+    let derived_member_count = if let Some(state) = backend.conversation_members.get(&summary.id) {
         state.members.len() as u32
     } else if member_count > 0 {
         member_count
@@ -8447,7 +8761,7 @@ fn timeline_rows_input_signature(
                         mix_sig(&mut sig, 0);
                     }
                 }
-                crate::domain::message::MessageFragment::Code(value) => {
+                crate::domain::message::MessageFragment::Code { text: value, .. } => {
                     mix_sig(&mut sig, 3);
                     mix_sig_str(&mut sig, value);
                 }

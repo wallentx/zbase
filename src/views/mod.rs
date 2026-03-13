@@ -1,6 +1,7 @@
 pub mod app_window;
 pub mod avatar;
 pub mod calls;
+pub mod code_highlight;
 pub mod composer;
 pub mod conversation;
 pub mod home;
@@ -317,6 +318,13 @@ pub fn mention_colors_for_user(
                     .get(&crate::domain::ids::UserId::new(lower))
                     .copied()
             }
+        })
+        .or_else(|| {
+            // Some backend sources preserve original casing in user IDs, but we treat them
+            // case-insensitively in the UI.
+            affinity_index.iter().find_map(|(key, affinity)| {
+                key.0.eq_ignore_ascii_case(&user_id.0).then_some(*affinity)
+            })
         })
         .unwrap_or(crate::domain::affinity::Affinity::None);
     match affinity {

@@ -10,7 +10,7 @@ const APP_ICON_ASSET: &str = "assets/icons/app-icon.png";
 pub struct SplashView;
 
 impl SplashView {
-    pub fn render(&self, status: &str, _cx: &mut Context<AppWindow>) -> AnyElement {
+    pub fn render(&self, status: &str, cx: &mut Context<AppWindow>) -> AnyElement {
         let kbd_bg = if is_dark_theme() {
             tint(0x283543, 0.85)
         } else {
@@ -37,9 +37,22 @@ impl SplashView {
             .items_center()
             .justify_center()
             .bg(rgb(app_bg()))
-            .on_mouse_down(MouseButton::Left, |_, _, _| {})
-            .on_mouse_down(MouseButton::Right, |_, _, _| {})
-            .on_mouse_move(|_, _, _| {})
+            .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
+                this.clear_hovered_message_immediate(cx);
+                cx.stop_propagation();
+            }))
+            .on_mouse_down(MouseButton::Right, cx.listener(|this, _, _, cx| {
+                this.clear_hovered_message_immediate(cx);
+                cx.stop_propagation();
+            }))
+            .on_mouse_move(cx.listener(|this, _, _, cx| {
+                this.clear_hovered_message_immediate(cx);
+                cx.stop_propagation();
+            }))
+            .on_scroll_wheel(cx.listener(|this, _, _, cx| {
+                this.clear_hovered_message_immediate(cx);
+                cx.stop_propagation();
+            }))
             .child(
                 div()
                     .flex()
