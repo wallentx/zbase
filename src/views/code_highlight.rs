@@ -259,59 +259,64 @@ pub fn highlight(code: &str, lang: CodeLanguage, theme: ThemeVariant) -> Vec<Sty
     if code.is_empty() || code.len() > MAX_CODE_BYTES_FOR_HIGHLIGHT {
         return Vec::new();
     }
-    let (language, name, highlights_query) = language_and_query(lang);
-    let mut config =
-        match HighlightConfiguration::new(language.clone(), name, highlights_query, "", "") {
-            Ok(config) => config,
-            Err(_) => HighlightConfiguration::new(language, name, "", "", "")
-                .expect("empty highlight config"),
+    // `crate::views::*` palette helpers read from a thread-local theme. Since highlighting is often
+    // computed on a background task, ensure the requested theme is applied on this thread while
+    // we map highlight classes to palette colors.
+    crate::views::with_theme(theme, || {
+        let (language, name, highlights_query) = language_and_query(lang);
+        let mut config =
+            match HighlightConfiguration::new(language.clone(), name, highlights_query, "", "") {
+                Ok(config) => config,
+                Err(_) => HighlightConfiguration::new(language, name, "", "", "")
+                    .expect("empty highlight config"),
+            };
+        config.configure(HIGHLIGHT_NAMES);
+
+        let mut highlighter = Highlighter::new();
+        let Ok(events) = highlighter.highlight(&config, code.as_bytes(), None, |_| None) else {
+            return Vec::new();
         };
-    config.configure(HIGHLIGHT_NAMES);
 
-    let mut highlighter = Highlighter::new();
-    let Ok(events) = highlighter.highlight(&config, code.as_bytes(), None, |_| None) else {
-        return Vec::new();
-    };
+        let mut active: Vec<usize> = Vec::new();
+        let mut out: Vec<StyledRange> = Vec::new();
 
-    let mut active: Vec<usize> = Vec::new();
-    let mut out: Vec<StyledRange> = Vec::new();
-
-    for event in events {
-        match event {
-            Ok(HighlightEvent::HighlightStart(s)) => active.push(s.0),
-            Ok(HighlightEvent::HighlightEnd) => {
-                let _ = active.pop();
-            }
-            Ok(HighlightEvent::Source { start, end }) => {
-                if start >= end || end > code.len() {
-                    continue;
+        for event in events {
+            match event {
+                Ok(HighlightEvent::HighlightStart(s)) => active.push(s.0),
+                Ok(HighlightEvent::HighlightEnd) => {
+                    let _ = active.pop();
                 }
-                let Some(&highlight_ix) = active.last() else {
-                    continue;
-                };
-                let Some(name) = HIGHLIGHT_NAMES.get(highlight_ix).copied() else {
-                    continue;
-                };
-                let Some(style) = style_for_highlight(name, theme) else {
-                    continue;
-                };
-                push_merged(
-                    &mut out,
-                    StyledRange {
-                        byte_range: start..end,
-                        color: Some(style.color),
-                        background_color: None,
-                        bold: style.bold,
-                        italic: style.italic,
-                        strikethrough: false,
-                    },
-                );
+                Ok(HighlightEvent::Source { start, end }) => {
+                    if start >= end || end > code.len() {
+                        continue;
+                    }
+                    let Some(&highlight_ix) = active.last() else {
+                        continue;
+                    };
+                    let Some(name) = HIGHLIGHT_NAMES.get(highlight_ix).copied() else {
+                        continue;
+                    };
+                    let Some(style) = style_for_highlight(name, theme) else {
+                        continue;
+                    };
+                    push_merged(
+                        &mut out,
+                        StyledRange {
+                            byte_range: start..end,
+                            color: Some(style.color),
+                            background_color: None,
+                            bold: style.bold,
+                            italic: style.italic,
+                            strikethrough: false,
+                        },
+                    );
+                }
+                Err(_) => {}
             }
-            Err(_) => {}
         }
-    }
 
-    out
+        out
+    })
 }
 
 fn language_and_query(lang: CodeLanguage) -> (tree_sitter::Language, &'static str, &'static str) {
@@ -376,22 +381,26 @@ struct Style {
     italic: bool,
 }
 
-fn style_for_highlight(name: &str, _theme: ThemeVariant) -> Option<Style> {
+fn style_for_highlight(name: &str, theme: ThemeVariant) -> Option<Style> {
     // Collapse dotted names (e.g. "type.builtin" -> "type") for palette mapping.
     let base = name.split('.').next().unwrap_or(name);
-    let (color, bold, italic) = match base {
-        "comment" => (text_secondary(), false, true),
-        "string" => (success(), false, false),
-        "number" => (warning(), false, false),
-        "boolean" => (warning(), true, false),
-        "constant" => (warning(), true, false),
-        "keyword" => (accent(), true, false),
-        "type" => (mention(), true, false),
-        "function" => (accent(), false, false),
-        "property" => (text_primary(), false, false),
-        "variable" => (text_primary(), false, false),
-        "label" => (accent(), false, false),
-        "operator" | "punctuation" | "escape" | "attribute" | "embedded" => {
+    let (color, bold, italic) = match (theme, base) {
+        // Dark mode: prioritize legibility over subtlety.
+        (ThemeVariant::Dark, "keyword") => (text_primary(), true, false),
+
+        // Shared mapping (light + dark).
+        (_, "comment") => (text_secondary(), false, true),
+        (_, "string") => (success(), false, false),
+        (_, "number") => (warning(), false, false),
+        (_, "boolean") => (warning(), true, false),
+        (_, "constant") => (warning(), true, false),
+        (_, "keyword") => (accent(), true, false),
+        (_, "type") => (mention(), true, false),
+        (_, "function") => (accent(), false, false),
+        (_, "property") => (text_primary(), false, false),
+        (_, "variable") => (text_primary(), false, false),
+        (_, "label") => (accent(), false, false),
+        (_, "operator" | "punctuation" | "escape" | "attribute" | "embedded") => {
             (text_secondary(), false, false)
         }
         _ => return None,
@@ -401,6 +410,27 @@ fn style_for_highlight(name: &str, _theme: ThemeVariant) -> Option<Style> {
         bold,
         italic,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sql_keywords_are_high_contrast_in_dark_mode() {
+        let code = "SELECT 1 FROM users;";
+        let ranges = highlight(code, CodeLanguage::Sql, ThemeVariant::Dark);
+        let select_start = code.find("SELECT").expect("SELECT present");
+        let select_end = select_start + "SELECT".len();
+
+        let select_range = ranges
+            .iter()
+            .find(|r| r.byte_range.start <= select_start && r.byte_range.end >= select_end)
+            .expect("expected a styled range covering SELECT");
+
+        let expected = crate::views::with_theme(ThemeVariant::Dark, || text_primary());
+        assert_eq!(select_range.color, Some(expected));
+    }
 }
 
 fn push_merged(out: &mut Vec<StyledRange>, next: StyledRange) {
