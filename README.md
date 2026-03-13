@@ -8,8 +8,6 @@
 A fast, native desktop chat client for <a href="https://keybase.io">Keybase</a>, built with Rust and <a href="https://gpui.rs">GPUI</a>.
 </p>
 
----
-
 <p align="center">
   <img src="docs/screenshot.png" alt="zBase screenshot" />
 </p>
