@@ -526,9 +526,12 @@ fn build_text_runs_for_content(
         if span_end <= span_start {
             continue;
         }
-        let link_active = link_ranges
+        let active_link_url = link_ranges
             .iter()
-            .any(|link| range_covers_span(&link.byte_range, span_start, span_end));
+            .find(|link| range_covers_span(&link.byte_range, span_start, span_end))
+            .map(|link| link.url.as_str());
+        let link_active = active_link_url.is_some();
+        let internal_link_active = active_link_url.is_some_and(|url| url.starts_with("zbase-"));
 
         let mut run_font = font.clone();
         let mut run_color = base_color;
@@ -558,7 +561,7 @@ fn build_text_runs_for_content(
         if run_italic {
             run_font.style = FontStyle::Italic;
         }
-        let underline = if link_active {
+        let underline = if link_active && !internal_link_active {
             run_color = link_color;
             Some(UnderlineStyle {
                 color: Some(run_color),
@@ -1484,6 +1487,32 @@ mod tests {
         assert_eq!(runs[0].color, rgb(accent()).into());
         assert_eq!(runs[0].background_color, Some(rgb(0x112233).into()));
         assert!(runs[0].underline.is_some());
+    }
+
+    #[test]
+    fn build_text_runs_keeps_styled_color_for_internal_links() {
+        let runs = build_text_runs_for_content(
+            "@bob",
+            &[LinkRange {
+                byte_range: 0..4,
+                url: "zbase-mention:bob".to_string(),
+            }],
+            &[StyledRange {
+                byte_range: 0..4,
+                color: Some(0x6588a7),
+                background_color: Some(0xe9f0f5),
+                bold: true,
+                italic: false,
+                strikethrough: false,
+            }],
+            rgb(0x223344).into(),
+            gpui::font(".SystemUIFont"),
+        );
+
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].color, rgb(0x6588a7).into());
+        assert_eq!(runs[0].background_color, Some(rgb(0xe9f0f5).into()));
+        assert!(runs[0].underline.is_none());
     }
 
     #[test]
