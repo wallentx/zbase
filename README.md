@@ -11,7 +11,7 @@ A fast, native desktop chat client for <a href="https://keybase.io">Keybase</a>,
 ---
 
 <p align="center">
-  <img src="docs/screenshot.jpg" alt="zBase screenshot" />
+  <img src="docs/screenshot.png" alt="zBase screenshot" />
 </p>
 
 zBase is a from-scratch replacement for the official Keybase desktop app. It talks directly to the Keybase daemon over its local msgpack-RPC socket and renders everything through GPUI — the same GPU-accelerated UI framework that powers the [Zed](https://zed.dev) editor. The result is a chat client that launches instantly, scrolls at 120 fps, and uses a fraction of the memory of an Electron app.
