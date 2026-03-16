@@ -2388,7 +2388,9 @@ impl AppModels {
                 self.search.highlighted_index = (!self.search.results.is_empty()).then_some(0);
                 self.set_right_pane(RightPaneMode::Hidden);
             }
-            Route::Activity { .. } | Route::Preferences | Route::WorkspaceHome { .. } => {
+            Route::Activity { .. }
+            | Route::Preferences
+            | Route::WorkspaceHome { .. } => {
                 self.set_right_pane(RightPaneMode::Hidden);
             }
             Route::ActiveCall { .. } => {

@@ -88,6 +88,10 @@ pub enum ChatEvent {
     RetentionChanged {
         summary: String,
     },
+    ChannelCreated {
+        channel_name: String,
+        conv_id: Option<ConversationId>,
+    },
     Other {
         text: String,
     },

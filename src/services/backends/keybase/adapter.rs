@@ -55,11 +55,11 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tokio::runtime::Builder;
-use tracing::warn;
+use tracing::{info, warn};
 
 use super::{
     notify_inventory::KeybaseNotifyEvent,
-    paths::socket_path,
+    paths::{ensure_service_running, socket_path},
     rpc::{
         client::{KeybaseRpcClient, NotificationChannels, RpcNotification},
         transport::FramedMsgpackTransport,
@@ -1504,7 +1504,7 @@ impl ChatBackend for KeybaseBackend {
                     });
                     match create_result {
                         Ok((raw_conversation_id, inbox)) => {
-                            let parsed = parse_inbox_conversations(&inbox, None);
+                            let parsed = parse_inbox_conversations(&inbox, None, false);
                             let created = parsed
                                 .iter()
                                 .find(|item| item.raw_conversation_id == raw_conversation_id)
@@ -1656,6 +1656,193 @@ impl ChatBackend for KeybaseBackend {
                 });
                 Ok(Vec::new())
             }
+            RoutedBackendCommand::ResolveChannel {
+                account_id,
+                team_name,
+                channel_name,
+                workspace_id,
+                ..
+            } => {
+                let mut emitted = Vec::new();
+                if let Some(path) = socket_path()
+                    && let Ok(runtime) = Builder::new_current_thread().enable_all().build()
+                {
+                    let team_name_for_call = team_name.clone();
+                    let channel_name_for_call = channel_name.clone();
+                    let resolve_result = runtime.block_on(async move {
+                        let transport = FramedMsgpackTransport::connect(&path).await?;
+                        let mut client = KeybaseRpcClient::new(transport);
+                        let inbox = fetch_inbox_for_team_topic(
+                            &mut client,
+                            &team_name_for_call,
+                            &channel_name_for_call,
+                        )
+                        .await?;
+                        Ok::<_, io::Error>(inbox)
+                    });
+                    match resolve_result {
+                        Ok(inbox) => {
+                            let parsed = parse_inbox_conversations(&inbox, None, true);
+                            let resolved = parsed
+                                .iter()
+                                .find(|item| {
+                                    item.summary.kind == ConversationKind::Channel
+                                        && item
+                                            .summary
+                                            .group
+                                            .as_ref()
+                                            .is_some_and(|group| {
+                                                group.id.eq_ignore_ascii_case(&team_name)
+                                            })
+                                        && item
+                                            .summary
+                                            .title
+                                            .eq_ignore_ascii_case(&channel_name)
+                                })
+                                .cloned();
+                            if let Some(resolved) = resolved {
+                                let conversation_binding = ConversationBinding {
+                                    conversation_id: resolved.summary.id.clone(),
+                                    backend_id: self.backend_id.clone(),
+                                    account_id,
+                                    provider_conversation_ref: resolved.provider_ref,
+                                };
+                                emitted.push(BackendEvent::ChannelResolved {
+                                    workspace_id,
+                                    conversation: resolved.summary,
+                                    conversation_binding,
+                                    can_post: resolved.can_post,
+                                });
+                            } else {
+                                tracing::warn!(
+                                    "ResolveChannel: no match for {}#{} among {} parsed conversations",
+                                    team_name,
+                                    channel_name,
+                                    parsed.len()
+                                );
+                                emitted.push(BackendEvent::ChannelResolveFailed {
+                                    workspace_id,
+                                    channel_name: channel_name.clone(),
+                                    error: format!(
+                                        "No matching channel found for {}#{}",
+                                        team_name, channel_name
+                                    ),
+                                });
+                            }
+                        }
+                        Err(error) => {
+                            emitted.push(BackendEvent::ChannelResolveFailed {
+                                workspace_id,
+                                channel_name,
+                                error: error.to_string(),
+                            });
+                        }
+                    }
+                } else {
+                    emitted.push(BackendEvent::ChannelResolveFailed {
+                        workspace_id,
+                        channel_name,
+                        error: "Unable to connect to Keybase service".to_string(),
+                    });
+                }
+                Ok(emitted)
+            }
+            RoutedBackendCommand::ResolveChannelById {
+                account_id,
+                conversation,
+                workspace_id,
+            } => {
+                let mut emitted = Vec::new();
+                let raw_conversation_id =
+                    provider_ref_to_conversation_id_bytes(&conversation);
+                if let Some(raw_id) = raw_conversation_id
+                    && let Some(path) = socket_path()
+                    && let Ok(runtime) = Builder::new_current_thread().enable_all().build()
+                {
+                    let resolve_result = runtime.block_on(async move {
+                        let transport = FramedMsgpackTransport::connect(&path).await?;
+                        let mut client = KeybaseRpcClient::new(transport);
+                        fetch_inbox_for_conversation_id(&mut client, &raw_id).await
+                    });
+                    match resolve_result {
+                        Ok(inbox) => {
+                            let parsed = parse_inbox_conversations(&inbox, None, true);
+                            if let Some(resolved) = parsed.into_iter().next() {
+                                let conversation_binding = ConversationBinding {
+                                    conversation_id: resolved.summary.id.clone(),
+                                    backend_id: self.backend_id.clone(),
+                                    account_id,
+                                    provider_conversation_ref: resolved.provider_ref,
+                                };
+                                emitted.push(BackendEvent::ChannelResolved {
+                                    workspace_id,
+                                    conversation: resolved.summary,
+                                    conversation_binding,
+                                    can_post: resolved.can_post,
+                                });
+                            } else {
+                                emitted.push(BackendEvent::ChannelResolveFailed {
+                                    workspace_id,
+                                    channel_name: conversation.0,
+                                    error: "Channel not found by ID".to_string(),
+                                });
+                            }
+                        }
+                        Err(error) => {
+                            emitted.push(BackendEvent::ChannelResolveFailed {
+                                workspace_id,
+                                channel_name: conversation.0,
+                                error: error.to_string(),
+                            });
+                        }
+                    }
+                } else {
+                    emitted.push(BackendEvent::ChannelResolveFailed {
+                        workspace_id,
+                        channel_name: conversation.0,
+                        error: "Unable to resolve channel ID".to_string(),
+                    });
+                }
+                Ok(emitted)
+            }
+            RoutedBackendCommand::JoinChannel {
+                conversation,
+                workspace_id,
+                ..
+            } => {
+                if let Some(path) = socket_path()
+                    && let Ok(runtime) = Builder::new_current_thread().enable_all().build()
+                {
+                    let join_result = runtime.block_on(async move {
+                        let transport = FramedMsgpackTransport::connect(&path).await?;
+                        let mut client = KeybaseRpcClient::new(transport);
+                        let raw_conversation_id =
+                            provider_ref_to_conversation_id_bytes(&conversation).ok_or_else(|| {
+                                io::Error::new(
+                                    io::ErrorKind::InvalidInput,
+                                    "invalid provider conversation reference",
+                                )
+                            })?;
+                        call_join_conversation_by_id_local(&mut client, &raw_conversation_id).await?;
+                        Ok::<_, io::Error>(raw_conversation_id)
+                    });
+                    match join_result {
+                        Ok(raw_conversation_id) => {
+                            let conversation_id =
+                                ConversationId::new(format!("kb_conv:{}", hex_encode(&raw_conversation_id)));
+                            tracing::info!("JoinChannel: successfully joined {}", conversation_id.0);
+                            return Ok(vec![BackendEvent::ChannelJoined {
+                                workspace_id,
+                                conversation_id,
+                            }]);
+                        }
+                        Err(e) => {
+                            tracing::warn!("JoinChannel: RPC error: {e}");
+                        }
+                    }
+                }
+                Ok(Vec::new())
+            }
             _ => Ok(Vec::new()),
         }
     }
@@ -1682,6 +1869,8 @@ fn run_listener(
     pending_outbox_sends: Arc<Mutex<HashMap<String, PendingSendMeta>>>,
 ) {
     send_internal(&sender, "zbase.internal.listener_starting", Value::Nil);
+
+    ensure_service_running();
 
     let Some(path) = socket_path() else {
         send_internal(&sender, "zbase.internal.socket_path_missing", Value::Nil);
@@ -1745,6 +1934,7 @@ fn run_listener(
                     maybe_handle_profile_notify(&event, &sender, &local_store);
                     maybe_handle_emoji_notify(&event, &sender, &local_store);
                     maybe_handle_team_role_notify(&event, &sender, &local_store);
+                    maybe_handle_new_conversation_notify(&event, &sender, &local_store);
                     let mut should_refresh_inbox = notify_should_refresh_inbox(&event);
                     let mut emitted_unread_for_conversation: Option<ConversationId> = None;
                     if let Some(read_update) = parse_read_marker_update_from_notify(&event) {
@@ -1979,6 +2169,8 @@ const CHAT_GET_LAST_ACTIVE_FOR_TLF_LOCAL: &str = "chat.1.local.getLastActiveForT
 const CHAT_PIN_MESSAGE_LOCAL: &str = "chat.1.local.pinMessage";
 const CHAT_UNPIN_MESSAGE_LOCAL: &str = "chat.1.local.unpinMessage";
 const CHAT_NEW_CONVERSATION_LOCAL: &str = "chat.1.local.newConversationLocal";
+const CHAT_FIND_CONVERSATIONS_LOCAL: &str = "chat.1.local.findConversationsLocal";
+const CHAT_JOIN_CONVERSATION_BY_ID_LOCAL: &str = "chat.1.local.joinConversationByIDLocal";
 const CHAT_TEAM_ID_OF_CONV: &str = "chat.1.remote.teamIDOfConv";
 const CHAT_TEAM_ID_FROM_TLF_NAME: &str = "chat.1.local.teamIDFromTLFName";
 const KEYBASE_USER_SEARCH: &str = "keybase.1.userSearch.userSearch";
@@ -2191,6 +2383,14 @@ fn run_bootstrap(
                 Value::from(error.to_string()),
             );
         }
+    }
+
+    let _ = sender.send(BackendEvent::BootStatus(
+        "Checking Keybase service…".to_string(),
+    ));
+
+    if !ensure_service_running() {
+        info!(target: "zbase.service", "service not running after auto-start attempt, will try connecting anyway");
     }
 
     let Some(path) = socket_path() else {
@@ -3627,7 +3827,8 @@ fn run_background_inbox_conversation_cache_refresh(
                         break;
                     }
                 };
-            let mut conversations = parse_inbox_conversations(&inbox, self_username.as_deref());
+            let mut conversations =
+                parse_inbox_conversations(&inbox, self_username.as_deref(), false);
             if conversations.is_empty() {
                 break;
             }
@@ -3949,12 +4150,13 @@ fn run_background_full_history_crawl(
                 if !throttle_delay.is_zero() {
                     std::thread::sleep(throttle_delay);
                 }
-                let page = match fetch_thread_page(
+                let page = match fetch_thread_page_with_attachment_hydration(
                     &mut client,
                     &conversation_id,
                     &raw_conversation_id,
                     next_cursor.as_deref(),
                     CRAWL_PAGE_SIZE,
+                    false,
                 )
                 .await
                 {
@@ -4782,12 +4984,13 @@ fn run_backfill_thread_history(
         let fetch_result = runtime.block_on(async move {
             let transport = FramedMsgpackTransport::connect(&path_for_fetch).await?;
             let mut client = KeybaseRpcClient::new(transport);
-            fetch_thread_messages_before_anchor(
+            fetch_thread_messages_before_anchor_impl(
                 &mut client,
                 &conversation_id_for_fetch,
                 &raw_conversation_id_for_fetch,
                 &anchor_for_fetch,
                 CRAWL_PAGE_SIZE,
+                false,
             )
             .await
         });
@@ -4869,12 +5072,13 @@ fn run_backfill_thread_history(
         let fetch_result = runtime.block_on(async move {
             let transport = FramedMsgpackTransport::connect(&path_for_fetch).await?;
             let mut client = KeybaseRpcClient::new(transport);
-            fetch_thread_messages_after_anchor(
+            fetch_thread_messages_after_anchor_impl(
                 &mut client,
                 &conversation_id_for_fetch,
                 &raw_conversation_id_for_fetch,
                 &pivot_for_fetch,
                 CRAWL_PAGE_SIZE,
+                false,
             )
             .await
         });
@@ -5581,12 +5785,13 @@ fn run_reply_ancestor_backfill(
         let fetch_result = runtime.block_on(async move {
             let transport = FramedMsgpackTransport::connect(&path_for_fetch).await?;
             let mut client = KeybaseRpcClient::new(transport);
-            fetch_thread_messages_before_anchor(
+            fetch_thread_messages_before_anchor_impl(
                 &mut client,
                 &conversation_id_for_fetch,
                 &raw_conversation_id_for_fetch,
                 &anchor_for_fetch,
                 CRAWL_PAGE_SIZE,
+                false,
             )
             .await
         });
@@ -6072,7 +6277,7 @@ fn warm_recent_conversation_messages_for_thread(
     let mut page = runtime.block_on(async move {
         let transport = FramedMsgpackTransport::connect(socket_path).await?;
         let mut client = KeybaseRpcClient::new(transport);
-        fetch_thread_messages_by_raw_id(
+        fetch_thread_messages_by_raw_id_without_attachment_hydration(
             &mut client,
             &conversation_id_for_fetch,
             &raw_conversation_id_for_fetch,
@@ -7474,6 +7679,52 @@ fn normalize_epoch_ms(raw: i64) -> Option<i64> {
         raw.saturating_mul(1000)
     };
     Some(normalized)
+}
+
+fn maybe_handle_new_conversation_notify(
+    event: &KeybaseNotifyEvent,
+    sender: &Sender<BackendEvent>,
+    local_store: &Arc<LocalStore>,
+) {
+    let Some(conv_value) = extract_conv_from_notify(event) else {
+        return;
+    };
+    let self_username = local_store.load_account_display_name();
+    let Some(parsed) = parse_inbox_ui_item(conv_value, self_username.as_deref()) else {
+        return;
+    };
+    let conversation_id = parsed.summary.id.clone();
+    if local_store.get_conversation(&conversation_id).ok().flatten().is_some() {
+        return;
+    }
+    tracing::info!(
+        conversation_id = %conversation_id.0,
+        title = %parsed.summary.title,
+        kind = ?parsed.summary.kind,
+        "discovered new conversation from notification"
+    );
+    let workspace_id = WorkspaceId::new(WORKSPACE_ID);
+    let provider_ref = parsed.provider_ref.clone();
+    let _ = local_store.persist_conversation(&parsed.summary, parsed.activity_time);
+    let _ = local_store.persist_conversation_binding(&conversation_id, &provider_ref);
+    let (channels, direct_messages) = if matches!(parsed.summary.kind, ConversationKind::Channel)
+    {
+        (vec![parsed.summary], Vec::new())
+    } else {
+        (Vec::new(), vec![parsed.summary])
+    };
+    let binding = ConversationBinding {
+        conversation_id,
+        backend_id: BackendId::new(KEYBASE_BACKEND_ID),
+        account_id: AccountId::new(DEFAULT_ACCOUNT_ID),
+        provider_conversation_ref: provider_ref,
+    };
+    let _ = sender.send(BackendEvent::WorkspaceConversationsExtended {
+        workspace_id,
+        channels,
+        direct_messages,
+        conversation_bindings: vec![binding],
+    });
 }
 
 fn maybe_handle_emoji_notify(
@@ -10238,6 +10489,7 @@ fn refresh_inbox_unread_state(sender: &Sender<BackendEvent>, local_store: &Local
         Ok::<Vec<BootstrapConversation>, io::Error>(parse_inbox_conversations(
             &inbox,
             self_username.as_deref(),
+            false,
         ))
     });
     let conversations = match refreshed {
@@ -10251,9 +10503,35 @@ fn refresh_inbox_unread_state(sender: &Sender<BackendEvent>, local_store: &Local
             return;
         }
     };
+    let mut new_channels = Vec::new();
+    let mut new_direct_messages = Vec::new();
+    let mut new_bindings = Vec::new();
+
     for conversation in conversations {
         let conversation_id = conversation.summary.id.clone();
+        let is_new = local_store
+            .get_conversation(&conversation_id)
+            .ok()
+            .flatten()
+            .is_none();
         let _ = local_store.persist_conversation(&conversation.summary, conversation.activity_time);
+        if is_new {
+            let _ = local_store.persist_conversation_binding(
+                &conversation_id,
+                &conversation.provider_ref,
+            );
+            new_bindings.push(ConversationBinding {
+                conversation_id: conversation_id.clone(),
+                backend_id: BackendId::new(KEYBASE_BACKEND_ID),
+                account_id: AccountId::new(DEFAULT_ACCOUNT_ID),
+                provider_conversation_ref: conversation.provider_ref.clone(),
+            });
+            if matches!(conversation.summary.kind, ConversationKind::Channel) {
+                new_channels.push(conversation.summary.clone());
+            } else {
+                new_direct_messages.push(conversation.summary.clone());
+            }
+        }
         if sender
             .send(BackendEvent::ConversationUnreadChanged {
                 conversation_id: conversation_id.clone(),
@@ -10284,6 +10562,15 @@ fn refresh_inbox_unread_state(sender: &Sender<BackendEvent>, local_store: &Local
             return;
         }
     }
+
+    if !new_channels.is_empty() || !new_direct_messages.is_empty() {
+        let _ = sender.send(BackendEvent::WorkspaceConversationsExtended {
+            workspace_id: WorkspaceId::new(WORKSPACE_ID),
+            channels: new_channels,
+            direct_messages: new_direct_messages,
+            conversation_bindings: new_bindings,
+        });
+    }
 }
 
 async fn bootstrap_payload_from_service(
@@ -10313,8 +10600,11 @@ async fn bootstrap_payload_from_service(
     let account_display_name = status_username(&status);
 
     let conversations_value = fetch_inbox_unboxed(&mut client).await?;
-    let mut conversations =
-        parse_inbox_conversations(&conversations_value, account_display_name.as_deref());
+    let mut conversations = parse_inbox_conversations(
+        &conversations_value,
+        account_display_name.as_deref(),
+        false,
+    );
     if conversations.is_empty() {
         return Ok(BootstrapPayload {
             workspace_ids: vec![WorkspaceId::new(WORKSPACE_ID)],
@@ -10472,6 +10762,17 @@ async fn fetch_inbox_unboxed(client: &mut KeybaseRpcClient) -> io::Result<Value>
         .await
 }
 
+fn all_member_statuses() -> Value {
+    Value::Array(vec![
+        Value::from(0i64), // ACTIVE
+        Value::from(1i64), // REMOVED
+        Value::from(2i64), // LEFT
+        Value::from(3i64), // PREVIEW
+        Value::from(4i64), // RESET
+        Value::from(5i64), // NEVER_JOINED
+    ])
+}
+
 async fn fetch_inbox_for_conversation_id(
     client: &mut KeybaseRpcClient,
     conversation_id: &[u8],
@@ -10479,11 +10780,41 @@ async fn fetch_inbox_for_conversation_id(
     let query = Value::Map(vec![
         (Value::from("topicType"), Value::from(TOPIC_TYPE_CHAT)),
         (Value::from("status"), Value::Array(Vec::new())),
-        (Value::from("memberStatus"), Value::Array(Vec::new())),
+        (Value::from("memberStatus"), all_member_statuses()),
         (
             Value::from("convIDs"),
             Value::Array(vec![Value::Binary(conversation_id.to_vec())]),
         ),
+        (Value::from("unreadOnly"), Value::from(false)),
+        (Value::from("readOnly"), Value::from(false)),
+        (Value::from("computeActiveList"), Value::from(false)),
+    ]);
+    client
+        .call(
+            CHAT_GET_INBOX_AND_UNBOX_LOCAL,
+            vec![Value::Map(vec![
+                (Value::from("query"), query),
+                (
+                    Value::from("identifyBehavior"),
+                    Value::from(IDENTIFY_BEHAVIOR_CHAT_GUI),
+                ),
+            ])],
+        )
+        .await
+}
+
+async fn fetch_inbox_for_team_topic(
+    client: &mut KeybaseRpcClient,
+    team_name: &str,
+    topic_name: &str,
+) -> io::Result<Value> {
+    let query = Value::Map(vec![
+        (Value::from("topicType"), Value::from(TOPIC_TYPE_CHAT)),
+        (Value::from("status"), Value::Array(Vec::new())),
+        (Value::from("memberStatus"), all_member_statuses()),
+        (Value::from("tlfName"), Value::from(team_name.to_string())),
+        (Value::from("topicName"), Value::from(topic_name.to_string())),
+        (Value::from("membersType"), Value::from(TEAM_MEMBERS_TYPE)),
         (Value::from("unreadOnly"), Value::from(false)),
         (Value::from("readOnly"), Value::from(false)),
         (Value::from("computeActiveList"), Value::from(false)),
@@ -10549,6 +10880,49 @@ async fn call_new_conversation_local(
                 (
                     Value::from("membersType"),
                     Value::from(IMPTEAM_MEMBERS_TYPE),
+                ),
+                (
+                    Value::from("identifyBehavior"),
+                    Value::from(IDENTIFY_BEHAVIOR_CHAT_GUI),
+                ),
+            ])],
+        )
+        .await
+}
+
+async fn call_find_conversations_local(
+    client: &mut KeybaseRpcClient,
+    team_name: &str,
+    channel_name: &str,
+) -> io::Result<Value> {
+    client
+        .call(
+            CHAT_FIND_CONVERSATIONS_LOCAL,
+            vec![Value::Map(vec![
+                (Value::from("tlfName"), Value::from(team_name.to_string())),
+                (Value::from("topicName"), Value::from(channel_name.to_string())),
+                (Value::from("topicType"), Value::from(TOPIC_TYPE_CHAT)),
+                (Value::from("membersType"), Value::from(TEAM_MEMBERS_TYPE)),
+                (
+                    Value::from("visibility"),
+                    Value::from(TLF_VISIBILITY_PRIVATE),
+                ),
+            ])],
+        )
+        .await
+}
+
+async fn call_join_conversation_by_id_local(
+    client: &mut KeybaseRpcClient,
+    conversation_id: &[u8],
+) -> io::Result<Value> {
+    client
+        .call(
+            CHAT_JOIN_CONVERSATION_BY_ID_LOCAL,
+            vec![Value::Map(vec![
+                (
+                    Value::from("convID"),
+                    Value::Binary(conversation_id.to_vec()),
                 ),
                 (
                     Value::from("identifyBehavior"),
@@ -10668,6 +11042,33 @@ fn extract_new_conversation_raw_id(response: &Value) -> Option<Vec<u8>> {
                 .or_else(|| conversation_id_bytes_from_base64_string(value))
         })
     })
+}
+
+fn extract_find_conversation_raw_id(response: &Value) -> Option<Vec<u8>> {
+    let mut candidates: Vec<&Value> = Vec::new();
+    if let Some(array) = map_get_any(response, &["conversations", "convs"]).and_then(as_array) {
+        candidates.extend(array.iter());
+    } else {
+        candidates.push(response);
+    }
+
+    for candidate in candidates {
+        let container = map_get_any(candidate, &["conv", "conversation", "info", "i"])
+            .unwrap_or(candidate);
+        if let Some(bytes) = find_value_for_keys(
+            container,
+            &["id", "convID", "convId", "conversationID", "conversationId"],
+            0,
+        )
+        .and_then(|value| {
+            value_to_conversation_id_bytes(value)
+                .or_else(|| conversation_id_bytes_from_base64_string(value))
+        }) {
+            return Some(bytes);
+        }
+    }
+
+    None
 }
 
 async fn call_mark_as_read_local(
@@ -11129,6 +11530,25 @@ async fn fetch_thread_messages_before_anchor(
     before_message_id: &MessageId,
     page_size: usize,
 ) -> io::Result<ThreadPage> {
+    fetch_thread_messages_before_anchor_impl(
+        client,
+        conversation_id,
+        raw_conversation_id,
+        before_message_id,
+        page_size,
+        true,
+    )
+    .await
+}
+
+async fn fetch_thread_messages_before_anchor_impl(
+    client: &mut KeybaseRpcClient,
+    conversation_id: &ConversationId,
+    raw_conversation_id: &[u8],
+    before_message_id: &MessageId,
+    page_size: usize,
+    hydrate_attachments: bool,
+) -> io::Result<ThreadPage> {
     let Ok(pivot) = before_message_id.0.parse::<i64>() else {
         return Ok(ThreadPage::default());
     };
@@ -11168,7 +11588,9 @@ async fn fetch_thread_messages_before_anchor(
         )
         .await?;
     let mut page = parse_thread_page(&result, conversation_id);
-    hydrate_thread_attachment_paths(client, raw_conversation_id, &mut page).await;
+    if hydrate_attachments {
+        hydrate_thread_attachment_paths(client, raw_conversation_id, &mut page).await;
+    }
     Ok(page)
 }
 
@@ -11178,6 +11600,25 @@ async fn fetch_thread_messages_after_anchor(
     raw_conversation_id: &[u8],
     after_message_id: &MessageId,
     page_size: usize,
+) -> io::Result<ThreadPage> {
+    fetch_thread_messages_after_anchor_impl(
+        client,
+        conversation_id,
+        raw_conversation_id,
+        after_message_id,
+        page_size,
+        true,
+    )
+    .await
+}
+
+async fn fetch_thread_messages_after_anchor_impl(
+    client: &mut KeybaseRpcClient,
+    conversation_id: &ConversationId,
+    raw_conversation_id: &[u8],
+    after_message_id: &MessageId,
+    page_size: usize,
+    hydrate_attachments: bool,
 ) -> io::Result<ThreadPage> {
     let Ok(pivot) = after_message_id.0.parse::<i64>() else {
         return Ok(ThreadPage::default());
@@ -11218,7 +11659,9 @@ async fn fetch_thread_messages_after_anchor(
         )
         .await?;
     let mut page = parse_thread_page(&result, conversation_id);
-    hydrate_thread_attachment_paths(client, raw_conversation_id, &mut page).await;
+    if hydrate_attachments {
+        hydrate_thread_attachment_paths(client, raw_conversation_id, &mut page).await;
+    }
     Ok(page)
 }
 
@@ -11482,6 +11925,7 @@ struct BootstrapConversation {
     summary: ConversationSummary,
     provider_ref: ProviderConversationRef,
     raw_conversation_id: Vec<u8>,
+    can_post: bool,
     activity_time: i64,
     read_marker: Option<MessageId>,
     pinned_state: PinnedState,
@@ -11490,6 +11934,7 @@ struct BootstrapConversation {
 fn parse_inbox_conversations(
     value: &Value,
     self_username: Option<&str>,
+    include_non_active_channels: bool,
 ) -> Vec<BootstrapConversation> {
     let mut result = Vec::new();
     let conversations = map_get(value, "conversations")
@@ -11541,9 +11986,8 @@ fn parse_inbox_conversations(
         let mention_count = conversation_mention_count(&conversation, &reader_info);
         let title = conversation_title(&tlf_name, &topic_name, members_type, self_username);
         let kind = conversation_kind(&tlf_name, members_type);
-        if kind == ConversationKind::Channel
-            && member_status != Some(CONVERSATION_MEMBER_STATUS_ACTIVE)
-        {
+        let can_post = member_status == Some(CONVERSATION_MEMBER_STATUS_ACTIVE);
+        if !include_non_active_channels && kind == ConversationKind::Channel && !can_post {
             continue;
         }
         let topic = if topic_name.is_empty() {
@@ -11578,6 +12022,7 @@ fn parse_inbox_conversations(
             summary,
             provider_ref,
             raw_conversation_id: raw_id,
+            can_post,
             activity_time,
             read_marker: read_msg
                 .filter(|value| *value > 0)
@@ -11587,6 +12032,113 @@ fn parse_inbox_conversations(
     }
 
     result
+}
+
+/// Parse a single `InboxUIItem` (as embedded in `NewChatActivity` notifications) into a
+/// `BootstrapConversation`. The `InboxUIItem` has top-level fields like `convID` (hex string),
+/// `name` (tlfName), `channel` (topicName), `membersType`, `memberStatus`, `status`, `time`, etc.
+fn parse_inbox_ui_item(
+    value: &Value,
+    self_username: Option<&str>,
+) -> Option<BootstrapConversation> {
+    let conv_id_str = map_get_any(value, &["convID", "convId"])
+        .and_then(as_str)?;
+    let raw_id = hex_decode(conv_id_str)?;
+    let encoded_id = format!("kb_conv:{}", hex_encode(&raw_id));
+    let conversation_id = ConversationId::new(encoded_id.clone());
+    let provider_ref = ProviderConversationRef::new(encoded_id);
+
+    let tlf_name = map_get_any(value, &["name", "tlfName", "n"])
+        .and_then(as_str)
+        .unwrap_or("")
+        .to_string();
+    let topic_name = map_get_any(value, &["channel", "topicName", "t"])
+        .and_then(as_str)
+        .unwrap_or("")
+        .to_string();
+    let members_type = map_get_any(value, &["membersType", "m"])
+        .and_then(as_i64)
+        .unwrap_or(IMPTEAM_MEMBERS_TYPE);
+    let status = map_get_any(value, &["status", "s"])
+        .and_then(as_i64)
+        .unwrap_or(0);
+    let member_status = map_get_any(value, &["memberStatus"])
+        .and_then(as_i64);
+    let activity_time = map_get_any(value, &["time"])
+        .and_then(as_i64)
+        .unwrap_or(0);
+    let read_msg = map_get_any(value, &["readMsgID", "readMsgid"])
+        .and_then(as_i64);
+
+    let title = conversation_title(&tlf_name, &topic_name, members_type, self_username);
+    let kind = conversation_kind(&tlf_name, members_type);
+    let can_post = member_status == Some(CONVERSATION_MEMBER_STATUS_ACTIVE);
+    let topic = if topic_name.is_empty() {
+        tlf_name.clone()
+    } else {
+        topic_name.clone()
+    };
+    let group = if members_type == TEAM_MEMBERS_TYPE {
+        Some(ConversationGroup {
+            id: tlf_name.clone(),
+            display_name: tlf_name.clone(),
+        })
+    } else {
+        None
+    };
+
+    let summary = ConversationSummary {
+        id: conversation_id,
+        title,
+        kind,
+        topic,
+        group,
+        unread_count: 0,
+        mention_count: 0,
+        muted: status == CONVERSATION_STATUS_MUTED,
+        last_activity_ms: activity_time,
+    };
+
+    Some(BootstrapConversation {
+        summary,
+        provider_ref,
+        raw_conversation_id: raw_id,
+        can_post,
+        activity_time,
+        read_marker: read_msg
+            .filter(|v| *v > 0)
+            .map(|v| MessageId::new(v.to_string())),
+        pinned_state: PinnedState::default(),
+    })
+}
+
+/// Extract the `conv` (InboxUIItem) from a `NewChatActivity` notification.
+/// The `conv` field appears inside `activity.incomingMessage.conv` or
+/// `activity.newConversation.conv` or `activity.setStatus.conv`.
+fn extract_conv_from_notify(event: &KeybaseNotifyEvent) -> Option<&Value> {
+    if event.method_name() != "chat.1.NotifyChat.NewChatActivity" {
+        return None;
+    }
+    let raw_params = match event {
+        KeybaseNotifyEvent::Known { raw_params, .. }
+        | KeybaseNotifyEvent::Unknown { raw_params, .. } => raw_params,
+    };
+    let activity = find_value_for_keys(raw_params, &["activity", "a"], 0)?;
+    for container_key in &[
+        "incomingMessage", "im", "i",
+        "newConversation", "nc",
+        "setStatus", "ss",
+        "readMessage", "rm",
+    ] {
+        if let Some(container) = map_get(activity, container_key) {
+            if let Some(conv) = map_get_any(container, &["conv", "c"]) {
+                if map_get_any(conv, &["convID", "convId"]).is_some() {
+                    return Some(conv);
+                }
+            }
+        }
+    }
+    None
 }
 
 fn extract_pinned_state_for_conversation(
@@ -13927,7 +14479,7 @@ fn extract_pin_target_message_id(message_body: &Value) -> Option<MessageId> {
         .map(|id| MessageId::new(id.to_string()))
 }
 
-fn extract_system_subtype(message_body: &Value, root: &Value) -> Option<ChatEvent> {
+fn extract_system_subtype(message_body: &Value, _root: &Value) -> Option<ChatEvent> {
     let payload = message_variant_payload(message_body, MESSAGE_TYPE_SYSTEM)
         .or_else(|| map_get_any(message_body, &["system", "s"]))?;
     let system_type = map_get_any(payload, &["systemType", "st"])
@@ -14055,21 +14607,16 @@ fn extract_system_subtype(message_body: &Value, root: &Value) -> Option<ChatEven
             })
         }
         MESSAGE_SYSTEM_TYPE_NEW_CHANNEL => {
-            if let Some(text) = extract_decorated_text_body(root)
-                .map(|text| text.trim().to_string())
-                .filter(|value| !value.is_empty())
-            {
-                return Some(ChatEvent::Other { text });
-            }
             let details = map_get_any(payload, &["newchannel", "nc"]).unwrap_or(payload);
-            let creator = map_get_any(details, &["creator", "c"])
-                .and_then(as_str)
-                .unwrap_or("someone");
             let name = map_get_any(details, &["nameAtCreation", "n"])
                 .and_then(as_str)
                 .unwrap_or("channel");
-            Some(ChatEvent::Other {
-                text: format!("{creator} created #{name}"),
+            let conv_id = map_get_any(details, &["convID", "c"])
+                .and_then(value_to_conversation_id_bytes)
+                .map(|bytes| ConversationId::new(format!("kb_conv:{}", hex_encode(&bytes))));
+            Some(ChatEvent::ChannelCreated {
+                channel_name: name.to_string(),
+                conv_id,
             })
         }
         _ => Some(ChatEvent::Other {
@@ -18009,7 +18556,7 @@ mod tests {
             ])]),
         )]);
 
-        let parsed = parse_inbox_conversations(&payload, Some("alice"));
+        let parsed = parse_inbox_conversations(&payload, Some("alice"), false);
         assert_eq!(parsed.len(), 1);
         assert_eq!(parsed[0].summary.unread_count, 1);
     }
@@ -18080,7 +18627,7 @@ mod tests {
             ])]),
         )]);
 
-        let parsed = parse_inbox_conversations(&payload, Some("alice"));
+        let parsed = parse_inbox_conversations(&payload, Some("alice"), false);
         assert_eq!(parsed.len(), 1);
         assert_eq!(parsed[0].pinned_state.items.len(), 1);
         let pinned = &parsed[0].pinned_state.items[0];

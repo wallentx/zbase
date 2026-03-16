@@ -35,6 +35,7 @@ use crate::{
     state::{
         AppStore, ConnectionState, DraftKey, UiAction,
         bindings::MessageBinding,
+        effect::BackendCommand,
         event::{BackendEvent, TeamRoleKind},
     },
     util::{
@@ -271,6 +272,7 @@ pub struct AppWindow {
     video_pending_urls: HashSet<String>,
     video_result_sender: Sender<VideoDecodeOutcome>,
     video_result_receiver: Receiver<VideoDecodeOutcome>,
+    preview_summaries: HashMap<ConversationId, (ConversationSummary, bool)>,
     og_service: OgService,
     og_result_sender: Sender<OgFetchResult>,
     og_result_receiver: Receiver<OgFetchResult>,
@@ -297,6 +299,8 @@ pub struct AppWindow {
     splash_open: bool,
     splash_shown_at: Instant,
     splash_boot_ready: bool,
+    pending_file_upload_caption_focus: bool,
+    sidebar_scroll_handle: ScrollHandle,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -370,6 +374,8 @@ struct SidebarViewState {
 struct CachedSidebarView {
     owner: WeakEntity<AppWindow>,
     state: SidebarViewState,
+    hovered_row: Option<String>,
+    scroll_handle: ScrollHandle,
 }
 
 #[derive(Clone)]
@@ -381,6 +387,7 @@ struct VideoDecodeOutcome {
 #[derive(Clone, Copy, Debug)]
 enum BenchScriptScenario {
     TimelineScroll,
+    ProfileScroll,
     SidebarFilter,
     SyncHeavy,
     ComposerTyping,
@@ -394,6 +401,7 @@ impl BenchScriptScenario {
             "timeline_scroll" | "timeline-scroll" | "timeline" | "scroll_chat" | "scroll-chat" => {
                 Some(Self::TimelineScroll)
             }
+            "profile_scroll" | "profile-scroll" | "profile" => Some(Self::ProfileScroll),
             "sidebar_filter" | "sidebar-filter" | "sidebar" => Some(Self::SidebarFilter),
             "sync_heavy" | "sync-heavy" | "sync" => Some(Self::SyncHeavy),
             "composer_typing" | "composer-typing" | "composer" | "typing" => {
@@ -408,6 +416,7 @@ impl BenchScriptScenario {
     fn slug(self) -> &'static str {
         match self {
             Self::TimelineScroll => "timeline_scroll",
+            Self::ProfileScroll => "profile_scroll",
             Self::SidebarFilter => "sidebar_filter",
             Self::SyncHeavy => "sync_heavy",
             Self::ComposerTyping => "composer_typing",
@@ -441,7 +450,12 @@ impl BenchScriptConfig {
 
 impl CachedSidebarView {
     fn new(owner: WeakEntity<AppWindow>, state: SidebarViewState) -> Self {
-        Self { owner, state }
+        Self {
+            owner,
+            state,
+            hovered_row: None,
+            scroll_handle: ScrollHandle::new(),
+        }
     }
 
     fn update_state(&mut self, state: SidebarViewState, cx: &mut Context<Self>) {
@@ -463,6 +477,8 @@ impl Render for CachedSidebarView {
                 self.state.current_user_avatar_asset.as_deref(),
                 &self.state.dm_avatar_assets,
                 &self.state.current_route,
+                self.hovered_row.as_deref(),
+                &self.scroll_handle,
                 cx,
             )
         })
@@ -550,6 +566,17 @@ impl SidebarHost for CachedSidebarView {
             });
         });
     }
+
+    fn sidebar_set_hovered_row(&mut self, label: Option<String>, cx: &mut Context<Self>) {
+        if self.hovered_row != label {
+            self.hovered_row = label;
+            cx.notify();
+        }
+    }
+
+    fn sidebar_hovered_row(&self) -> Option<&str> {
+        self.hovered_row.as_deref()
+    }
 }
 
 impl SidebarHost for AppWindow {
@@ -594,6 +621,12 @@ impl SidebarHost for AppWindow {
 
     fn sidebar_navigate_to(&mut self, route: Route, window: &mut Window, cx: &mut Context<Self>) {
         self.navigate_to(route, window, cx);
+    }
+
+    fn sidebar_set_hovered_row(&mut self, _label: Option<String>, _cx: &mut Context<Self>) {}
+
+    fn sidebar_hovered_row(&self) -> Option<&str> {
+        None
     }
 }
 
@@ -697,6 +730,7 @@ impl AppWindow {
             video_pending_urls: HashSet::new(),
             video_result_sender,
             video_result_receiver,
+            preview_summaries: HashMap::new(),
             og_service: OgService::new(local_store),
             og_result_sender,
             og_result_receiver,
@@ -723,6 +757,8 @@ impl AppWindow {
             splash_open: true,
             splash_shown_at: Instant::now(),
             splash_boot_ready: false,
+            pending_file_upload_caption_focus: false,
+            sidebar_scroll_handle: ScrollHandle::new(),
         }
     }
 
@@ -2070,6 +2106,9 @@ impl AppWindow {
                 let _ = self.sync_scroll_indicators();
                 self.refresh(cx);
             }
+            BenchScriptScenario::ProfileScroll => {
+                self.run_bench_profile_scroll_tick(cx);
+            }
             BenchScriptScenario::SidebarFilter => {
                 const FILTERS: [&str; 10] =
                     ["", "g", "ge", "gen", "d", "de", "des", "a", "al", "ali"];
@@ -2125,6 +2164,46 @@ impl AppWindow {
                 self.run_bench_thread_open_tick(cx);
             }
         }
+    }
+
+    fn run_bench_profile_scroll_tick(&mut self, cx: &mut Context<Self>) {
+        let direction = if (self.bench_script_step / 180).is_multiple_of(2) {
+            -96.0
+        } else {
+            96.0
+        };
+        let mut moved = false;
+        moved |= Self::scroll_handle_by(&self.profile_social_scroll, direction);
+        moved |= Self::scroll_handle_by(&self.profile_scroll, direction);
+        if self.bench_script_step.is_multiple_of(420) || !moved {
+            Self::scroll_handle_to_top(&self.profile_social_scroll);
+            Self::scroll_handle_to_top(&self.profile_scroll);
+        }
+        self.refresh(cx);
+    }
+
+    fn scroll_handle_by(handle: &ScrollHandle, delta_y_px: f32) -> bool {
+        let max = handle.max_offset();
+        if max.height <= px(0.) {
+            return false;
+        }
+        let mut offset = handle.offset();
+        let next_y = (offset.y + px(delta_y_px)).clamp(-max.height, px(0.));
+        if next_y == offset.y {
+            return false;
+        }
+        offset.y = next_y;
+        handle.set_offset(offset);
+        true
+    }
+
+    fn scroll_handle_to_top(handle: &ScrollHandle) {
+        let mut offset = handle.offset();
+        if offset.y == px(0.) {
+            return;
+        }
+        offset.y = px(0.);
+        handle.set_offset(offset);
     }
 
     fn ensure_bench_thread_conversation(&mut self, cx: &mut Context<Self>) -> bool {
@@ -3175,6 +3254,7 @@ impl AppWindow {
         }
 
         if workspace_changed || conversation_changed {
+            self.models.conversation.can_post = false;
             if let Some(active_conversation) = self
                 .models
                 .workspace
@@ -3266,8 +3346,20 @@ impl AppWindow {
                         None
                     }
                 };
-            } else {
-                self.models.conversation.avatar_asset = None;
+            } else if let Some(conversation_id) = snapshot.timeline.conversation_id.clone() {
+                if let Some((cached_summary, cached_can_post)) =
+                    self.preview_summaries.get(&conversation_id).cloned()
+                {
+                    self.models.conversation.summary = cached_summary;
+                    self.models.conversation.can_post = cached_can_post;
+                    self.models.conversation.avatar_asset = None;
+                } else {
+                    self.models.conversation.avatar_asset = None;
+                    if self.models.conversation.summary.id != conversation_id {
+                        self.models.conversation.summary.id = conversation_id.clone();
+                    }
+                }
+                self.models.composer.conversation_id = conversation_id;
             }
         }
         self.models.conversation.pinned_message = snapshot
@@ -3360,6 +3452,11 @@ impl AppWindow {
                             event,
                             &message.author_id,
                             &snapshot.backend.user_profiles,
+                            team_name_for_conversation(
+                                &message.conversation_id,
+                                &snapshot.backend.conversation_team_ids,
+                                &self.models.workspace.channels,
+                            ),
                         ),
                     ));
                     previous_message = None;
@@ -3641,6 +3738,289 @@ impl AppWindow {
         }
     }
 
+    pub(crate) fn navigate_to_channel_link(
+        &mut self,
+        channel_name: &str,
+        team_hint: Option<&str>,
+        conv_id: Option<&ConversationId>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(conv_id) = conv_id {
+            tracing::info!(
+                "navigate_to_channel_link: using conv_id {} for #{channel_name}",
+                conv_id.0
+            );
+            self.navigate_to_channel_by_conv_id(conv_id.clone(), window, cx);
+        } else {
+            tracing::info!(
+                "navigate_to_channel_link: no conv_id, falling back to name resolution for #{channel_name}"
+            );
+            self.navigate_to_channel_by_name(channel_name, team_hint, window, cx);
+        }
+    }
+
+    fn navigate_to_channel_by_conv_id(
+        &mut self,
+        conversation_id: ConversationId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let workspace_id = self.models.app.active_workspace_id.clone();
+
+        // Check if already in the sidebar (user is a member)
+        let sidebar_route = self
+            .models
+            .sidebar
+            .sections
+            .iter()
+            .flat_map(|s| &s.rows)
+            .find(|row| {
+                matches!(&row.route, Route::Channel { channel_id: cid, .. } if cid.0 == conversation_id.0)
+            })
+            .map(|row| row.route.clone());
+
+        if let Some(route) = sidebar_route {
+            self.navigate_to(route, window, cx);
+            return;
+        }
+
+        // Not in sidebar - resolve via backend (handles non-member preview)
+        tracing::info!(
+            "navigate_to_channel_by_conv_id: resolving {} via backend",
+            conversation_id.0
+        );
+        let Ok(events) = self.backend_router.route_command(
+            BackendCommand::ResolveChannelById {
+                workspace_id: workspace_id.clone(),
+                conversation_id: conversation_id.clone(),
+            },
+        ) else {
+            tracing::warn!(
+                "navigate_to_channel_by_conv_id: route_command returned Err for {}",
+                conversation_id.0
+            );
+            cx.notify();
+            return;
+        };
+
+        for event in events {
+            match event {
+                BackendEvent::ChannelResolved {
+                    workspace_id,
+                    conversation,
+                    conversation_binding,
+                    can_post,
+                } => {
+                    self.backend_router
+                        .register_conversation_binding(conversation_binding.clone());
+                    let _ = self.app_store.dispatch_backend(BackendEvent::ChannelResolved {
+                        workspace_id: workspace_id.clone(),
+                        conversation: conversation.clone(),
+                        conversation_binding,
+                        can_post,
+                    });
+                    self.preview_summaries.insert(
+                        conversation.id.clone(),
+                        (conversation.clone(), can_post),
+                    );
+                    let conv_id_str = conversation.id.0.clone();
+                    self.navigate_to(
+                        Route::Channel {
+                            workspace_id,
+                            channel_id: crate::domain::ids::ChannelId::new(conv_id_str),
+                        },
+                        window,
+                        cx,
+                    );
+                    self.models.conversation.summary = conversation.clone();
+                    self.models.composer.conversation_id = conversation.id.clone();
+                    self.models.conversation.can_post = can_post;
+                    return;
+                }
+                BackendEvent::ChannelResolveFailed { error, .. } => {
+                    tracing::warn!(
+                        "navigate_to_channel_by_conv_id: resolve failed: {error}"
+                    );
+                    cx.notify();
+                    return;
+                }
+                other => {
+                    self.apply_backend_events_inline(vec![other]);
+                }
+            }
+        }
+
+        tracing::warn!(
+            "navigate_to_channel_by_conv_id: no ChannelResolved event for {}",
+            conversation_id.0
+        );
+        cx.notify();
+    }
+
+    pub(crate) fn navigate_to_channel_by_name(
+        &mut self,
+        channel_name: &str,
+        team_hint: Option<&str>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let normalized_channel_name = channel_name
+            .trim()
+            .trim_start_matches('#')
+            .trim()
+            .to_string();
+        if normalized_channel_name.is_empty() {
+            self.models.push_toast("Channel name is empty", None);
+            cx.notify();
+            return;
+        }
+
+        let current_conv_id = conversation_id_from_navigated_route(&self.models.navigation.current);
+        let workspace_team_name = current_conv_id.as_ref().and_then(|cid| {
+            self.models
+                .workspace
+                .channels
+                .iter()
+                .find(|c| c.id == *cid)
+                .and_then(|c| c.group.as_ref())
+                .map(|g| g.id.clone())
+        });
+        let summary_team_name = self
+            .models
+            .conversation
+            .summary
+            .group
+            .as_ref()
+            .map(|group| group.id.clone());
+        let backend_team_name = current_conv_id.as_ref().and_then(|cid| {
+            self.app_store
+                .snapshot()
+                .backend
+                .conversation_team_ids
+                .get(cid)
+                .cloned()
+                .and_then(|value| {
+                    let trimmed = value.trim();
+                    if trimmed.is_empty() || looks_like_keybase_team_id(trimmed) {
+                        None
+                    } else {
+                        Some(trimmed.to_string())
+                    }
+                })
+        });
+        let hinted_team_name = team_hint.and_then(|value| {
+            let trimmed = value.trim();
+            (!trimmed.is_empty()).then_some(trimmed.to_string())
+        });
+        let current_team_name = hinted_team_name
+            .or(workspace_team_name)
+            .or(summary_team_name)
+            .or(backend_team_name)
+            .and_then(|name| {
+                let trimmed = name.trim();
+                (!trimmed.is_empty()).then_some(trimmed.to_string())
+            });
+
+        let route = self
+            .models
+            .sidebar
+            .sections
+            .iter()
+            .flat_map(|s| &s.rows)
+            .find(|row| {
+                if !row.label.eq_ignore_ascii_case(&normalized_channel_name) {
+                    return false;
+                }
+                match (&row.route, &current_team_name) {
+                    (
+                        Route::Channel {
+                            channel_id,
+                            workspace_id: _,
+                        },
+                        Some(gid),
+                    ) => {
+                        let conv_id = ConversationId::new(channel_id.0.clone());
+                        self.models
+                            .workspace
+                            .channels
+                            .iter()
+                            .find(|c| c.id == conv_id)
+                            .and_then(|c| c.group.as_ref())
+                            .is_some_and(|g| g.id == *gid)
+                    }
+                    (Route::Channel { .. }, None) => false,
+                    _ => false,
+                }
+            })
+            .map(|row| row.route.clone());
+
+        if let Some(route) = route {
+            tracing::info!(
+                "navigate_to_channel_by_name: found in sidebar, navigating to {normalized_channel_name}"
+            );
+            self.navigate_to(route, window, cx);
+        } else {
+            let Some(team_name) = current_team_name else {
+                tracing::warn!(
+                    "navigate_to_channel_by_name: no team context for #{normalized_channel_name}"
+                );
+                cx.notify();
+                return;
+            };
+            let workspace_id = self.models.app.active_workspace_id.clone();
+            self.resolve_channel_and_navigate(
+                workspace_id,
+                team_name,
+                normalized_channel_name,
+                window,
+                cx,
+            );
+        }
+    }
+
+    pub(crate) fn join_current_channel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(conversation_id) = conversation_id_from_navigated_route(&self.models.navigation.current)
+        else {
+            tracing::warn!("join_current_channel: no conversation_id from route");
+            return;
+        };
+        tracing::info!("join_current_channel: joining {}", conversation_id.0);
+        let workspace_id = self.models.app.active_workspace_id.clone();
+        let Ok(events) = self.backend_router.route_command(BackendCommand::JoinChannel {
+            workspace_id: workspace_id.clone(),
+            conversation_id: conversation_id.clone(),
+        }) else {
+            tracing::warn!("join_current_channel: route_command failed for {}", conversation_id.0);
+            self.models
+                .push_toast("Failed to join channel", None);
+            cx.notify();
+            return;
+        };
+        let joined = events
+            .iter()
+            .any(|event| matches!(event, BackendEvent::ChannelJoined { .. }));
+        if !joined {
+            tracing::warn!("join_current_channel: no ChannelJoined event for {}", conversation_id.0);
+            self.models.push_toast("Failed to join channel", None);
+            cx.notify();
+            return;
+        }
+        tracing::info!("join_current_channel: successfully joined {}", conversation_id.0);
+        self.preview_summaries.remove(&conversation_id);
+
+        if let Ok(workspace_events) = self
+            .backend_router
+            .route_command(BackendCommand::LoadWorkspace { workspace_id })
+        {
+            self.apply_backend_events_inline(workspace_events);
+        }
+        self.models.conversation.can_post = true;
+        self.sync_inputs_from_models(cx);
+        self.restore_chat_focus(window, cx);
+        self.refresh(cx);
+    }
+
     pub(crate) fn navigate_to(
         &mut self,
         route: Route,
@@ -3685,6 +4065,152 @@ impl AppWindow {
         self.sync_inputs_from_models(cx);
         self.restore_chat_focus(window, cx);
         self.refresh(cx);
+    }
+
+    fn resolve_channel_and_navigate(
+        &mut self,
+        workspace_id: WorkspaceId,
+        team_name: String,
+        channel_name: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let team_for_error = team_name.clone();
+        tracing::info!(
+            "resolve_channel_and_navigate: resolving #{channel_name} in team={team_name}"
+        );
+        let Ok(events) = self.backend_router.route_command(BackendCommand::ResolveChannel {
+            workspace_id: workspace_id.clone(),
+            team_name,
+            channel_name: channel_name.clone(),
+        }) else {
+            tracing::warn!(
+                "resolve_channel_and_navigate: route_command returned Err for #{channel_name} in {team_for_error}"
+            );
+            cx.notify();
+            return;
+        };
+
+        for event in events {
+            match event {
+                BackendEvent::ChannelResolved {
+                    workspace_id,
+                    conversation,
+                    conversation_binding,
+                    can_post,
+                } => {
+                    self.backend_router
+                        .register_conversation_binding(conversation_binding.clone());
+                    let _ = self.app_store.dispatch_backend(BackendEvent::ChannelResolved {
+                        workspace_id: workspace_id.clone(),
+                        conversation: conversation.clone(),
+                        conversation_binding,
+                        can_post,
+                    });
+                    self.preview_summaries.insert(
+                        conversation.id.clone(),
+                        (conversation.clone(), can_post),
+                    );
+                    let conv_id_str = conversation.id.0.clone();
+                    self.navigate_to(
+                        Route::Channel {
+                            workspace_id,
+                            channel_id: crate::domain::ids::ChannelId::new(conv_id_str),
+                        },
+                        window,
+                        cx,
+                    );
+                    self.models.conversation.summary = conversation.clone();
+                    self.models.composer.conversation_id = conversation.id.clone();
+                    self.models.conversation.can_post = can_post;
+                    return;
+                }
+                BackendEvent::ChannelResolveFailed { error, .. } => {
+                    tracing::warn!(
+                        "resolve_channel_and_navigate: failed for #{channel_name} in {team_for_error}: {error}"
+                    );
+                    cx.notify();
+                    return;
+                }
+                other => {
+                    self.apply_backend_events_inline(vec![other]);
+                }
+            }
+        }
+
+        self.models.push_toast(
+            format!("Unable to open #{channel_name} in {team_for_error}"),
+            None,
+        );
+        cx.notify();
+    }
+
+    fn apply_backend_events_inline(&mut self, events: Vec<BackendEvent>) {
+        if events.is_empty() {
+            return;
+        }
+        let mut pending_effects = Vec::new();
+        for event in events {
+            self.register_bindings_from_backend_event(&event);
+            pending_effects.extend(self.app_store.dispatch_backend(event));
+        }
+        loop {
+            if pending_effects.is_empty() {
+                break;
+            }
+            let Ok(events) = self.backend_router.apply_effects(&pending_effects) else {
+                break;
+            };
+            if events.is_empty() {
+                break;
+            }
+            pending_effects.clear();
+            for event in events {
+                self.register_bindings_from_backend_event(&event);
+                pending_effects.extend(self.app_store.dispatch_backend(event));
+            }
+        }
+        self.sync_models_from_store();
+    }
+
+    fn register_bindings_from_backend_event(&mut self, event: &BackendEvent) {
+        match event {
+            BackendEvent::BootstrapLoaded { payload, .. } => {
+                for binding in &payload.workspace_bindings {
+                    self.backend_router.register_workspace_binding(binding.clone());
+                }
+                for binding in &payload.conversation_bindings {
+                    self.backend_router.register_conversation_binding(binding.clone());
+                }
+                for binding in &payload.message_bindings {
+                    self.backend_router.register_message_binding(binding.clone());
+                }
+            }
+            BackendEvent::WorkspaceConversationsExtended {
+                conversation_bindings,
+                ..
+            } => {
+                for binding in conversation_bindings {
+                    self.backend_router
+                        .register_conversation_binding(binding.clone());
+                }
+            }
+            BackendEvent::ConversationCreated {
+                conversation_binding,
+                ..
+            } => {
+                self.backend_router
+                    .register_conversation_binding(conversation_binding.clone());
+            }
+            BackendEvent::ChannelResolved {
+                conversation_binding,
+                ..
+            } => {
+                self.backend_router
+                    .register_conversation_binding(conversation_binding.clone());
+            }
+            _ => {}
+        }
     }
 
     pub(crate) fn navigate_to_message(
@@ -3841,6 +4367,26 @@ impl AppWindow {
         };
         self.models.set_right_pane(next);
         self.refresh(cx);
+    }
+
+    pub(crate) fn open_dm_header_profile(&mut self, cx: &mut Context<Self>) {
+        let conv_id = &self.models.conversation.summary.id;
+        let username = self
+            .models
+            .workspace
+            .direct_messages
+            .iter()
+            .find(|dm| dm.id == *conv_id)
+            .and_then(|dm| {
+                dm.title
+                    .split(',')
+                    .map(str::trim)
+                    .find(|s| !s.is_empty())
+                    .map(|s| s.to_string())
+            });
+        if let Some(username) = username {
+            self.open_user_profile_card(UserId::new(username), cx);
+        }
     }
 
     pub(crate) fn open_user_profile_card(&mut self, user_id: UserId, cx: &mut Context<Self>) {
@@ -4683,6 +5229,10 @@ impl AppWindow {
             window.focus(&self.focus_handle);
             return;
         }
+        if !self.models.conversation.can_post {
+            window.focus(&self.focus_handle);
+            return;
+        }
         if self.models.navigation.right_pane == RightPaneMode::Thread {
             let composer_focused = self.composer_input.focus_handle(cx).is_focused(window);
             let thread_focused = self.thread_input.focus_handle(cx).is_focused(window);
@@ -5018,6 +5568,7 @@ impl AppWindow {
         if !self.models.open_file_upload_lightbox(paths, target) {
             return;
         }
+        self.pending_file_upload_caption_focus = true;
         self.sync_inputs_from_models(cx);
         self.refresh(cx);
     }
@@ -5474,7 +6025,7 @@ impl AppWindow {
         self.refresh(cx);
     }
 
-    const HOVER_SETTLE_DELAY: Duration = Duration::from_millis(100);
+    const HOVER_SETTLE_DELAY: Duration = Duration::from_millis(200);
     /// Delay before hiding the quick reaction strip after the mouse leaves the row,
     /// so the user can move to the strip (which may be outside the row) without it disappearing.
     const HOVER_CLEAR_DELAY: Duration = Duration::from_millis(300);
@@ -7386,6 +7937,10 @@ impl AppWindow {
 impl Render for AppWindow {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let render_t0 = Instant::now();
+        if self.pending_file_upload_caption_focus {
+            self.pending_file_upload_caption_focus = false;
+            window.focus(&self.file_upload_caption_input.focus_handle(cx));
+        }
         if !window.is_window_hovered() && self.models.timeline.hovered_message_id.is_some() {
             self.schedule_hover_clear(cx);
         }
@@ -7530,6 +8085,8 @@ impl Render for AppWindow {
                                 self.models.app.current_user_avatar_asset.as_deref(),
                                 &self.sidebar_dm_avatar_assets,
                                 &self.models.navigation.current,
+                                None,
+                                &self.sidebar_scroll_handle,
                                 cx,
                             )
                         },
@@ -8475,21 +9032,38 @@ fn profile_display_name(
         .unwrap_or_else(|| user_id.0.clone())
 }
 
-fn format_user_list(
-    user_ids: &[UserId],
-    user_profiles: &HashMap<UserId, crate::state::state::UserProfileState>,
-) -> String {
-    user_ids
+fn team_name_for_conversation(
+    conversation_id: &ConversationId,
+    conversation_team_ids: &HashMap<ConversationId, String>,
+    channels: &[ConversationSummary],
+) -> Option<String> {
+    if let Some(from_channels) = channels
         .iter()
-        .map(|user_id| profile_display_name(user_id, user_profiles))
-        .collect::<Vec<_>>()
-        .join(", ")
+        .find(|summary| summary.id == *conversation_id)
+        .and_then(|summary| summary.group.as_ref())
+        .map(|group| group.id.trim().to_string())
+        .filter(|value| !value.is_empty())
+    {
+        return Some(from_channels);
+    }
+
+    conversation_team_ids
+        .get(conversation_id)
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .filter(|value| !looks_like_keybase_team_id(value))
+}
+
+fn looks_like_keybase_team_id(value: &str) -> bool {
+    let trimmed = value.trim();
+    trimmed.len() >= 32 && trimmed.bytes().all(|b| (b as char).is_ascii_hexdigit())
 }
 
 fn format_chat_event(
     event: &ChatEvent,
     author_id: &UserId,
     user_profiles: &HashMap<UserId, crate::state::state::UserProfileState>,
+    team_name: Option<String>,
 ) -> crate::models::timeline_model::SystemEventRow {
     use crate::models::timeline_model::{EventSpan, SystemEventIcon, SystemEventRow};
 
@@ -8511,32 +9085,46 @@ fn format_chat_event(
             ],
         },
         ChatEvent::MembersAdded { user_ids, role } => {
-            let members = format_user_list(user_ids, user_profiles);
             let role_suffix = role
                 .as_deref()
                 .filter(|value| !value.trim().is_empty())
                 .map(|value| format!(" as {value}"))
                 .unwrap_or_default();
-            let text = if members.is_empty() {
-                format!("added members{role_suffix}")
+            let mut spans = vec![EventSpan::Actor(author), EventSpan::Text("added".into())];
+            if user_ids.is_empty() {
+                spans.push(EventSpan::Text(format!("members{role_suffix}")));
             } else {
-                format!("added {members}{role_suffix}")
-            };
+                for (i, uid) in user_ids.iter().enumerate() {
+                    spans.push(EventSpan::UserLink(uid.clone()));
+                    if i + 1 < user_ids.len() {
+                        spans.push(EventSpan::Text(",".into()));
+                    }
+                }
+                if !role_suffix.is_empty() {
+                    spans.push(EventSpan::Text(role_suffix));
+                }
+            }
             SystemEventRow {
                 icon: SystemEventIcon::Add,
-                spans: vec![EventSpan::Actor(author), EventSpan::Text(text)],
+                spans,
             }
         }
         ChatEvent::MembersRemoved { user_ids } => {
-            let members = format_user_list(user_ids, user_profiles);
-            let text = if members.is_empty() {
-                "removed members".to_string()
+            let mut spans = vec![EventSpan::Actor(author)];
+            if user_ids.is_empty() {
+                spans.push(EventSpan::Text("removed members".into()));
             } else {
-                format!("removed {members}")
-            };
+                spans.push(EventSpan::Text("removed".into()));
+                for (i, uid) in user_ids.iter().enumerate() {
+                    spans.push(EventSpan::UserLink(uid.clone()));
+                    if i + 1 < user_ids.len() {
+                        spans.push(EventSpan::Text(",".into()));
+                    }
+                }
+            }
             SystemEventRow {
                 icon: SystemEventIcon::Remove,
-                spans: vec![EventSpan::Actor(author), EventSpan::Text(text)],
+                spans,
             }
         }
         ChatEvent::DescriptionChanged { description } => {
@@ -8596,6 +9184,21 @@ fn format_chat_event(
         ChatEvent::RetentionChanged { summary } => SystemEventRow {
             icon: SystemEventIcon::Settings,
             spans: vec![EventSpan::Text(summary.clone())],
+        },
+        ChatEvent::ChannelCreated {
+            channel_name,
+            conv_id,
+        } => SystemEventRow {
+            icon: SystemEventIcon::Add,
+            spans: vec![
+                EventSpan::Actor(author),
+                EventSpan::Text("created".to_string()),
+                EventSpan::ChannelLink {
+                    channel_name: channel_name.clone(),
+                    team_name,
+                    conv_id: conv_id.clone(),
+                },
+            ],
         },
         ChatEvent::Other { text } => SystemEventRow {
             icon: SystemEventIcon::Info,
@@ -8660,6 +9263,10 @@ fn mix_chat_event_signature(sig: &mut u64, event: &ChatEvent) {
         ChatEvent::RetentionChanged { summary } => {
             mix_sig(sig, 11);
             mix_sig_str(sig, summary);
+        }
+        ChatEvent::ChannelCreated { channel_name, .. } => {
+            mix_sig(sig, 13);
+            mix_sig_str(sig, channel_name);
         }
         ChatEvent::Other { text } => {
             mix_sig(sig, 12);

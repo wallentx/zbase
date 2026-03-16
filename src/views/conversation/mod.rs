@@ -149,7 +149,53 @@ impl ConversationView {
                         )
                     }),
             )
-            .child(ComposerPanel.render(composer, composer_input, cx))
+            .when(conversation.can_post, |container| {
+                container.child(ComposerPanel.render(composer, composer_input, cx))
+            })
+            .when(!conversation.can_post, |container| {
+                container.child(Self::render_join_bar(conversation, cx))
+            })
+            .into_any_element()
+    }
+
+    fn render_join_bar(conversation: &ConversationModel, cx: &mut Context<AppWindow>) -> AnyElement {
+        let channel_label = conversation.summary.title.trim();
+        let join_label = if channel_label.is_empty() {
+            "Join Channel".to_string()
+        } else {
+            format!("Join #{channel_label}")
+        };
+        div()
+            .px_3()
+            .py_2()
+            .border_t_1()
+            .border_color(shell_border())
+            .flex()
+            .items_center()
+            .justify_between()
+            .child(
+                div()
+                    .text_sm()
+                    .text_color(rgb(text_secondary()))
+                    .child("You can read this channel, but need to join to send messages."),
+            )
+            .child(
+                div()
+                    .id("conversation-join-button")
+                    .px_3()
+                    .py_1()
+                    .rounded_md()
+                    .bg(rgb(accent()))
+                    .text_sm()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(rgb(0xffffff))
+                    .cursor_pointer()
+                    .hover(|s| s.bg(rgb(accent_soft())))
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.join_current_channel(window, cx);
+                    }))
+                    .child(join_label),
+            )
             .into_any_element()
     }
 
@@ -325,12 +371,25 @@ impl ConversationHeader {
                     .font_weight(FontWeight::SEMIBOLD)
                     .child(conversation.summary.title.clone()),
             );
+        let is_dm = matches!(
+            conversation.summary.kind,
+            crate::domain::conversation::ConversationKind::DirectMessage
+        );
         let title_row = if is_channel {
             div()
                 .id("conversation-header-title")
                 .cursor(CursorStyle::PointingHand)
                 .on_click(cx.listener(|this, _, window, cx| {
                     this.toggle_pane(RightPaneMode::Details, window, cx);
+                }))
+                .child(title_content)
+                .into_any_element()
+        } else if is_dm {
+            div()
+                .id("conversation-header-title")
+                .cursor(CursorStyle::PointingHand)
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.open_dm_header_profile(cx);
                 }))
                 .child(title_content)
                 .into_any_element()

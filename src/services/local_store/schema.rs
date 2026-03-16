@@ -263,6 +263,9 @@ pub enum CachedChatEvent {
     RetentionChanged {
         summary: String,
     },
+    ChannelCreated {
+        channel_name: String,
+    },
     Other {
         text: String,
     },
@@ -303,6 +306,9 @@ impl CachedChatEvent {
             ChatEvent::RetentionChanged { summary } => Self::RetentionChanged {
                 summary: summary.clone(),
             },
+            ChatEvent::ChannelCreated { channel_name, .. } => Self::ChannelCreated {
+                channel_name: channel_name.clone(),
+            },
             ChatEvent::Other { text } => Self::Other { text: text.clone() },
         }
     }
@@ -334,6 +340,10 @@ impl CachedChatEvent {
             Self::HistoryCleared => Some(ChatEvent::HistoryCleared),
             Self::RetentionChanged { summary } => Some(ChatEvent::RetentionChanged {
                 summary: summary.clone(),
+            }),
+            Self::ChannelCreated { channel_name } => Some(ChatEvent::ChannelCreated {
+                channel_name: channel_name.clone(),
+                conv_id: None,
             }),
             Self::Other { text } => Some(ChatEvent::Other { text: text.clone() }),
             Self::Unknown => None,

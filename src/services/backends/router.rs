@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use crate::{
     domain::{
-        backend::{AccountId, BackendId, ProviderMessageRef},
+        backend::{AccountId, BackendId, ProviderConversationRef, ProviderMessageRef},
         ids::{ConversationId, MessageId, WorkspaceId},
     },
     state::{
@@ -517,6 +517,74 @@ impl BackendRouter {
                 backend.execute(RoutedBackendCommand::UnfollowUser {
                     account_id,
                     user_id,
+                })
+            }
+            BackendCommand::ResolveChannel {
+                workspace_id,
+                team_name,
+                channel_name,
+            } => {
+                let (account_id, backend_id, provider_workspace_ref) = if let Some(binding) =
+                    self.workspace_bindings.get(&workspace_id).cloned()
+                {
+                    (
+                        binding.account_id,
+                        binding.backend_id,
+                        binding.provider_workspace_ref,
+                    )
+                } else {
+                    let (account_id, backend_id) = self.default_account_backend()?;
+                    (
+                        account_id,
+                        backend_id,
+                        crate::domain::backend::ProviderWorkspaceRef::new(workspace_id.0.clone()),
+                    )
+                };
+                let backend = self.backend_for_binding(&backend_id)?;
+                backend.execute(RoutedBackendCommand::ResolveChannel {
+                    account_id,
+                    workspace: provider_workspace_ref,
+                    team_name,
+                    channel_name,
+                    workspace_id,
+                })
+            }
+            BackendCommand::ResolveChannelById {
+                workspace_id,
+                conversation_id,
+            } => {
+                let (account_id, backend_id) = if let Some(binding) =
+                    self.conversation_bindings.get(&conversation_id).cloned()
+                {
+                    (binding.account_id, binding.backend_id)
+                } else {
+                    self.default_account_backend()?
+                };
+                let provider_ref =
+                    ProviderConversationRef::new(conversation_id.0.clone());
+                let backend = self.backend_for_binding(&backend_id)?;
+                backend.execute(RoutedBackendCommand::ResolveChannelById {
+                    account_id,
+                    conversation: provider_ref,
+                    workspace_id,
+                })
+            }
+            BackendCommand::JoinChannel {
+                workspace_id,
+                conversation_id,
+            } => {
+                let binding = self
+                    .conversation_bindings
+                    .get(&conversation_id)
+                    .cloned()
+                    .ok_or_else(|| {
+                        BackendError::MissingConversationBinding(conversation_id.0.clone())
+                    })?;
+                let backend = self.backend_for_binding(&binding.backend_id)?;
+                backend.execute(RoutedBackendCommand::JoinChannel {
+                    account_id: binding.account_id,
+                    conversation: binding.provider_conversation_ref,
+                    workspace_id,
                 })
             }
         }

@@ -57,6 +57,12 @@ pub enum SystemEventIcon {
 pub enum EventSpan {
     Actor(String),
     Text(String),
+    ChannelLink {
+        channel_name: String,
+        team_name: Option<String>,
+        conv_id: Option<ConversationId>,
+    },
+    UserLink(UserId),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

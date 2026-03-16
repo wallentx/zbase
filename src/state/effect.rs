@@ -146,6 +146,19 @@ pub enum BackendCommand {
     UnfollowUser {
         user_id: UserId,
     },
+    ResolveChannel {
+        workspace_id: WorkspaceId,
+        team_name: String,
+        channel_name: String,
+    },
+    ResolveChannelById {
+        workspace_id: WorkspaceId,
+        conversation_id: ConversationId,
+    },
+    JoinChannel {
+        workspace_id: WorkspaceId,
+        conversation_id: ConversationId,
+    },
 }
 
 #[derive(Clone, Debug)]
