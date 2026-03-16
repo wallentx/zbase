@@ -27,7 +27,7 @@ const SOCIAL_VIRTUALIZATION_MIN_ENTRIES: usize = 200;
 pub fn render_profile_panel(
     profile_panel: &ProfilePanelModel,
     profile_scroll: &ScrollHandle,
-    profile_social_scroll: &ScrollHandle,
+    _profile_social_scroll: &ScrollHandle,
     cx: &mut Context<AppWindow>,
 ) -> AnyElement {
     let Some(user_id) = profile_panel.user_id.as_ref() else {
@@ -76,7 +76,7 @@ pub fn render_profile_panel(
         && !social_virtualization_disabled();
     let (social_start_index, social_end_index, social_top_spacer_px, social_bottom_spacer_px) =
         if use_social_virtualization {
-            social_entry_window(social_entries.len(), profile_social_scroll)
+            social_entry_window(social_entries.len(), profile_scroll)
         } else {
             (0, social_entries.len(), 0.0, 0.0)
         };
@@ -87,7 +87,9 @@ pub fn render_profile_panel(
         .id("right-pane-profile-scroll")
         .overflow_y_scroll()
         .track_scroll(profile_scroll)
-        .on_scroll_wheel(cx.listener(AppWindow::profile_scrolled))
+        .when(use_social_virtualization, |panel| {
+            panel.on_scroll_wheel(cx.listener(AppWindow::profile_scrolled))
+        })
         .scrollbar_width(px(8.))
         .p_4()
         .flex()
@@ -359,35 +361,23 @@ pub fn render_profile_panel(
                             };
 
                         if use_social_virtualization {
-                            let mut list = div()
+                            div()
                                 .id("profile-social-list-scroll")
                                 .flex()
                                 .flex_col()
-                                .overflow_y_scroll()
-                                .scrollbar_width(px(6.))
-                                .track_scroll(profile_social_scroll)
-                                .on_scroll_wheel(cx.listener(|_, _, _, cx| {
-                                    cx.stop_propagation();
-                                }))
-                                .max_h(px(420.))
-                                .min_h(px(0.));
-
-                            if social_top_spacer_px > 0.0 {
-                                list = list.child(div().h(px(social_top_spacer_px)));
-                            }
-
-                            list = list.children(visible_social_entries.iter().enumerate().map(
-                                |(visible_offset, entry)| {
-                                    let index = social_start_index + visible_offset;
-                                    render_entry(index, entry)
-                                },
-                            ));
-
-                            if social_bottom_spacer_px > 0.0 {
-                                list = list.child(div().h(px(social_bottom_spacer_px)));
-                            }
-
-                            list.into_any_element()
+                                .when(social_top_spacer_px > 0.0, |list_container| {
+                                    list_container.child(div().h(px(social_top_spacer_px)))
+                                })
+                                .children(visible_social_entries.iter().enumerate().map(
+                                    |(visible_offset, entry)| {
+                                        let index = social_start_index + visible_offset;
+                                        render_entry(index, entry)
+                                    },
+                                ))
+                                .when(social_bottom_spacer_px > 0.0, |list_container| {
+                                    list_container.child(div().h(px(social_bottom_spacer_px)))
+                                })
+                                .into_any_element()
                         } else {
                             div()
                                 .flex()
@@ -851,29 +841,37 @@ fn social_graph_entries<'a>(
 }
 
 const SOCIAL_ENTRY_ESTIMATED_HEIGHT_PX: f32 = 44.0;
-const SOCIAL_ENTRY_OVERSCAN_ROWS: usize = 10;
-const SOCIAL_ENTRY_VISIBLE_ROWS: usize = 24;
+const SOCIAL_ENTRY_INITIAL_RENDER_ROWS: usize = 180;
+const SOCIAL_ENTRY_PROGRESSIVE_CHUNK_ROWS: usize = 72;
+const SOCIAL_ENTRY_MAX_RENDER_ROWS: usize = 260;
 
 fn social_entry_window(
     total_entries: usize,
-    social_scroll: &ScrollHandle,
+    profile_scroll: &ScrollHandle,
 ) -> (usize, usize, f32, f32) {
     if total_entries == 0 {
         return (0, 0, 0.0, 0.0);
     }
-
-    let max_offset = social_scroll.max_offset();
-    let mut scroll_top = social_scroll.offset().y.abs();
-    if max_offset.height > px(0.) && scroll_top > max_offset.height {
-        scroll_top = max_offset.height;
+    if total_entries <= SOCIAL_ENTRY_INITIAL_RENDER_ROWS {
+        return (0, total_entries, 0.0, 0.0);
     }
-    let scroll_top_px = f32::from(scroll_top);
 
-    let estimated_row = (scroll_top_px / SOCIAL_ENTRY_ESTIMATED_HEIGHT_PX).floor() as usize;
-    let mut start = estimated_row.saturating_sub(SOCIAL_ENTRY_OVERSCAN_ROWS);
-    start = start.min(total_entries.saturating_sub(1));
-    let target_rows = SOCIAL_ENTRY_VISIBLE_ROWS + (SOCIAL_ENTRY_OVERSCAN_ROWS * 2);
-    let end = (start + target_rows).min(total_entries);
+    let max_offset = profile_scroll.max_offset();
+    let progress = if max_offset.height <= px(0.) {
+        0.0
+    } else {
+        let mut scroll_top = profile_scroll.offset().y.abs();
+        if scroll_top > max_offset.height {
+            scroll_top = max_offset.height;
+        }
+        (f32::from(scroll_top) / f32::from(max_offset.height)).clamp(0.0, 1.0)
+    };
+    let remaining = total_entries.saturating_sub(SOCIAL_ENTRY_INITIAL_RENDER_ROWS);
+    let revealed = ((remaining as f32) * progress).ceil() as usize;
+    let reveal_chunks = revealed.div_ceil(SOCIAL_ENTRY_PROGRESSIVE_CHUNK_ROWS);
+    let revealed_rows = reveal_chunks.saturating_mul(SOCIAL_ENTRY_PROGRESSIVE_CHUNK_ROWS);
+    let end = (SOCIAL_ENTRY_INITIAL_RENDER_ROWS + revealed_rows).min(total_entries);
+    let start = end.saturating_sub(SOCIAL_ENTRY_MAX_RENDER_ROWS);
     let top_spacer_px = (start as f32) * SOCIAL_ENTRY_ESTIMATED_HEIGHT_PX;
     let bottom_spacer_px =
         ((total_entries.saturating_sub(end)) as f32) * SOCIAL_ENTRY_ESTIMATED_HEIGHT_PX;

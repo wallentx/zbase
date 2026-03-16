@@ -260,6 +260,21 @@ pub enum BackendEvent {
         conversation: ConversationSummary,
         conversation_binding: ConversationBinding,
     },
+    ChannelResolved {
+        workspace_id: WorkspaceId,
+        conversation: ConversationSummary,
+        conversation_binding: ConversationBinding,
+        can_post: bool,
+    },
+    ChannelResolveFailed {
+        workspace_id: WorkspaceId,
+        channel_name: String,
+        error: String,
+    },
+    ChannelJoined {
+        workspace_id: WorkspaceId,
+        conversation_id: ConversationId,
+    },
     CallUpdated(CallPatch),
     BootStatus(String),
     KeybaseNotifyStub {

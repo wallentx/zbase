@@ -1346,6 +1346,17 @@ fn reduce_backend_event(state: &mut UiState, event: BackendEvent) -> ReducerOutp
             state.new_chat.search_results = results;
             state.new_chat.creating = false;
         }
+        BackendEvent::ChannelResolved {
+            conversation_binding,
+            ..
+        } => {
+            state.backend.conversation_bindings.insert(
+                conversation_binding.conversation_id.clone(),
+                conversation_binding,
+            );
+        }
+        BackendEvent::ChannelResolveFailed { .. } => {}
+        BackendEvent::ChannelJoined { .. } => {}
         BackendEvent::ConversationCreated {
             op_id: _,
             workspace_id,
@@ -1659,7 +1670,7 @@ fn message_body_text_for_matching(msg: &MessageRecord) -> Option<String> {
         })
 }
 
-fn upsert_message_in_state(state: &mut UiState, message: MessageRecord) {
+fn upsert_message_in_state(state: &mut UiState, mut message: MessageRecord) {
     if state.timeline.conversation_id.as_ref() != Some(&message.conversation_id) {
         // Keep the active timeline stable; incoming events for other conversations
         // should not force navigation.
@@ -1694,6 +1705,7 @@ fn upsert_message_in_state(state: &mut UiState, message: MessageRecord) {
         .iter_mut()
         .find(|existing| existing.id == message.id)
     {
+        preserve_local_attachment_sources(existing, &mut message);
         *existing = message.clone();
     } else {
         state.timeline.messages.push(message.clone());
@@ -1711,6 +1723,7 @@ fn upsert_message_in_state(state: &mut UiState, message: MessageRecord) {
                 .iter_mut()
                 .find(|existing| existing.id == message.id)
             {
+                preserve_local_attachment_sources(existing, &mut message);
                 *existing = message.clone();
             } else {
                 state.thread.replies.push(message.clone());
@@ -1743,6 +1756,77 @@ fn replace_pending_message_id(state: &mut UiState, pending_id: &MessageId, _serv
         .thread
         .replies
         .retain(|message| message.id != *pending_id);
+}
+
+fn preserve_local_attachment_sources(
+    existing: &MessageRecord,
+    incoming: &mut MessageRecord,
+) {
+    if existing.attachments.is_empty() || incoming.attachments.is_empty() {
+        return;
+    }
+    for (index, incoming_att) in incoming.attachments.iter_mut().enumerate() {
+        let existing_att = existing
+            .attachments
+            .iter()
+            .find(|candidate| {
+                !candidate.name.is_empty()
+                    && !incoming_att.name.is_empty()
+                    && candidate.name.eq_ignore_ascii_case(&incoming_att.name)
+            })
+            .or_else(|| existing.attachments.get(index));
+        let Some(existing_att) = existing_att else {
+            continue;
+        };
+        let existing_has_local_source = matches!(
+            &existing_att.source,
+            Some(AttachmentSource::LocalPath(p)) if !p.is_empty()
+        );
+        let incoming_source_usable = incoming_att.source.as_ref().is_some_and(|s| match s {
+            AttachmentSource::LocalPath(p) => !p.is_empty(),
+            AttachmentSource::Url(url) => !is_unrenderable_asset_url(url),
+        });
+        if existing_has_local_source && !incoming_source_usable {
+            incoming_att.source = existing_att.source.clone();
+        }
+        let existing_has_local_preview = matches!(
+            &existing_att.preview,
+            Some(preview) if matches!(&preview.source, AttachmentSource::LocalPath(p) if !p.is_empty())
+        );
+        let incoming_preview_usable =
+            incoming_att
+                .preview
+                .as_ref()
+                .is_some_and(|preview| match &preview.source {
+                    AttachmentSource::LocalPath(p) => !p.is_empty(),
+                    AttachmentSource::Url(url) => !is_unrenderable_asset_url(url),
+                });
+        if existing_has_local_preview && !incoming_preview_usable {
+            incoming_att.preview = existing_att.preview.clone();
+        }
+    }
+}
+
+fn is_unrenderable_asset_url(url: &str) -> bool {
+    let lower = url.to_ascii_lowercase();
+    if lower.starts_with("http://127.0.0.1:") || lower.starts_with("http://localhost:") {
+        return true;
+    }
+    let prefix = if lower.starts_with("https://s3.amazonaws.com/") {
+        "https://s3.amazonaws.com/"
+    } else if lower.starts_with("http://s3.amazonaws.com/") {
+        "http://s3.amazonaws.com/"
+    } else {
+        return false;
+    };
+    if lower.contains("x-amz-signature=") || lower.contains("awsaccesskeyid=") {
+        return false;
+    }
+    let path = &url[prefix.len()..];
+    let Some(first_segment) = path.split('/').next() else {
+        return false;
+    };
+    first_segment.len() == 64 && first_segment.chars().all(|ch| ch.is_ascii_hexdigit())
 }
 
 fn merge_pending_message_attachment_sources(

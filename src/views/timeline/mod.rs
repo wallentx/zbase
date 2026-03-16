@@ -385,6 +385,7 @@ impl TimelineList {
                 .child(badge(label.clone(), warning_soft(), warning()))
                 .into_any_element(),
             TimelineRow::SystemEvent(row) => {
+                let row_identity = format!("{:p}", row);
                 let icon = match row.icon {
                     SystemEventIcon::Join => arrow_right_icon(text_secondary()),
                     SystemEventIcon::Leave => arrow_left_icon(text_secondary()),
@@ -395,6 +396,78 @@ impl TimelineList {
                     SystemEventIcon::Settings => sliders_icon(text_secondary()),
                     SystemEventIcon::Info => activity_icon(text_secondary()),
                 };
+                let span_elements: Vec<AnyElement> = row
+                    .spans
+                    .iter()
+                    .enumerate()
+                    .map(|(span_idx, span)| match span {
+                        EventSpan::Actor(name) => div()
+                            .font_weight(FontWeight::MEDIUM)
+                            .child(name.clone())
+                            .into_any_element(),
+                        EventSpan::Text(text) => {
+                            div().child(text.clone()).into_any_element()
+                        }
+                        EventSpan::ChannelLink {
+                            channel_name,
+                            team_name,
+                            conv_id,
+                        } => {
+                            let label = format!("#{channel_name}");
+                            let name = channel_name.clone();
+                            let team = team_name.clone();
+                            let target_conv_id = conv_id.clone();
+                            div()
+                                .id(SharedString::from(format!(
+                                    "channel-link-{row_identity}-{span_idx}-{channel_name}"
+                                )))
+                                .font_weight(FontWeight::MEDIUM)
+                                .text_color(rgb(accent()))
+                                .cursor(gpui::CursorStyle::PointingHand)
+                                .flex()
+                                .items_center()
+                                .hover(|s| s.underline())
+                                .on_mouse_move(cx.listener(|this, _, _, cx| {
+                                    this.clear_hovered_message(cx);
+                                    cx.stop_propagation();
+                                }))
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    this.navigate_to_channel_link(
+                                        &name,
+                                        team.as_deref(),
+                                        target_conv_id.as_ref(),
+                                        window,
+                                        cx,
+                                    );
+                                    cx.stop_propagation();
+                                }))
+                                .child(label)
+                                .into_any_element()
+                        }
+                        EventSpan::UserLink(user_id) => {
+                            let label = user_id.0.clone();
+                            let uid = user_id.clone();
+                            div()
+                                .id(SharedString::from(format!(
+                                    "user-link-{row_identity}-{span_idx}-{}", user_id.0
+                                )))
+                                .font_weight(FontWeight::MEDIUM)
+                                .text_color(rgb(accent()))
+                                .cursor(gpui::CursorStyle::PointingHand)
+                                .hover(|s| s.underline())
+                                .on_mouse_move(cx.listener(|this, _, _, cx| {
+                                    this.clear_hovered_message(cx);
+                                    cx.stop_propagation();
+                                }))
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.open_user_profile_card(uid.clone(), cx);
+                                    cx.stop_propagation();
+                                }))
+                                .child(label)
+                                .into_any_element()
+                        }
+                    })
+                    .collect();
                 div()
                     .w_full()
                     .min_w(px(0.))
@@ -413,17 +486,7 @@ impl TimelineList {
                             .gap_0p5()
                             .text_xs()
                             .text_color(rgb(text_secondary()))
-                            .children(row.spans.iter().map(|span| {
-                                match span {
-                                    EventSpan::Actor(name) => div()
-                                        .font_weight(FontWeight::MEDIUM)
-                                        .child(name.clone())
-                                        .into_any_element(),
-                                    EventSpan::Text(text) => {
-                                        div().child(text.clone()).into_any_element()
-                                    }
-                                }
-                            })),
+                            .children(span_elements),
                     )
                     .into_any_element()
             }
@@ -899,7 +962,15 @@ impl TimelineList {
                             .map(|(index, attachment)| {
                                 let attachment_label = attachment_display_label(attachment);
                                 let header = attachment_header_row(attachment);
-                                let mut card = div().flex().flex_col().gap_0p5().child(header);
+                                let mut card = div()
+                                    .id(SharedString::from(format!(
+                                        "timeline-attachment-{}-{index}",
+                                        message.id.0
+                                    )))
+                                    .flex()
+                                    .flex_col()
+                                    .gap_0p5()
+                                    .child(header);
 
                                 if attachment.kind == AttachmentKind::Image
                                     && let Some(media_source) = attachment_image_source(attachment)
@@ -930,8 +1001,8 @@ impl TimelineList {
                                     );
                                     let lightbox_source = attachment_lightbox_source(attachment);
                                     let lightbox_caption = caption_text.clone();
-                                    let lightbox_width = preview_width;
-                                    let lightbox_height = preview_height;
+                                    let lightbox_width = attachment.width.or(preview_width);
+                                    let lightbox_height = attachment.height.or(preview_height);
                                     card = card.child(
                                         div()
                                             .id(SharedString::from(format!(
@@ -1108,6 +1179,31 @@ impl TimelineList {
                                                 )
                                             }),
                                     );
+                                } else if matches!(
+                                    attachment.kind,
+                                    AttachmentKind::File | AttachmentKind::Audio
+                                ) {
+                                    let file_path =
+                                        attachment.source.as_ref().and_then(|s| match s {
+                                            AttachmentSource::LocalPath(p)
+                                                if !p.trim().is_empty() =>
+                                            {
+                                                Some(p.clone())
+                                            }
+                                            _ => None,
+                                        });
+                                    let file_name = attachment.name.clone();
+                                    if let Some(path) = file_path {
+                                        card = card
+                                            .cursor(gpui::CursorStyle::PointingHand)
+                                            .on_click(cx.listener(move |this, _, _, cx| {
+                                                this.save_attachment_copy(
+                                                    &path,
+                                                    &file_name,
+                                                    cx,
+                                                );
+                                            }));
+                                    }
                                 }
 
                                 card.into_any_element()
@@ -1474,7 +1570,11 @@ impl TimelineList {
                     .zip(hover_window_top)
                     .map(|(anchor_y, window_top)| (anchor_y - window_top).max(0.0));
 
-                let toolbar_visible = is_hovered && hover_toolbar_settled;
+                let any_text_selected = selectable_texts
+                    .values()
+                    .any(|entity| entity.read(cx).has_selection());
+                let toolbar_visible =
+                    is_hovered && hover_toolbar_settled && !any_text_selected;
                 let toolbar_wrapper = div()
                     .absolute()
                     .when_some(toolbar_left, |d, left| d.left(px(left)))

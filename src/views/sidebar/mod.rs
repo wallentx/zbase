@@ -14,9 +14,9 @@ use crate::{
 };
 use gpui::prelude::FluentBuilder;
 use gpui::{
-    AnyElement, AppContext, ClickEvent, Context, FontWeight, InteractiveElement, IntoElement,
-    MouseMoveEvent, ParentElement, Render, SharedString, StatefulInteractiveElement, Styled,
-    Window, div, px, rgb,
+    AnyElement, AppContext, ClickEvent, Context, DragMoveEvent, FontWeight, InteractiveElement,
+    IntoElement, MouseMoveEvent, ParentElement, Render, ScrollHandle, SharedString,
+    StatefulInteractiveElement, Styled, Window, div, px, rgb,
 };
 use std::collections::HashMap;
 
@@ -64,6 +64,8 @@ pub trait SidebarHost: Sized + 'static {
         cx: &mut Context<Self>,
     );
     fn sidebar_navigate_to(&mut self, route: Route, window: &mut Window, cx: &mut Context<Self>);
+    fn sidebar_set_hovered_row(&mut self, label: Option<String>, cx: &mut Context<Self>);
+    fn sidebar_hovered_row(&self) -> Option<&str>;
 }
 
 impl Sidebar {
@@ -75,6 +77,8 @@ impl Sidebar {
         current_user_avatar_asset: Option<&str>,
         dm_avatar_assets: &HashMap<String, String>,
         current_route: &Route,
+        hovered_row: Option<&str>,
+        scroll_handle: &ScrollHandle,
         cx: &mut Context<H>,
     ) -> AnyElement {
         let connectivity_tint = match connectivity {
@@ -82,6 +86,8 @@ impl Sidebar {
             Connectivity::Reconnecting => 0xf59e0b,
             Connectivity::Offline => 0xef4444,
         };
+
+        let drag_scroll_handle = scroll_handle.clone();
 
         div()
             .w(px(sidebar.width_px))
@@ -104,6 +110,10 @@ impl Sidebar {
                     .id("sidebar-sections-scroll")
                     .overflow_y_scroll()
                     .scrollbar_width(px(8.))
+                    .track_scroll(scroll_handle)
+                    .on_drag_move::<DraggedSection>(move |event, _, _| {
+                        Self::auto_scroll_during_drag(event, &drag_scroll_handle);
+                    })
                     .pr_2()
                     .pt_2()
                     .children(sidebar.sections.iter().map(|section| {
@@ -112,6 +122,7 @@ impl Sidebar {
                             &section.rows,
                             dm_avatar_assets,
                             current_route,
+                            hovered_row,
                             cx,
                         )
                     })),
@@ -241,11 +252,39 @@ impl Sidebar {
             .into_any_element()
     }
 
+    fn auto_scroll_during_drag(
+        event: &DragMoveEvent<DraggedSection>,
+        scroll_handle: &ScrollHandle,
+    ) {
+        let edge_zone = px(40.);
+        let max_speed = px(8.);
+
+        let mouse_y = event.event.position.y;
+        let top = event.bounds.top();
+        let bottom = event.bounds.bottom();
+
+        let delta = if mouse_y < top + edge_zone {
+            let proximity = (top + edge_zone - mouse_y) / edge_zone;
+            max_speed * proximity.clamp(0.0, 1.0)
+        } else if mouse_y > bottom - edge_zone {
+            let proximity = (mouse_y - (bottom - edge_zone)) / edge_zone;
+            -(max_speed * proximity.clamp(0.0, 1.0))
+        } else {
+            return;
+        };
+
+        let mut offset = scroll_handle.offset();
+        let max = scroll_handle.max_offset();
+        offset.y = (offset.y + delta).clamp(-max.height, px(0.));
+        scroll_handle.set_offset(offset);
+    }
+
     fn render_section<H: SidebarHost>(
         section: &SidebarSection,
         visible_rows: &[SidebarRow],
         dm_avatar_assets: &HashMap<String, String>,
         current_route: &Route,
+        hovered_row: Option<&str>,
         cx: &mut Context<H>,
     ) -> AnyElement {
         let section_id = section.id.clone();
@@ -265,13 +304,14 @@ impl Sidebar {
                     )))
                     .flex()
                     .items_center()
-                    .justify_between()
+                    .gap_1()
                     .text_xs()
                     .font_weight(FontWeight::SEMIBOLD)
                     .text_color(rgb(text_secondary()))
                     .px_2()
                     .py_0p5()
                     .rounded_md()
+                    .cursor_pointer()
                     .when(!is_unread_section, |div| {
                         div.on_click(cx.listener(move |this, _, _, cx| {
                             this.sidebar_toggle_section(section_id.clone(), cx);
@@ -298,8 +338,8 @@ impl Sidebar {
                         ))
                     })
                     .child(section.title.clone())
-                    .when(!is_unread_section, |div| {
-                        div.child(if section.collapsed {
+                    .when(!is_unread_section, |el| {
+                        el.child(if section.collapsed {
                             chevron_right_icon(text_secondary())
                         } else {
                             chevron_down_icon(text_secondary())
@@ -308,7 +348,7 @@ impl Sidebar {
             )
             .when(is_unread_section || !section.collapsed, |div| {
                 div.children(visible_rows.iter().map(|row| {
-                    Self::render_row(&section.id, row, dm_avatar_assets, current_route, cx)
+                    Self::render_row(&section.id, row, dm_avatar_assets, current_route, hovered_row, cx)
                 }))
             })
             .into_any_element()
@@ -319,6 +359,7 @@ impl Sidebar {
         row: &SidebarRow,
         dm_avatar_assets: &HashMap<String, String>,
         current_route: &Route,
+        hovered_row: Option<&str>,
         cx: &mut Context<H>,
     ) -> AnyElement {
         let selected = &row.route == current_route;
@@ -326,6 +367,8 @@ impl Sidebar {
         let has_mention = row.mention_count > 0;
         let route_label = row.route.label();
         let route = row.route.clone();
+        let is_hovered = hovered_row == Some(route_label.as_str());
+        let hover_label = route_label.clone();
 
         div()
             // Rows can appear in multiple sections (e.g. Unread + Channels/DMs). Keep ids unique so
@@ -336,12 +379,22 @@ impl Sidebar {
             )))
             .w_full()
             .rounded_md()
-            .hover(|s| s.bg(subtle_surface()))
             .px_2()
             .py_1()
             .flex()
             .items_center()
             .justify_between()
+            .cursor_pointer()
+            .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
+                this.sidebar_set_hovered_row(
+                    if *hovered {
+                        Some(hover_label.clone())
+                    } else {
+                        None
+                    },
+                    cx,
+                );
+            }))
             .on_click(cx.listener(move |this, _, window, cx| {
                 this.sidebar_navigate_to(route.clone(), window, cx);
             }))
@@ -351,7 +404,9 @@ impl Sidebar {
                     .items_center()
                     .gap_1p5()
                     .text_xs()
-                    .when(selected || has_unread, |d| d.font_weight(FontWeight::BOLD))
+                    .when(selected || has_unread || is_hovered, |d| {
+                        d.font_weight(FontWeight::BOLD)
+                    })
                     .text_color(rgb(if selected { accent() } else { text_primary() }))
                     .child(Self::leading_element(
                         row,

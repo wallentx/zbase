@@ -163,6 +163,23 @@ pub enum RoutedBackendCommand {
         account_id: AccountId,
         user_id: UserId,
     },
+    ResolveChannel {
+        account_id: AccountId,
+        workspace: ProviderWorkspaceRef,
+        team_name: String,
+        channel_name: String,
+        workspace_id: WorkspaceId,
+    },
+    ResolveChannelById {
+        account_id: AccountId,
+        conversation: ProviderConversationRef,
+        workspace_id: WorkspaceId,
+    },
+    JoinChannel {
+        account_id: AccountId,
+        conversation: ProviderConversationRef,
+        workspace_id: WorkspaceId,
+    },
 }
 
 pub trait ChatBackend: Send {

@@ -209,6 +209,14 @@ impl LocalStore {
         Ok(Self { db })
     }
 
+    pub fn load_account_display_name(&self) -> Option<String> {
+        let meta_cf = self.cf(CF_META).ok()?;
+        let meta_bytes = self.db.get_cf(&meta_cf, META_KEY).ok()??;
+        let meta: CachedMeta = decode(&meta_bytes).ok()?;
+        meta.account_display_name
+            .filter(|name| !name.trim().is_empty())
+    }
+
     pub fn load_bootstrap_seed(
         &self,
         conversation_limit: usize,
