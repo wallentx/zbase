@@ -149,9 +149,14 @@ impl CodeLanguage {
     }
 }
 
+const MIN_KEYWORD_SCORE: i32 = 2;
+
 pub fn detect_language(code: &str) -> Option<CodeLanguage> {
     let trimmed = code.trim_start();
     if trimmed.is_empty() {
+        return None;
+    }
+    if looks_like_prose(trimmed) {
         return None;
     }
     if trimmed.starts_with('{') || trimmed.starts_with('[') {
@@ -159,7 +164,9 @@ pub fn detect_language(code: &str) -> Option<CodeLanguage> {
             return Some(CodeLanguage::Json);
         }
     }
-    if trimmed.starts_with("---") || trimmed.contains("\n---") {
+    if (trimmed.starts_with("---") || trimmed.contains("\n---"))
+        && has_yaml_key_value_lines(trimmed)
+    {
         return Some(CodeLanguage::Yaml);
     }
     if trimmed.starts_with("#!") {
@@ -168,7 +175,6 @@ pub fn detect_language(code: &str) -> Option<CodeLanguage> {
     if is_probably_toml(trimmed) {
         return Some(CodeLanguage::Toml);
     }
-    // Keyword scoring fallback for common languages.
     let lower = trimmed.to_ascii_lowercase();
     let mut scored = [
         (
@@ -176,7 +182,8 @@ pub fn detect_language(code: &str) -> Option<CodeLanguage> {
             score_keywords(
                 &lower,
                 &[
-                    "fn ", "let ", "impl ", "match ", "use ", "pub ", "crate::", "self",
+                    "fn ", "let ", "impl ", "match ", "pub fn", "crate::", "mut ", "&self",
+                    "use std::", "-> ", "pub struct", "enum ",
                 ],
             ),
         ),
@@ -185,7 +192,8 @@ pub fn detect_language(code: &str) -> Option<CodeLanguage> {
             score_keywords(
                 &lower,
                 &[
-                    "def ", "import ", "from ", "self", "elif ", "none", "true", "false",
+                    "def ", "import ", "elif ", "print(", "class ", "__init__", "self.",
+                    "return ", "lambda ", "except ",
                 ],
             ),
         ),
@@ -196,11 +204,13 @@ pub fn detect_language(code: &str) -> Option<CodeLanguage> {
                 &[
                     "function ",
                     "const ",
-                    "let ",
                     "=>",
-                    "import ",
                     "export ",
                     "console.",
+                    "require(",
+                    "async ",
+                    "await ",
+                    "document.",
                 ],
             ),
         ),
@@ -210,11 +220,14 @@ pub fn detect_language(code: &str) -> Option<CodeLanguage> {
                 &lower,
                 &[
                     "interface ",
-                    "type ",
                     "implements ",
                     "readonly ",
-                    ": ",
                     "as const",
+                    "export type",
+                    "export interface",
+                    ": string",
+                    ": number",
+                    ": boolean",
                 ],
             ),
         ),
@@ -222,7 +235,9 @@ pub fn detect_language(code: &str) -> Option<CodeLanguage> {
             CodeLanguage::Go,
             score_keywords(
                 &lower,
-                &["func ", "package ", "import ", ":=", "defer ", "go "],
+                &[
+                    "func ", "package ", ":=", "defer ", "go ", "fmt.", "chan ", "goroutine",
+                ],
             ),
         ),
         (
@@ -230,14 +245,14 @@ pub fn detect_language(code: &str) -> Option<CodeLanguage> {
             score_keywords(
                 &lower,
                 &[
-                    "select ", "from ", "where ", "join ", "group by", "order by", "insert ",
-                    "update ", "delete ",
+                    "select ", "where ", "join ", "group by", "order by", "insert into",
+                    "create table", "alter table", "drop table",
                 ],
             ),
         ),
     ];
     scored.sort_by(|a, b| b.1.cmp(&a.1));
-    (scored[0].1 > 0).then_some(scored[0].0)
+    (scored[0].1 >= MIN_KEYWORD_SCORE).then_some(scored[0].0)
 }
 
 pub fn resolve_language(explicit: Option<&str>, code: &str) -> Option<CodeLanguage> {
@@ -450,40 +465,85 @@ fn push_merged(out: &mut Vec<StyledRange>, next: StyledRange) {
 }
 
 fn is_probably_json(text: &str) -> bool {
-    // Very cheap heuristic: must contain either ':' (object) or ',' (array/object), and use double quotes for keys.
     let bytes = text.as_bytes();
-    let mut saw_double_quote = false;
-    let mut saw_colon = false;
-    let mut saw_comma = false;
+    let mut quote_count = 0u32;
+    let mut colon_count = 0u32;
+    let mut brace_bracket_count = 0u32;
     for &b in bytes.iter().take(2048) {
         match b {
-            b'"' => saw_double_quote = true,
-            b':' => saw_colon = true,
-            b',' => saw_comma = true,
+            b'"' => quote_count += 1,
+            b':' => colon_count += 1,
+            b'{' | b'}' | b'[' | b']' => brace_bracket_count += 1,
             _ => {}
         }
     }
-    saw_double_quote && (saw_colon || saw_comma)
+    quote_count >= 2 && colon_count >= 1 && brace_bracket_count >= 2
 }
 
 fn is_probably_toml(text: &str) -> bool {
-    // TOML commonly has `key = value` and section headers like `[section]`.
     let sample = text.lines().take(40).collect::<Vec<_>>();
-    let mut saw_assignment = false;
+    let mut assignment_count = 0;
     let mut saw_section = false;
-    for line in sample {
+    for line in &sample {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
-        if line.starts_with('[') && line.ends_with(']') {
+        if line.starts_with('[') && line.ends_with(']') && !line.contains(' ') {
             saw_section = true;
         }
-        if line.contains('=') {
-            saw_assignment = true;
+        if let Some(eq_pos) = line.find('=') {
+            let key = line[..eq_pos].trim();
+            if !key.is_empty()
+                && !key.contains(' ')
+                && key.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '-' || c == '.')
+            {
+                assignment_count += 1;
+            }
         }
     }
-    saw_assignment && (saw_section || text.contains('\n'))
+    saw_section && assignment_count >= 2
+}
+
+fn looks_like_prose(text: &str) -> bool {
+    let lines: Vec<&str> = text.lines().take(30).collect();
+    if lines.is_empty() {
+        return false;
+    }
+    let mut total_words = 0usize;
+    let mut long_words = 0usize;
+    for line in &lines {
+        for word in line.split_whitespace() {
+            let alpha: String = word.chars().filter(|c| c.is_alphabetic()).collect();
+            if alpha.len() >= 2 {
+                total_words += 1;
+                if alpha.len() >= 4 {
+                    long_words += 1;
+                }
+            }
+        }
+    }
+    if total_words < 8 {
+        return false;
+    }
+    let has_sentence_punctuation = text.contains(". ") || text.contains("? ") || text.contains("! ");
+    let long_word_ratio = long_words as f64 / total_words as f64;
+    let avg_words_per_line = total_words as f64 / lines.len() as f64;
+    has_sentence_punctuation && long_word_ratio > 0.6 && avg_words_per_line > 5.0
+}
+
+fn has_yaml_key_value_lines(text: &str) -> bool {
+    let mut kv_count = 0;
+    for line in text.lines().take(30) {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') || trimmed == "---" {
+            continue;
+        }
+        if trimmed.contains(": ") || trimmed.ends_with(':') {
+            kv_count += 1;
+        }
+    }
+    kv_count >= 2
 }
 
 fn score_keywords(lower: &str, tokens: &[&str]) -> i32 {

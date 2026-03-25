@@ -215,6 +215,16 @@ pub fn text_primary() -> u32 {
     palette().text_primary
 }
 
+pub fn mono_font_family() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "Menlo"
+    } else if cfg!(target_os = "windows") {
+        "Consolas"
+    } else {
+        "monospace"
+    }
+}
+
 pub fn text_secondary() -> u32 {
     palette().text_secondary
 }
@@ -549,13 +559,35 @@ pub fn attachment_display_label(attachment: &AttachmentSummary) -> String {
     }
 }
 
+pub fn attachment_is_animated_gif(attachment: &AttachmentSummary) -> bool {
+    let name_lower = attachment.name.to_ascii_lowercase();
+    if name_lower.ends_with(".gif") {
+        return true;
+    }
+    if let Some(ref mime) = attachment.mime_type {
+        if mime.eq_ignore_ascii_case("image/gif") {
+            return true;
+        }
+    }
+    false
+}
+
 pub fn attachment_image_source(attachment: &AttachmentSummary) -> Option<ImageSource> {
-    attachment
-        .preview
-        .as_ref()
-        .map(|preview| preview.source.clone())
-        .or_else(|| attachment.source.as_ref().cloned())
-        .and_then(|source| image_source_from_attachment_source(&source))
+    if attachment_is_animated_gif(attachment) {
+        attachment
+            .source
+            .as_ref()
+            .cloned()
+            .or_else(|| attachment.preview.as_ref().map(|p| p.source.clone()))
+            .and_then(|source| image_source_from_attachment_source(&source))
+    } else {
+        attachment
+            .preview
+            .as_ref()
+            .map(|preview| preview.source.clone())
+            .or_else(|| attachment.source.as_ref().cloned())
+            .and_then(|source| image_source_from_attachment_source(&source))
+    }
 }
 
 pub fn attachment_lightbox_source(attachment: &AttachmentSummary) -> Option<AttachmentSource> {
@@ -586,6 +618,17 @@ pub fn attachment_open_target(attachment: &AttachmentSummary) -> Option<String> 
         .as_ref()
         .or_else(|| attachment.preview.as_ref().map(|preview| &preview.source))
         .and_then(attachment_source_to_open_target)
+}
+
+pub fn attachment_local_path(attachment: &AttachmentSummary) -> Option<String> {
+    attachment
+        .source
+        .as_ref()
+        .or_else(|| attachment.preview.as_ref().map(|p| &p.source))
+        .and_then(|source| match source {
+            AttachmentSource::LocalPath(p) if !p.trim().is_empty() => Some(p.clone()),
+            _ => None,
+        })
 }
 
 fn attachment_source_to_image_source(source: &AttachmentSource) -> Option<ImageSource> {

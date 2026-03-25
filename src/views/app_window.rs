@@ -4048,6 +4048,7 @@ impl AppWindow {
         }
         if route_changed {
             self.models.navigate_to(route.clone());
+            self.sync_models_from_store();
         }
         self.dispatch_ui_action(UiAction::Navigate(route.clone()));
         if let Some(conversation_id) = conversation_id_from_navigated_route(&route) {

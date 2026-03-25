@@ -13214,12 +13214,16 @@ fn parse_code_fragment_at(body: &str, backtick_index: usize) -> Option<(MessageF
         let fence_body = &body[start..end];
         let (lang, content_start) = if let Some(nl_rel) = fence_body.find('\n') {
             let info = fence_body[..nl_rel].trim();
-            let lang = info
-                .split_whitespace()
-                .next()
-                .filter(|s| !s.is_empty())
-                .map(|s| s.to_ascii_lowercase());
-            (lang, start + nl_rel + 1)
+            if info.is_empty() {
+                (None, start + nl_rel + 1)
+            } else {
+                let candidate = info.split_whitespace().next().unwrap_or("");
+                if crate::views::code_highlight::CodeLanguage::from_tag(candidate).is_some() {
+                    (Some(candidate.to_ascii_lowercase()), start + nl_rel + 1)
+                } else {
+                    (None, start)
+                }
+            }
         } else {
             (None, start)
         };

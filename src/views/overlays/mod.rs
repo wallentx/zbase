@@ -236,6 +236,7 @@ impl OverlayHost {
                             .justify_center()
                             .child(
                                 img(image_source)
+                                    .id("lightbox-image")
                                     .w(px(frame_width))
                                     .h(px(frame_height))
                                     .object_fit(ObjectFit::Contain)

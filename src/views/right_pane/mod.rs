@@ -23,13 +23,14 @@ use crate::{
         RIGHT_PANE_RESIZE_HANDLE_WIDTH_PX, accent, accent_soft,
         app_window::{AppWindow, video_preview_cache_key},
         attachment_display_label, attachment_header_row, attachment_image_source,
-        attachment_lightbox_source, attachment_open_target,
+        attachment_lightbox_source, attachment_local_path, attachment_open_target,
         avatar::{Avatar, default_avatar_background},
         badge, border, chevron_down_icon, close_icon, crown_icon, danger, danger_soft, emoji_icon,
         format_duration_ms, glass_surface_strong,
         inline_markdown::{InlineMarkdownConfig, apply_inline_markdown, remap_source_byte_range},
         input::TextField,
-        is_dark_theme, mention_colors_for_user, mention_soft, panel_alt_bg, panel_alt_surface,
+        is_dark_theme, mention_colors_for_user, mention_soft, mono_font_family, panel_alt_bg,
+        panel_alt_surface,
         play_icon,
         selectable_text::{
             InlineAttachment, LinkRange, SelectableText, StyledRange, resolve_selectable_text,
@@ -465,7 +466,27 @@ fn render_parent_message(
                                 .enumerate()
                                 .map(|(index, attachment)| {
                                     let attachment_label = attachment_display_label(attachment);
-                                    let header = attachment_header_row(attachment);
+                                    let local_path = attachment_local_path(attachment);
+                                    let header = {
+                                        let base = attachment_header_row(attachment);
+                                        if let Some(ref path) = local_path {
+                                            let p = path.clone();
+                                            let fname = attachment.name.clone();
+                                            div()
+                                                .id(SharedString::from(format!(
+                                                    "rp-att-hdr-{}-{index}",
+                                                    message.id.0
+                                                )))
+                                                .cursor(gpui::CursorStyle::PointingHand)
+                                                .on_click(cx.listener(move |this, _, _, cx| {
+                                                    this.save_attachment_copy(&p, &fname, cx);
+                                                }))
+                                                .child(base)
+                                                .into_any_element()
+                                        } else {
+                                            base
+                                        }
+                                    };
                                     let mut card = div().flex().flex_col().gap_0p5().child(header);
 
                                     if attachment.kind == AttachmentKind::Image
@@ -522,6 +543,10 @@ fn render_parent_message(
                                                 )
                                                 .child(
                                                     img(media_source)
+                                                        .id(SharedString::from(format!(
+                                                            "rp-img-{}-{index}",
+                                                            message.id.0
+                                                        )))
                                                         .w(px(media_width))
                                                         .h(px(media_height))
                                                         .rounded_md()
@@ -2136,7 +2161,35 @@ fn render_fragment(
                 .child(selectable)
                 .into_any_element()
         }
-        MessageFragment::Code { text, .. } | MessageFragment::Quote(text) => {
+        MessageFragment::Code { text, .. } => {
+            let selectable = if compact_inline {
+                resolve_selectable_text_inline(
+                    selectable_texts,
+                    format!("right-pane-{message_key}-{index}"),
+                    text.clone(),
+                    Vec::new(),
+                    Vec::new(),
+                    cx,
+                )
+            } else {
+                resolve_selectable_text(
+                    selectable_texts,
+                    format!("right-pane-{message_key}-{index}"),
+                    text.clone(),
+                    Vec::new(),
+                    Vec::new(),
+                    cx,
+                )
+            };
+            div()
+                .text_sm()
+                .font_family(mono_font_family())
+                .line_height(px(22.))
+                .text_color(rgb(text_primary()))
+                .child(selectable)
+                .into_any_element()
+        }
+        MessageFragment::Quote(text) => {
             let selectable = if compact_inline {
                 resolve_selectable_text_inline(
                     selectable_texts,
@@ -2189,6 +2242,7 @@ fn render_fragment(
                 .rounded_sm()
                 .bg(subtle_surface())
                 .text_sm()
+                .font_family(mono_font_family())
                 .line_height(px(22.))
                 .text_color(rgb(text_primary()))
                 .child(selectable)
