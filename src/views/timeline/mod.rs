@@ -16,12 +16,12 @@ use crate::{
         affinity_positive,
         app_window::{AppWindow, video_preview_cache_key},
         arrow_left_icon, arrow_right_icon, attachment_display_label, attachment_header_row,
-        attachment_image_source, attachment_lightbox_source,
+        attachment_image_source, attachment_lightbox_source, attachment_local_path,
         avatar::{Avatar, default_avatar_background},
         badge, clipboard_icon, copy_icon, crown_icon, danger, format_duration_ms,
         glass_surface_dark, hash_icon,
         inline_markdown::{InlineMarkdownConfig, apply_inline_markdown, remap_source_byte_range},
-        mention_soft, panel_alt_bg, panel_bg, pin_icon, play_icon, plus_icon,
+        mention_soft, mono_font_family, panel_alt_bg, panel_bg, pin_icon, play_icon, plus_icon,
         selectable_text::{
             InlineAttachment, LinkRange, SelectableText, StyledRange, resolve_selectable_text,
             resolve_selectable_text_inline, resolve_selectable_text_with_attachments,
@@ -961,7 +961,27 @@ impl TimelineList {
                             .enumerate()
                             .map(|(index, attachment)| {
                                 let attachment_label = attachment_display_label(attachment);
-                                let header = attachment_header_row(attachment);
+                                let local_path = attachment_local_path(attachment);
+                                let header = {
+                                    let base = attachment_header_row(attachment);
+                                    if let Some(ref path) = local_path {
+                                        let p = path.clone();
+                                        let fname = attachment.name.clone();
+                                        div()
+                                            .id(SharedString::from(format!(
+                                                "tl-att-hdr-{}-{index}",
+                                                message.id.0
+                                            )))
+                                            .cursor(gpui::CursorStyle::PointingHand)
+                                            .on_click(cx.listener(move |this, _, _, cx| {
+                                                this.save_attachment_copy(&p, &fname, cx);
+                                            }))
+                                            .child(base)
+                                            .into_any_element()
+                                    } else {
+                                        base
+                                    }
+                                };
                                 let mut card = div()
                                     .id(SharedString::from(format!(
                                         "timeline-attachment-{}-{index}",
@@ -1043,6 +1063,10 @@ impl TimelineList {
                                             })
                                             .child(
                                                 img(media_source)
+                                                    .id(SharedString::from(format!(
+                                                        "timeline-img-{}-{index}",
+                                                        message.id.0
+                                                    )))
                                                     .w(px(media_width))
                                                     .h(px(media_height))
                                                     .rounded_md()
@@ -1179,31 +1203,6 @@ impl TimelineList {
                                                 )
                                             }),
                                     );
-                                } else if matches!(
-                                    attachment.kind,
-                                    AttachmentKind::File | AttachmentKind::Audio
-                                ) {
-                                    let file_path =
-                                        attachment.source.as_ref().and_then(|s| match s {
-                                            AttachmentSource::LocalPath(p)
-                                                if !p.trim().is_empty() =>
-                                            {
-                                                Some(p.clone())
-                                            }
-                                            _ => None,
-                                        });
-                                    let file_name = attachment.name.clone();
-                                    if let Some(path) = file_path {
-                                        card = card
-                                            .cursor(gpui::CursorStyle::PointingHand)
-                                            .on_click(cx.listener(move |this, _, _, cx| {
-                                                this.save_attachment_copy(
-                                                    &path,
-                                                    &file_name,
-                                                    cx,
-                                                );
-                                            }));
-                                    }
                                 }
 
                                 card.into_any_element()
@@ -1549,7 +1548,7 @@ impl TimelineList {
 
                 const TOOLBAR_W: f32 = 260.0;
                 const TOOLBAR_H: f32 = 30.0;
-                const TOOLBAR_X_GAP: f32 = 10.0;
+                const TOOLBAR_X_GAP: f32 = 12.0;
 
                 let toolbar_left = hover_anchor_x
                     .zip(hover_window_left)
@@ -1568,7 +1567,9 @@ impl TimelineList {
 
                 let toolbar_top = hover_anchor_y
                     .zip(hover_window_top)
-                    .map(|(anchor_y, window_top)| (anchor_y - window_top).max(0.0));
+                    .map(|(anchor_y, window_top)| {
+                        (anchor_y - window_top - TOOLBAR_H / 2.0).max(0.0)
+                    });
 
                 let any_text_selected = selectable_texts
                     .values()
@@ -2648,6 +2649,7 @@ impl TimelineList {
                     .rounded_sm()
                     .bg(subtle_surface().opacity(0.6))
                     .text_sm()
+                    .font_family(mono_font_family())
                     .line_height(px(22.))
                     .text_color(rgb(text_primary()))
                     .child(selectable)
@@ -2860,6 +2862,7 @@ impl TimelineList {
                     .px_2()
                     .py_1()
                     .text_sm()
+                    .font_family(mono_font_family())
                     .child(resolve_selectable_text_inline(
                         selectable_texts,
                         format!("timeline-{message_key}-code-{index}"),
