@@ -22,8 +22,10 @@ use crate::{
 use gpui::prelude::FluentBuilder;
 use gpui::{
     AnyElement, Context, CursorStyle, Entity, ExternalPaths, FontWeight, InteractiveElement,
-    IntoElement, ListState, ParentElement, StatefulInteractiveElement, Styled, div, px, rgb,
+    IntoElement, ListState, ParentElement, RenderImage, StatefulInteractiveElement, Styled, div,
+    px, rgb,
 };
+use std::{collections::HashMap, collections::HashSet, sync::Arc};
 
 #[derive(Default)]
 pub struct ConversationView;
@@ -41,6 +43,8 @@ impl ConversationView {
         composer: &ComposerModel,
         composer_input: &Entity<TextField>,
         timeline_list_state: &ListState,
+        video_render_cache: &HashMap<String, Arc<RenderImage>>,
+        failed_video_urls: &HashSet<String>,
         unseen_message_count: usize,
         show_jump_to_bottom: bool,
         cx: &mut Context<AppWindow>,
@@ -120,7 +124,13 @@ impl ConversationView {
                     .flex()
                     .flex_col()
                     .overflow_hidden()
-                    .child(TimelineList.render(timeline, timeline_list_state, cx))
+                    .child(TimelineList.render(
+                        timeline,
+                        timeline_list_state,
+                        video_render_cache,
+                        failed_video_urls,
+                        cx,
+                    ))
                     .when_some(timeline.typing_text.clone(), |container, typing_label| {
                         container.child(
                             div()

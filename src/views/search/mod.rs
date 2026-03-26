@@ -20,7 +20,7 @@ use gpui::{
     ObjectFit, ParentElement, RenderImage, SharedString, StatefulInteractiveElement, Styled,
     StyledImage, div, img, px, rgb,
 };
-use std::{collections::HashMap, sync::Arc};
+use std::{collections::{HashMap, HashSet}, sync::Arc};
 
 #[derive(Default)]
 pub struct SearchView;
@@ -30,6 +30,7 @@ impl SearchView {
         &self,
         search: &SearchModel,
         video_render_cache: &HashMap<String, Arc<RenderImage>>,
+        failed_video_urls: &HashSet<String>,
         search_input: &Entity<TextField>,
         cx: &mut Context<AppWindow>,
     ) -> AnyElement {
@@ -130,6 +131,7 @@ impl SearchView {
                             result,
                             search.highlighted_index == Some(index),
                             video_render_cache,
+                            failed_video_urls,
                             cx,
                         )
                     })),
@@ -161,6 +163,7 @@ impl SearchView {
         result: &SearchResult,
         highlighted: bool,
         video_render_cache: &HashMap<String, Arc<RenderImage>>,
+        failed_video_urls: &HashSet<String>,
         cx: &mut Context<AppWindow>,
     ) -> AnyElement {
         let snippet = compact_snippet(&result.snippet, 160);
@@ -228,6 +231,7 @@ impl SearchView {
                     index,
                     &result.message.link_previews,
                     video_render_cache,
+                    failed_video_urls,
                     cx,
                 ))
             })
@@ -254,6 +258,7 @@ fn render_link_previews(
     result_index: usize,
     previews: &[LinkPreview],
     video_render_cache: &HashMap<String, Arc<RenderImage>>,
+    failed_video_urls: &HashSet<String>,
     cx: &mut Context<AppWindow>,
 ) -> AnyElement {
     const MAX_VISIBLE: usize = 1;
@@ -312,23 +317,49 @@ fn render_link_previews(
                                 .w(px(media_width))
                                 .h(px(media_height))
                                 .object_fit(ObjectFit::Contain)
+                                .into_any_element()
                         } else {
-                            img(SharedString::from(media_source))
-                                .id(image_element_id.clone())
-                                .w(px(media_width))
-                                .h(px(media_height))
-                                .object_fit(ObjectFit::Contain)
-                                .with_fallback({
+                            let failed = failed_video_urls.contains(&media_source);
+                            let image_source = (!failed).then(|| ImageSource::from(media_source));
+
+                            div()
+                                .size_full()
+                                .when_some(image_source, |d, source| {
+                                    d.child(
+                                        img(source)
+                                            .id(image_element_id.clone())
+                                            .w(px(media_width))
+                                            .h(px(media_height))
+                                            .object_fit(ObjectFit::Contain)
+                                            .with_fallback({
+                                                let site = preview.site.clone().unwrap_or_else(|| {
+                                                    "media".to_string()
+                                                });
+                                                move || {
+                                                    div()
+                                                        .text_xs()
+                                                        .text_color(rgb(text_secondary()))
+                                                        .child(site.clone())
+                                                        .into_any_element()
+                                                }
+                                            }),
+                                    )
+                                })
+                                .when(failed, |d| {
                                     let site =
                                         preview.site.clone().unwrap_or_else(|| "media".to_string());
-                                    move || {
+                                    d.child(
                                         div()
+                                            .size_full()
+                                            .flex()
+                                            .items_center()
+                                            .justify_center()
                                             .text_xs()
                                             .text_color(rgb(text_secondary()))
-                                            .child(site.clone())
-                                            .into_any_element()
-                                    }
+                                            .child(site),
+                                    )
                                 })
+                                .into_any_element()
                         }
                     })
                     .when(preview.is_video, |container| {

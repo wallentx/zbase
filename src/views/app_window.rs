@@ -94,7 +94,7 @@ const ENV_BENCH_THREAD_ROOT_ID: &str = "ZBASE_BENCH_THREAD_ROOT_ID";
 const ENV_BENCH_THREAD_ROOT_IDS: &str = "ZBASE_BENCH_THREAD_ROOT_IDS";
 const ENV_BENCH_EXIT_ON_STOP: &str = "ZBASE_BENCH_EXIT_ON_STOP";
 const ENV_THREAD_OPEN_PROFILE: &str = "ZBASE_THREAD_OPEN_PROFILE";
-const BACKEND_POLL_BOOT_INTERVAL: Duration = Duration::from_millis(16);
+const BACKEND_POLL_BOOT_INTERVAL: Duration = Duration::from_millis(50);
 const BACKEND_POLL_READY_INTERVAL: Duration = Duration::from_millis(200);
 const QUICK_SWITCHER_REMOTE_MIN_QUERY_CHARS: usize = 2;
 const QUICK_SWITCHER_CORPUS_REBUILD_COALESCE: Duration = Duration::from_millis(180);
@@ -270,6 +270,7 @@ pub struct AppWindow {
     video_render_cache: HashMap<String, Arc<RenderImage>>,
     video_cache_order: VecDeque<String>,
     video_pending_urls: HashSet<String>,
+    failed_video_urls: HashSet<String>,
     video_result_sender: Sender<VideoDecodeOutcome>,
     video_result_receiver: Receiver<VideoDecodeOutcome>,
     preview_summaries: HashMap<ConversationId, (ConversationSummary, bool)>,
@@ -728,6 +729,7 @@ impl AppWindow {
             video_render_cache: HashMap::new(),
             video_cache_order: VecDeque::new(),
             video_pending_urls: HashSet::new(),
+            failed_video_urls: HashSet::new(),
             video_result_sender,
             video_result_receiver,
             preview_summaries: HashMap::new(),
@@ -1484,6 +1486,8 @@ impl AppWindow {
             if let Some(render_image) = outcome.render_image {
                 self.insert_video_render_cache_entry(outcome.cache_key, render_image);
                 changed = true;
+            } else {
+                self.failed_video_urls.insert(outcome.cache_key);
             }
         }
         changed
@@ -1582,6 +1586,7 @@ impl AppWindow {
             };
             let cache_key = video_preview_cache_key(&video_url);
             if self.video_render_cache.contains_key(&cache_key)
+                || self.failed_video_urls.contains(&cache_key)
                 || !self.video_pending_urls.insert(cache_key.clone())
             {
                 continue;
@@ -4640,6 +4645,7 @@ impl AppWindow {
                 &mut self.timeline_row_render_cache,
                 find_query,
                 &self.video_render_cache,
+                &self.failed_video_urls,
                 &mut self.code_highlight_cache,
                 &mut self.selectable_texts,
                 cx,
@@ -7977,6 +7983,7 @@ impl Render for AppWindow {
                     &self.models.search,
                     &self.models.timeline,
                     &self.video_render_cache,
+                    &self.failed_video_urls,
                     &mut self.code_highlight_cache,
                     &mut self.selectable_texts,
                     &self.thread_input,
@@ -8153,6 +8160,7 @@ impl Render for AppWindow {
                     let el = MainPanelHost.render(
                         &self.models,
                         &self.video_render_cache,
+                        &self.failed_video_urls,
                         &self.search_input,
                         &self.find_in_chat_input,
                         &self.composer_input,

@@ -11,7 +11,7 @@ use gpui::{
     AnyElement, Context, Entity, IntoElement, ListState, ParentElement, RenderImage, Styled, div,
     px, rgb,
 };
-use std::{collections::HashMap, sync::Arc};
+use std::{collections::HashMap, collections::HashSet, sync::Arc};
 
 #[derive(Default)]
 pub struct MainPanelHost;
@@ -21,6 +21,7 @@ impl MainPanelHost {
         &self,
         models: &AppModels,
         video_render_cache: &HashMap<String, Arc<RenderImage>>,
+        failed_video_urls: &HashSet<String>,
         search_input: &Entity<TextField>,
         find_in_chat_input: &Entity<TextField>,
         composer_input: &Entity<TextField>,
@@ -41,12 +42,20 @@ impl MainPanelHost {
                 &models.composer,
                 composer_input,
                 timeline_list_state,
+                video_render_cache,
+                failed_video_urls,
                 timeline_unseen_count,
                 show_timeline_jump_to_bottom,
                 cx,
             ),
             Route::Search { .. } => {
-                SearchView.render(&models.search, video_render_cache, search_input, cx)
+                SearchView.render(
+                    &models.search,
+                    video_render_cache,
+                    failed_video_urls,
+                    search_input,
+                    cx,
+                )
             }
             Route::Activity { .. } => InboxView.render(&models.notifications, cx),
             Route::Preferences => PreferencesView.render(&models.settings, cx),

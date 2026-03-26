@@ -81,6 +81,7 @@ impl RightPaneHost {
         search: &SearchModel,
         timeline: &TimelineModel,
         video_render_cache: &HashMap<String, Arc<RenderImage>>,
+        failed_video_urls: &HashSet<String>,
         code_highlight_cache: &mut crate::views::code_highlight::CodeHighlightCache,
         selectable_texts: &mut HashMap<String, Entity<SelectableText>>,
         reply_input: &Entity<TextField>,
@@ -97,6 +98,7 @@ impl RightPaneHost {
                 thread,
                 timeline,
                 video_render_cache,
+                failed_video_urls,
                 code_highlight_cache,
                 selectable_texts,
                 reply_input,
@@ -110,7 +112,7 @@ impl RightPaneHost {
             RightPaneMode::Members => render_members_panel(conversation, cx),
             RightPaneMode::Files => render_files_panel(timeline, cx),
             RightPaneMode::Search => {
-                render_search_panel(conversation, search, video_render_cache, cx)
+                render_search_panel(conversation, search, video_render_cache, failed_video_urls, cx)
             }
             RightPaneMode::Profile(_) => crate::views::profile::render_profile_panel(
                 profile_panel,
@@ -175,6 +177,7 @@ impl ThreadPane {
         thread: &ThreadPaneModel,
         timeline: &TimelineModel,
         video_render_cache: &HashMap<String, Arc<RenderImage>>,
+        failed_video_urls: &HashSet<String>,
         code_highlight_cache: &mut crate::views::code_highlight::CodeHighlightCache,
         selectable_texts: &mut HashMap<String, Entity<SelectableText>>,
         reply_input: &Entity<TextField>,
@@ -257,6 +260,7 @@ impl ThreadPane {
                                 &timeline_row,
                                 thread_media_max_width,
                                 video_render_cache,
+                                failed_video_urls,
                                 code_highlight_cache,
                                 selectable_texts,
                                 cx,
@@ -371,6 +375,7 @@ fn render_parent_message(
     emoji_index: &HashMap<String, InlineEmojiRender>,
     emoji_source_index: &HashMap<String, InlineEmojiRender>,
     video_render_cache: &HashMap<String, Arc<RenderImage>>,
+    failed_video_urls: &HashSet<String>,
     selectable_texts: &mut HashMap<String, Entity<SelectableText>>,
     cx: &mut Context<AppWindow>,
 ) -> AnyElement {
@@ -443,6 +448,7 @@ fn render_parent_message(
                         &message.id.0,
                         &message.link_previews,
                         video_render_cache,
+                        failed_video_urls,
                         cx,
                     ))
                 })
@@ -818,6 +824,7 @@ fn render_link_previews(
     message_key: &str,
     previews: &[LinkPreview],
     video_render_cache: &HashMap<String, Arc<RenderImage>>,
+    failed_video_urls: &HashSet<String>,
     cx: &mut Context<AppWindow>,
 ) -> AnyElement {
     const MAX_VISIBLE: usize = 2;
@@ -884,26 +891,52 @@ fn render_link_previews(
                                 .flex_shrink_0()
                                 .min_w(px(16.))
                                 .min_h(px(16.))
+                                .into_any_element()
                         } else {
-                            img(SharedString::from(media_source))
-                                .id(image_element_id.clone())
+                            let failed = failed_video_urls.contains(&media_source);
+                            let image_source = (!failed).then(|| ImageSource::from(media_source));
+
+                            div()
                                 .size_full()
-                                .rounded_md()
-                                .object_fit(ObjectFit::Contain)
-                                .flex_shrink_0()
-                                .min_w(px(16.))
-                                .min_h(px(16.))
-                                .with_fallback({
+                                .when_some(image_source, |d, source| {
+                                    d.child(
+                                        img(source)
+                                            .id(image_element_id.clone())
+                                            .size_full()
+                                            .rounded_md()
+                                            .object_fit(ObjectFit::Contain)
+                                            .flex_shrink_0()
+                                            .min_w(px(16.))
+                                            .min_h(px(16.))
+                                            .with_fallback({
+                                                let site = preview.site.clone().unwrap_or_else(|| {
+                                                    "media".to_string()
+                                                });
+                                                move || {
+                                                    div()
+                                                        .text_xs()
+                                                        .text_color(rgb(text_secondary()))
+                                                        .child(site.clone())
+                                                        .into_any_element()
+                                                }
+                                            }),
+                                    )
+                                })
+                                .when(failed, |d| {
                                     let site =
                                         preview.site.clone().unwrap_or_else(|| "media".to_string());
-                                    move || {
+                                    d.child(
                                         div()
+                                            .size_full()
+                                            .flex()
+                                            .items_center()
+                                            .justify_center()
                                             .text_xs()
                                             .text_color(rgb(text_secondary()))
-                                            .child(site.clone())
-                                            .into_any_element()
-                                    }
+                                            .child(site),
+                                    )
                                 })
+                                .into_any_element()
                         }
                     })
                     .when(preview.is_video, |container| {
@@ -1623,6 +1656,7 @@ fn render_search_panel(
     conversation: &ConversationModel,
     search: &SearchModel,
     _video_render_cache: &HashMap<String, Arc<RenderImage>>,
+    _failed_video_urls: &HashSet<String>,
     cx: &mut Context<AppWindow>,
 ) -> AnyElement {
     let scoped_results = search
