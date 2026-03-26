@@ -158,7 +158,10 @@ impl ConversationView {
             .into_any_element()
     }
 
-    fn render_join_bar(conversation: &ConversationModel, cx: &mut Context<AppWindow>) -> AnyElement {
+    fn render_join_bar(
+        conversation: &ConversationModel,
+        cx: &mut Context<AppWindow>,
+    ) -> AnyElement {
         let channel_label = conversation.summary.title.trim();
         let join_label = if channel_label.is_empty() {
             "Join Channel".to_string()

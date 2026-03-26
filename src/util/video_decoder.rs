@@ -234,15 +234,10 @@ pub fn extract_video_thumbnail_to_file(
         if decoder.send_packet(&packet).is_err() {
             continue;
         }
-        if decoder.receive_frame(&mut decoded_frame).is_ok() {
-            if scaler.run(&decoded_frame, &mut converted).is_ok() {
-                return write_frame_as_png(
-                    &converted,
-                    target_width,
-                    target_height,
-                    output_png_path,
-                );
-            }
+        if decoder.receive_frame(&mut decoded_frame).is_ok()
+            && scaler.run(&decoded_frame, &mut converted).is_ok()
+        {
+            return write_frame_as_png(&converted, target_width, target_height, output_png_path);
         }
     }
 

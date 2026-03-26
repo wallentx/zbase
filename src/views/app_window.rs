@@ -75,10 +75,10 @@ use gpui::{
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     env,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{
         Arc,
-        mpsc::{self, Receiver, Sender, TryRecvError},
+        mpsc::{self, Receiver, Sender},
     },
     thread,
     time::{Duration, Instant},
@@ -184,7 +184,7 @@ fn quick_switcher_remote_debounce(conversation_count: usize) -> Duration {
     }
 }
 
-fn unique_copy_destination(downloads_dir: &PathBuf, preferred_name: &str) -> PathBuf {
+fn unique_copy_destination(downloads_dir: &Path, preferred_name: &str) -> PathBuf {
     let candidate = downloads_dir.join(preferred_name);
     if !candidate.exists() {
         return candidate;
@@ -1479,16 +1479,11 @@ impl AppWindow {
 
     fn drain_video_decode_results(&mut self) -> bool {
         let mut changed = false;
-        loop {
-            match self.video_result_receiver.try_recv() {
-                Ok(outcome) => {
-                    self.video_pending_urls.remove(&outcome.cache_key);
-                    if let Some(render_image) = outcome.render_image {
-                        self.insert_video_render_cache_entry(outcome.cache_key, render_image);
-                        changed = true;
-                    }
-                }
-                Err(TryRecvError::Empty) | Err(TryRecvError::Disconnected) => break,
+        while let Ok(outcome) = self.video_result_receiver.try_recv() {
+            self.video_pending_urls.remove(&outcome.cache_key);
+            if let Some(render_image) = outcome.render_image {
+                self.insert_video_render_cache_entry(outcome.cache_key, render_image);
+                changed = true;
             }
         }
         changed
@@ -1533,16 +1528,11 @@ impl AppWindow {
 
     fn drain_og_fetch_results(&mut self) -> bool {
         let mut changed = false;
-        loop {
-            match self.og_result_receiver.try_recv() {
-                Ok(result) => {
-                    if result.preview.is_some() {
-                        changed = true;
-                    }
-                    self.og_service.apply_result(result);
-                }
-                Err(TryRecvError::Empty) | Err(TryRecvError::Disconnected) => break,
+        while let Ok(result) = self.og_result_receiver.try_recv() {
+            if result.preview.is_some() {
+                changed = true;
             }
+            self.og_service.apply_result(result);
         }
         if changed {
             self.apply_og_previews_to_timeline();
@@ -3790,12 +3780,13 @@ impl AppWindow {
             "navigate_to_channel_by_conv_id: resolving {} via backend",
             conversation_id.0
         );
-        let Ok(events) = self.backend_router.route_command(
-            BackendCommand::ResolveChannelById {
+        let Ok(events) = self
+            .backend_router
+            .route_command(BackendCommand::ResolveChannelById {
                 workspace_id: workspace_id.clone(),
                 conversation_id: conversation_id.clone(),
-            },
-        ) else {
+            })
+        else {
             tracing::warn!(
                 "navigate_to_channel_by_conv_id: route_command returned Err for {}",
                 conversation_id.0
@@ -3814,16 +3805,16 @@ impl AppWindow {
                 } => {
                     self.backend_router
                         .register_conversation_binding(conversation_binding.clone());
-                    let _ = self.app_store.dispatch_backend(BackendEvent::ChannelResolved {
-                        workspace_id: workspace_id.clone(),
-                        conversation: conversation.clone(),
-                        conversation_binding,
-                        can_post,
-                    });
-                    self.preview_summaries.insert(
-                        conversation.id.clone(),
-                        (conversation.clone(), can_post),
-                    );
+                    let _ = self
+                        .app_store
+                        .dispatch_backend(BackendEvent::ChannelResolved {
+                            workspace_id: workspace_id.clone(),
+                            conversation: conversation.clone(),
+                            conversation_binding,
+                            can_post,
+                        });
+                    self.preview_summaries
+                        .insert(conversation.id.clone(), (conversation.clone(), can_post));
                     let conv_id_str = conversation.id.0.clone();
                     self.navigate_to(
                         Route::Channel {
@@ -3839,9 +3830,7 @@ impl AppWindow {
                     return;
                 }
                 BackendEvent::ChannelResolveFailed { error, .. } => {
-                    tracing::warn!(
-                        "navigate_to_channel_by_conv_id: resolve failed: {error}"
-                    );
+                    tracing::warn!("navigate_to_channel_by_conv_id: resolve failed: {error}");
                     cx.notify();
                     return;
                 }
@@ -3980,20 +3969,26 @@ impl AppWindow {
     }
 
     pub(crate) fn join_current_channel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(conversation_id) = conversation_id_from_navigated_route(&self.models.navigation.current)
+        let Some(conversation_id) =
+            conversation_id_from_navigated_route(&self.models.navigation.current)
         else {
             tracing::warn!("join_current_channel: no conversation_id from route");
             return;
         };
         tracing::info!("join_current_channel: joining {}", conversation_id.0);
         let workspace_id = self.models.app.active_workspace_id.clone();
-        let Ok(events) = self.backend_router.route_command(BackendCommand::JoinChannel {
-            workspace_id: workspace_id.clone(),
-            conversation_id: conversation_id.clone(),
-        }) else {
-            tracing::warn!("join_current_channel: route_command failed for {}", conversation_id.0);
-            self.models
-                .push_toast("Failed to join channel", None);
+        let Ok(events) = self
+            .backend_router
+            .route_command(BackendCommand::JoinChannel {
+                workspace_id: workspace_id.clone(),
+                conversation_id: conversation_id.clone(),
+            })
+        else {
+            tracing::warn!(
+                "join_current_channel: route_command failed for {}",
+                conversation_id.0
+            );
+            self.models.push_toast("Failed to join channel", None);
             cx.notify();
             return;
         };
@@ -4001,12 +3996,18 @@ impl AppWindow {
             .iter()
             .any(|event| matches!(event, BackendEvent::ChannelJoined { .. }));
         if !joined {
-            tracing::warn!("join_current_channel: no ChannelJoined event for {}", conversation_id.0);
+            tracing::warn!(
+                "join_current_channel: no ChannelJoined event for {}",
+                conversation_id.0
+            );
             self.models.push_toast("Failed to join channel", None);
             cx.notify();
             return;
         }
-        tracing::info!("join_current_channel: successfully joined {}", conversation_id.0);
+        tracing::info!(
+            "join_current_channel: successfully joined {}",
+            conversation_id.0
+        );
         self.preview_summaries.remove(&conversation_id);
 
         if let Ok(workspace_events) = self
@@ -4080,11 +4081,14 @@ impl AppWindow {
         tracing::info!(
             "resolve_channel_and_navigate: resolving #{channel_name} in team={team_name}"
         );
-        let Ok(events) = self.backend_router.route_command(BackendCommand::ResolveChannel {
-            workspace_id: workspace_id.clone(),
-            team_name,
-            channel_name: channel_name.clone(),
-        }) else {
+        let Ok(events) = self
+            .backend_router
+            .route_command(BackendCommand::ResolveChannel {
+                workspace_id: workspace_id.clone(),
+                team_name,
+                channel_name: channel_name.clone(),
+            })
+        else {
             tracing::warn!(
                 "resolve_channel_and_navigate: route_command returned Err for #{channel_name} in {team_for_error}"
             );
@@ -4102,16 +4106,16 @@ impl AppWindow {
                 } => {
                     self.backend_router
                         .register_conversation_binding(conversation_binding.clone());
-                    let _ = self.app_store.dispatch_backend(BackendEvent::ChannelResolved {
-                        workspace_id: workspace_id.clone(),
-                        conversation: conversation.clone(),
-                        conversation_binding,
-                        can_post,
-                    });
-                    self.preview_summaries.insert(
-                        conversation.id.clone(),
-                        (conversation.clone(), can_post),
-                    );
+                    let _ = self
+                        .app_store
+                        .dispatch_backend(BackendEvent::ChannelResolved {
+                            workspace_id: workspace_id.clone(),
+                            conversation: conversation.clone(),
+                            conversation_binding,
+                            can_post,
+                        });
+                    self.preview_summaries
+                        .insert(conversation.id.clone(), (conversation.clone(), can_post));
                     let conv_id_str = conversation.id.0.clone();
                     self.navigate_to(
                         Route::Channel {
@@ -4178,13 +4182,16 @@ impl AppWindow {
         match event {
             BackendEvent::BootstrapLoaded { payload, .. } => {
                 for binding in &payload.workspace_bindings {
-                    self.backend_router.register_workspace_binding(binding.clone());
+                    self.backend_router
+                        .register_workspace_binding(binding.clone());
                 }
                 for binding in &payload.conversation_bindings {
-                    self.backend_router.register_conversation_binding(binding.clone());
+                    self.backend_router
+                        .register_conversation_binding(binding.clone());
                 }
                 for binding in &payload.message_bindings {
-                    self.backend_router.register_message_binding(binding.clone());
+                    self.backend_router
+                        .register_message_binding(binding.clone());
                 }
             }
             BackendEvent::WorkspaceConversationsExtended {
@@ -4778,7 +4785,7 @@ impl AppWindow {
         }
         if count > 0 {
             self.models.push_toast(
-                &format!(
+                format!(
                     "Marked {} conversation{} as read",
                     count,
                     if count == 1 { "" } else { "s" }
@@ -4990,13 +4997,12 @@ impl AppWindow {
         direction: isize,
     ) -> bool {
         let now = Instant::now();
-        if let Some((last_target, last_direction, last_at)) = self.last_autocomplete_nav {
-            if last_target == target
-                && last_direction == direction
-                && now.duration_since(last_at) < AUTOCOMPLETE_NAV_DEBOUNCE
-            {
-                return false;
-            }
+        if let Some((last_target, last_direction, last_at)) = self.last_autocomplete_nav
+            && last_target == target
+            && last_direction == direction
+            && now.duration_since(last_at) < AUTOCOMPLETE_NAV_DEBOUNCE
+        {
+            return false;
         }
         self.last_autocomplete_nav = Some((target, direction, now));
 
@@ -7004,7 +7010,7 @@ impl AppWindow {
             .cloned()
             .collect();
 
-        rows.sort_by(|a, b| b.last_seen_seq.cmp(&a.last_seen_seq));
+        rows.sort_by_key(|row| std::cmp::Reverse(row.last_seen_seq));
         rows
     }
 
@@ -7959,7 +7965,7 @@ impl Render for AppWindow {
                 self.models.sidebar.width_px,
                 f32::from(window.viewport_size().width),
             );
-            let capabilities = current_backend_capabilities(&self.app_store.snapshot());
+            let capabilities = current_backend_capabilities(self.app_store.snapshot());
 
             let t_right = Instant::now();
             let right_pane = shell_layout.show_right_pane.then(|| {

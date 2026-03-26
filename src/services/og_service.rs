@@ -45,12 +45,12 @@ impl OgService {
             return;
         }
         if let Ok(Some(mut preview)) = self.local_store.get_og_preview(&key) {
-            if let Some(ref thumb) = preview.thumbnail_asset {
-                if !PathBuf::from(thumb).exists() {
-                    preview.thumbnail_asset = None;
-                    preview.media_width = None;
-                    preview.media_height = None;
-                }
+            if let Some(ref thumb) = preview.thumbnail_asset
+                && !PathBuf::from(thumb).exists()
+            {
+                preview.thumbnail_asset = None;
+                preview.media_width = None;
+                preview.media_height = None;
             }
             self.cache.insert(key, Some(preview));
             return;
@@ -257,12 +257,10 @@ fn extract_meta_content(head: &str, property: &str) -> Option<String> {
             || tag_lower.contains(&format!("name=\"{property}\""))
             || tag_lower.contains(&format!("name='{property}'"));
 
-        if has_property {
-            if let Some(value) = extract_attribute_value(tag, "content") {
-                let decoded = decode_html_entities(&value);
-                if !decoded.trim().is_empty() {
-                    return Some(decoded.trim().to_string());
-                }
+        if has_property && let Some(value) = extract_attribute_value(tag, "content") {
+            let decoded = decode_html_entities(&value);
+            if !decoded.trim().is_empty() {
+                return Some(decoded.trim().to_string());
             }
         }
         search_from = tag_end;

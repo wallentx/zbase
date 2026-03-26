@@ -348,7 +348,14 @@ impl Sidebar {
             )
             .when(is_unread_section || !section.collapsed, |div| {
                 div.children(visible_rows.iter().map(|row| {
-                    Self::render_row(&section.id, row, dm_avatar_assets, current_route, hovered_row, cx)
+                    Self::render_row(
+                        &section.id,
+                        row,
+                        dm_avatar_assets,
+                        current_route,
+                        hovered_row,
+                        cx,
+                    )
                 }))
             })
             .into_any_element()

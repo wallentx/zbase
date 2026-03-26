@@ -20,7 +20,7 @@ use crate::{
 };
 use gpui::{
     App, AppContext, Bounds, Focusable, TitlebarOptions, WindowBackgroundAppearance, WindowBounds,
-    WindowOptions, point, px, size,
+    WindowOptions, guess_compositor, point, px, size,
 };
 use std::env;
 use std::sync::Arc;
@@ -29,6 +29,8 @@ const ENV_BENCH_USE_DEMO: &str = "ZBASE_BENCH_USE_DEMO";
 const ENV_BENCH_SKIP_BACKEND: &str = "ZBASE_BENCH_SKIP_BACKEND";
 
 pub fn open_main_window(cx: &mut App) {
+    validate_linux_window_backend();
+
     let bounds = Bounds::centered(None, size(px(1440.), px(920.)), cx);
     let options = WindowOptions {
         window_bounds: Some(WindowBounds::Windowed(bounds)),
@@ -151,6 +153,22 @@ pub fn open_main_window(cx: &mut App) {
     })
     .expect("failed to open zbase window");
 }
+
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+fn validate_linux_window_backend() {
+    let has_wayland = env::var_os("WAYLAND_DISPLAY").is_some_and(|value| !value.is_empty());
+    let has_x11 = env::var_os("DISPLAY").is_some_and(|value| !value.is_empty());
+    let compositor = guess_compositor();
+
+    if compositor == "Headless" && (has_wayland || has_x11) {
+        panic!(
+            "zbase was built without GPUI Linux windowing support. DISPLAY present: {has_x11}, WAYLAND_DISPLAY present: {has_wayland}. Rebuild after enabling gpui \"x11\" and/or \"wayland\" features."
+        );
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
+fn validate_linux_window_backend() {}
 
 fn env_flag(name: &str) -> bool {
     env::var(name)

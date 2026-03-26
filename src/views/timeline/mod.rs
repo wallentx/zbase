@@ -405,9 +405,7 @@ impl TimelineList {
                             .font_weight(FontWeight::MEDIUM)
                             .child(name.clone())
                             .into_any_element(),
-                        EventSpan::Text(text) => {
-                            div().child(text.clone()).into_any_element()
-                        }
+                        EventSpan::Text(text) => div().child(text.clone()).into_any_element(),
                         EventSpan::ChannelLink {
                             channel_name,
                             team_name,
@@ -449,7 +447,8 @@ impl TimelineList {
                             let uid = user_id.clone();
                             div()
                                 .id(SharedString::from(format!(
-                                    "user-link-{row_identity}-{span_idx}-{}", user_id.0
+                                    "user-link-{row_identity}-{span_idx}-{}",
+                                    user_id.0
                                 )))
                                 .font_weight(FontWeight::MEDIUM)
                                 .text_color(rgb(accent()))
@@ -2062,8 +2061,8 @@ impl TimelineList {
         let scale = (max_width / width).min(max_height / height).min(1.0);
         width *= scale;
         height *= scale;
-        let min_width = max_width.min(120.0).max(1.0);
-        let min_height = max_height.min(90.0).max(1.0);
+        let min_width = max_width.clamp(1.0, 120.0);
+        let min_height = max_height.clamp(1.0, 90.0);
         (width.max(min_width), height.max(min_height))
     }
 

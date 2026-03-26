@@ -4,6 +4,7 @@ pub mod effect;
 pub mod event;
 pub mod ids;
 pub mod reducer;
+#[allow(clippy::module_inception)]
 pub mod state;
 pub mod store;
 
