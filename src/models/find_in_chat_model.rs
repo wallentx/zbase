@@ -81,7 +81,7 @@ impl FindInChatModel {
         self.results.get(prev).cloned()
     }
 
-    fn sort_and_rotate_results(&self, results: &mut Vec<SearchResult>) {
+    fn sort_and_rotate_results(&self, results: &mut [SearchResult]) {
         results.sort_by(|left, right| {
             left.message
                 .timestamp_ms

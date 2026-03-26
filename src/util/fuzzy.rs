@@ -220,8 +220,8 @@ fn greedy_match_indices(pattern: &[char], candidate: &[CandidateChar]) -> Option
     let mut matched = Vec::with_capacity(pattern.len());
     for needle in pattern {
         let mut found = None;
-        for idx in cursor..candidate.len() {
-            if candidate[idx].lower == *needle {
+        for (idx, candidate_char) in candidate.iter().enumerate().skip(cursor) {
+            if candidate_char.lower == *needle {
                 found = Some(idx);
                 break;
             }

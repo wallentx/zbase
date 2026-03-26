@@ -369,7 +369,7 @@ impl SelectableText {
         if !self.link_ranges.is_empty() {
             let in_bounds = self
                 .last_bounds
-                .map_or(false, |b| b.contains(&event.position));
+                .is_some_and(|b| b.contains(&event.position));
             let over_link = if in_bounds {
                 let index = self.index_for_mouse_position(event.position);
                 self.link_at_index(index).is_some()
@@ -391,10 +391,8 @@ impl SelectableText {
             let up_offset = self.index_for_mouse_position(event.position);
             // For double/triple click selection, mouse-down may have already established a full
             // word/line range. Avoid shrinking it on mouse-up when releasing within that range.
-            if self.selected_range.is_empty() {
-                self.select_to(up_offset, cx);
-            } else if !(self.selected_range.start <= up_offset
-                && up_offset <= self.selected_range.end)
+            if self.selected_range.is_empty()
+                || !(self.selected_range.start <= up_offset && up_offset <= self.selected_range.end)
             {
                 self.select_to(up_offset, cx);
             }
@@ -427,7 +425,7 @@ impl SelectableText {
         if self.link_ranges.is_empty() {
             return false;
         }
-        let in_bounds = self.last_bounds.map_or(false, |b| b.contains(&position));
+        let in_bounds = self.last_bounds.is_some_and(|b| b.contains(&position));
         if !in_bounds {
             return false;
         }

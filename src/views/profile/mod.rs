@@ -829,10 +829,10 @@ fn profile_social_graph(profile: &UserProfile) -> Option<&SocialGraph> {
     })
 }
 
-fn social_graph_entries<'a>(
-    social_graph: Option<&'a SocialGraph>,
+fn social_graph_entries(
+    social_graph: Option<&SocialGraph>,
     tab: SocialTab,
-) -> &'a [crate::domain::profile::SocialGraphEntry] {
+) -> &[crate::domain::profile::SocialGraphEntry] {
     match (social_graph, tab) {
         (Some(graph), SocialTab::Followers) => graph.followers.as_deref().unwrap_or(&[]),
         (Some(graph), SocialTab::Following) => graph.following.as_deref().unwrap_or(&[]),

@@ -564,10 +564,10 @@ pub fn attachment_is_animated_gif(attachment: &AttachmentSummary) -> bool {
     if name_lower.ends_with(".gif") {
         return true;
     }
-    if let Some(ref mime) = attachment.mime_type {
-        if mime.eq_ignore_ascii_case("image/gif") {
-            return true;
-        }
+    if let Some(ref mime) = attachment.mime_type
+        && mime.eq_ignore_ascii_case("image/gif")
+    {
+        return true;
     }
     false
 }

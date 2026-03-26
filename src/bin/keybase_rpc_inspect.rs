@@ -1,11 +1,15 @@
+#![cfg(not(target_os = "windows"))]
+
 use std::{env, path::PathBuf};
 
 use rmpv::Value;
 use tokio::{sync::mpsc, time};
 
 #[path = "../services/backends/keybase/rpc/client.rs"]
+#[allow(dead_code)]
 mod client;
 #[path = "../services/backends/keybase/paths.rs"]
+#[allow(dead_code)]
 mod keybase_paths;
 #[path = "../services/backends/keybase/rpc/transport.rs"]
 mod transport;
@@ -465,10 +469,10 @@ fn direct_map_get<'a>(value: &'a Value, keys: &[&str]) -> Option<&'a Value> {
         return None;
     };
     for (k, v) in entries {
-        if let Some(ks) = k.as_str() {
-            if keys.iter().any(|wanted| wanted.eq_ignore_ascii_case(ks)) {
-                return Some(v);
-            }
+        if let Some(ks) = k.as_str()
+            && keys.iter().any(|wanted| wanted.eq_ignore_ascii_case(ks))
+        {
+            return Some(v);
         }
     }
     None
@@ -511,10 +515,7 @@ async fn inspect_resolve_channel(team_name: &str, channel_name: &str) {
         (Value::from("topicType"), Value::from(TOPIC_TYPE_CHAT)),
         (Value::from("status"), Value::Array(Vec::new())),
         (Value::from("memberStatus"), all_member_statuses),
-        (
-            Value::from("tlfName"),
-            Value::from(team_name.to_string()),
-        ),
+        (Value::from("tlfName"), Value::from(team_name.to_string())),
         (
             Value::from("topicName"),
             Value::from(channel_name.to_string()),
@@ -556,10 +557,10 @@ async fn inspect_resolve_channel(team_name: &str, channel_name: &str) {
         .or_else(|| match &result {
             Value::Map(entries) => {
                 for (k, v) in entries {
-                    if k.as_str() == Some("conversations") {
-                        if let Value::Array(items) = v {
-                            return Some(items.clone());
-                        }
+                    if k.as_str() == Some("conversations")
+                        && let Value::Array(items) = v
+                    {
+                        return Some(items.clone());
                     }
                 }
                 None
@@ -583,13 +584,15 @@ async fn inspect_resolve_channel(team_name: &str, channel_name: &str) {
         let topic_direct = direct_map_get(&info_val, &["topicName", "t"])
             .and_then(|v| v.as_str())
             .unwrap_or("<none>");
-        let members_type_direct = direct_map_get(&info_val, &["membersType", "m"])
-            .and_then(|v| v.as_i64());
+        let members_type_direct =
+            direct_map_get(&info_val, &["membersType", "m"]).and_then(|v| v.as_i64());
         let conv_id_hex = direct_map_get(&info_val, &["id", "i"])
             .and_then(|v| match v {
                 Value::Binary(bytes) => {
                     let mut s = String::with_capacity(bytes.len() * 2);
-                    for b in bytes { s.push_str(&format!("{:02x}", b)); }
+                    for b in bytes {
+                        s.push_str(&format!("{:02x}", b));
+                    }
                     Some(s)
                 }
                 _ => None,
@@ -599,12 +602,11 @@ async fn inspect_resolve_channel(team_name: &str, channel_name: &str) {
         let reader_info = direct_map_get(conv, &["readerInfo", "ri", "r"])
             .cloned()
             .unwrap_or(Value::Nil);
-        let member_status = direct_map_get(&reader_info, &["status", "s"])
-            .and_then(|v| v.as_i64());
+        let member_status = direct_map_get(&reader_info, &["status", "s"]).and_then(|v| v.as_i64());
 
         // Also show recursive result for comparison
-        let tlf_recursive = find_first_string(&info_val, &["tlfName"])
-            .unwrap_or_else(|| "<none>".to_string());
+        let tlf_recursive =
+            find_first_string(&info_val, &["tlfName"]).unwrap_or_else(|| "<none>".to_string());
 
         println!("  tlfName(direct)={tlf_direct}");
         println!("  tlfName(recursive)={tlf_recursive}");
@@ -668,8 +670,12 @@ async fn inspect_resolve_by_id(conv_hex: &str) {
     let mut client = KeybaseRpcClient::new(transport);
 
     let all_statuses = Value::Array(vec![
-        Value::from(0i64), Value::from(1i64), Value::from(2i64),
-        Value::from(3i64), Value::from(4i64), Value::from(5i64),
+        Value::from(0i64),
+        Value::from(1i64),
+        Value::from(2i64),
+        Value::from(3i64),
+        Value::from(4i64),
+        Value::from(5i64),
     ]);
     let query = Value::Map(vec![
         (Value::from("topicType"), Value::from(TOPIC_TYPE_CHAT)),
@@ -713,7 +719,7 @@ async fn inspect_resolve_by_id(conv_hex: &str) {
     println!("conversations count: {}", conv_array.len());
 
     for (i, conv) in conv_array.iter().enumerate() {
-        let info_val = direct_map_get(&conv, &["info", "i", "conv", "conversation"])
+        let info_val = direct_map_get(conv, &["info", "i", "conv", "conversation"])
             .cloned()
             .unwrap_or(conv.clone());
         let tlf = direct_map_get(&info_val, &["tlfName", "n"])
@@ -722,13 +728,12 @@ async fn inspect_resolve_by_id(conv_hex: &str) {
         let topic = direct_map_get(&info_val, &["topicName", "t"])
             .and_then(|v| v.as_str())
             .unwrap_or("<none>");
-        let members_type = direct_map_get(&info_val, &["membersType", "m"])
-            .and_then(|v| v.as_i64());
-        let reader_info = direct_map_get(&conv, &["readerInfo", "ri", "r"])
+        let members_type =
+            direct_map_get(&info_val, &["membersType", "m"]).and_then(|v| v.as_i64());
+        let reader_info = direct_map_get(conv, &["readerInfo", "ri", "r"])
             .cloned()
             .unwrap_or(Value::Nil);
-        let member_status = direct_map_get(&reader_info, &["status", "s"])
-            .and_then(|v| v.as_i64());
+        let member_status = direct_map_get(&reader_info, &["status", "s"]).and_then(|v| v.as_i64());
         println!(
             "  [{i}] {tlf}#{topic} membersType={members_type:?} member_status={member_status:?}"
         );
@@ -806,7 +811,7 @@ async fn inspect_find_all_channels(channel_name: &str) {
     println!("Total channels named #{channel_name}: {}", conv_array.len());
 
     for (i, conv) in conv_array.iter().enumerate() {
-        let info_val = direct_map_get(&conv, &["info", "i", "conv", "conversation"])
+        let info_val = direct_map_get(conv, &["info", "i", "conv", "conversation"])
             .cloned()
             .unwrap_or(conv.clone());
         let tlf = direct_map_get(&info_val, &["tlfName", "n"])
@@ -827,14 +832,11 @@ async fn inspect_find_all_channels(channel_name: &str) {
                 _ => None,
             })
             .unwrap_or_else(|| "<none>".to_string());
-        let reader_info = direct_map_get(&conv, &["readerInfo", "ri", "r"])
+        let reader_info = direct_map_get(conv, &["readerInfo", "ri", "r"])
             .cloned()
             .unwrap_or(Value::Nil);
-        let member_status = direct_map_get(&reader_info, &["status", "s"])
-            .and_then(|v| v.as_i64());
-        println!(
-            "  [{i}] {tlf}#{topic} convID={conv_id_hex} member_status={member_status:?}"
-        );
+        let member_status = direct_map_get(&reader_info, &["status", "s"]).and_then(|v| v.as_i64());
+        println!("  [{i}] {tlf}#{topic} convID={conv_id_hex} member_status={member_status:?}");
     }
 }
 
@@ -1105,10 +1107,7 @@ async fn inspect_test_join_leave(conv_hex: &str, is_join: bool) {
         .call(
             method,
             vec![Value::Map(vec![
-                (
-                    Value::from("convID"),
-                    Value::Binary(raw_id.to_vec()),
-                ),
+                (Value::from("convID"), Value::Binary(raw_id.to_vec())),
                 (
                     Value::from("identifyBehavior"),
                     Value::from(IDENTIFY_BEHAVIOR_CHAT_GUI),
