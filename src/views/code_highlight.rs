@@ -159,10 +159,8 @@ pub fn detect_language(code: &str) -> Option<CodeLanguage> {
     if looks_like_prose(trimmed) {
         return None;
     }
-    if trimmed.starts_with('{') || trimmed.starts_with('[') {
-        if is_probably_json(trimmed) {
-            return Some(CodeLanguage::Json);
-        }
+    if (trimmed.starts_with('{') || trimmed.starts_with('[')) && is_probably_json(trimmed) {
+        return Some(CodeLanguage::Json);
     }
     if (trimmed.starts_with("---") || trimmed.contains("\n---"))
         && has_yaml_key_value_lines(trimmed)
@@ -251,7 +249,7 @@ pub fn detect_language(code: &str) -> Option<CodeLanguage> {
             ),
         ),
     ];
-    scored.sort_by(|a, b| b.1.cmp(&a.1));
+    scored.sort_by_key(|b| std::cmp::Reverse(b.1));
     (scored[0].1 >= MIN_KEYWORD_SCORE).then_some(scored[0].0)
 }
 
@@ -427,39 +425,17 @@ fn style_for_highlight(name: &str, theme: ThemeVariant) -> Option<Style> {
     })
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn sql_keywords_are_high_contrast_in_dark_mode() {
-        let code = "SELECT 1 FROM users;";
-        let ranges = highlight(code, CodeLanguage::Sql, ThemeVariant::Dark);
-        let select_start = code.find("SELECT").expect("SELECT present");
-        let select_end = select_start + "SELECT".len();
-
-        let select_range = ranges
-            .iter()
-            .find(|r| r.byte_range.start <= select_start && r.byte_range.end >= select_end)
-            .expect("expected a styled range covering SELECT");
-
-        let expected = crate::views::with_theme(ThemeVariant::Dark, || text_primary());
-        assert_eq!(select_range.color, Some(expected));
-    }
-}
-
 fn push_merged(out: &mut Vec<StyledRange>, next: StyledRange) {
-    if let Some(last) = out.last_mut() {
-        if last.color == next.color
-            && last.background_color == next.background_color
-            && last.bold == next.bold
-            && last.italic == next.italic
-            && last.strikethrough == next.strikethrough
-            && last.byte_range.end == next.byte_range.start
-        {
-            last.byte_range.end = next.byte_range.end;
-            return;
-        }
+    if let Some(last) = out.last_mut()
+        && last.color == next.color
+        && last.background_color == next.background_color
+        && last.bold == next.bold
+        && last.italic == next.italic
+        && last.strikethrough == next.strikethrough
+        && last.byte_range.end == next.byte_range.start
+    {
+        last.byte_range.end = next.byte_range.end;
+        return;
     }
     out.push(next);
 }
@@ -558,4 +534,25 @@ fn stable_code_hash(code: &str) -> u64 {
     code.len().hash(&mut hasher);
     code.as_bytes().hash(&mut hasher);
     hasher.finish()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sql_keywords_are_high_contrast_in_dark_mode() {
+        let code = "SELECT 1 FROM users;";
+        let ranges = highlight(code, CodeLanguage::Sql, ThemeVariant::Dark);
+        let select_start = code.find("SELECT").expect("SELECT present");
+        let select_end = select_start + "SELECT".len();
+
+        let select_range = ranges
+            .iter()
+            .find(|r| r.byte_range.start <= select_start && r.byte_range.end >= select_end)
+            .expect("expected a styled range covering SELECT");
+
+        let expected = crate::views::with_theme(ThemeVariant::Dark, text_primary);
+        assert_eq!(select_range.color, Some(expected));
+    }
 }

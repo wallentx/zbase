@@ -20,7 +20,7 @@ use crate::{
 };
 use gpui::{
     App, AppContext, Bounds, Focusable, TitlebarOptions, WindowBackgroundAppearance, WindowBounds,
-    WindowOptions, guess_compositor, point, px, size,
+    WindowOptions, point, px, size,
 };
 use std::env;
 use std::sync::Arc;
@@ -158,11 +158,12 @@ pub fn open_main_window(cx: &mut App) {
 fn validate_linux_window_backend() {
     let has_wayland = env::var_os("WAYLAND_DISPLAY").is_some_and(|value| !value.is_empty());
     let has_x11 = env::var_os("DISPLAY").is_some_and(|value| !value.is_empty());
-    let compositor = guess_compositor();
 
-    if compositor == "Headless" && (has_wayland || has_x11) {
-        panic!(
-            "zbase was built without GPUI Linux windowing support. DISPLAY present: {has_x11}, WAYLAND_DISPLAY present: {has_wayland}. Rebuild after enabling gpui \"x11\" and/or \"wayland\" features."
+    if has_wayland || has_x11 {
+        tracing::debug!(
+            "display vars detected: DISPLAY={}, WAYLAND_DISPLAY={}",
+            has_x11,
+            has_wayland
         );
     }
 }
