@@ -48,15 +48,13 @@ impl MainPanelHost {
                 show_timeline_jump_to_bottom,
                 cx,
             ),
-            Route::Search { .. } => {
-                SearchView.render(
-                    &models.search,
-                    video_render_cache,
-                    failed_video_urls,
-                    search_input,
-                    cx,
-                )
-            }
+            Route::Search { .. } => SearchView.render(
+                &models.search,
+                video_render_cache,
+                failed_video_urls,
+                search_input,
+                cx,
+            ),
             Route::Activity { .. } => InboxView.render(&models.notifications, cx),
             Route::Preferences => PreferencesView.render(&models.settings, cx),
             Route::ActiveCall { .. } => CallWindow.render(&models.call),

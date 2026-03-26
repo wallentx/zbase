@@ -240,7 +240,6 @@ impl TimelineList {
         _failed_video_urls: &HashSet<String>,
         cx: &mut Context<AppWindow>,
     ) -> AnyElement {
-
         div()
             .flex_1()
             .min_h(px(0.))
@@ -1917,7 +1916,8 @@ impl TimelineList {
                                             .into_any_element()
                                     } else {
                                         let failed = failed_video_urls.contains(&media_source);
-                                        let image_source = (!failed).then(|| ImageSource::from(media_source));
+                                        let image_source =
+                                            (!failed).then(|| ImageSource::from(media_source));
 
                                         div()
                                             .size_full()
@@ -1933,9 +1933,12 @@ impl TimelineList {
                                                         .min_w(px(16.))
                                                         .min_h(px(16.))
                                                         .with_fallback({
-                                                            let site = preview.site.clone().unwrap_or_else(|| {
-                                                                "media".to_string()
-                                                            });
+                                                            let site = preview
+                                                                .site
+                                                                .clone()
+                                                                .unwrap_or_else(|| {
+                                                                    "media".to_string()
+                                                                });
                                                             move || {
                                                                 div()
                                                                     .text_xs()

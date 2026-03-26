@@ -20,7 +20,10 @@ use gpui::{
     ObjectFit, ParentElement, RenderImage, SharedString, StatefulInteractiveElement, Styled,
     StyledImage, div, img, px, rgb,
 };
-use std::{collections::{HashMap, HashSet}, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
 
 #[derive(Default)]
 pub struct SearchView;
@@ -332,9 +335,10 @@ fn render_link_previews(
                                             .h(px(media_height))
                                             .object_fit(ObjectFit::Contain)
                                             .with_fallback({
-                                                let site = preview.site.clone().unwrap_or_else(|| {
-                                                    "media".to_string()
-                                                });
+                                                let site = preview
+                                                    .site
+                                                    .clone()
+                                                    .unwrap_or_else(|| "media".to_string());
                                                 move || {
                                                     div()
                                                         .text_xs()

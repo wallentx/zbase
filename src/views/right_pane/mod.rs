@@ -30,8 +30,7 @@ use crate::{
         inline_markdown::{InlineMarkdownConfig, apply_inline_markdown, remap_source_byte_range},
         input::TextField,
         is_dark_theme, mention_colors_for_user, mention_soft, mono_font_family, panel_alt_bg,
-        panel_alt_surface,
-        play_icon,
+        panel_alt_surface, play_icon,
         selectable_text::{
             InlineAttachment, LinkRange, SelectableText, StyledRange, resolve_selectable_text,
             resolve_selectable_text_inline, resolve_selectable_text_with_attachments,
@@ -111,9 +110,13 @@ impl RightPaneHost {
             }
             RightPaneMode::Members => render_members_panel(conversation, cx),
             RightPaneMode::Files => render_files_panel(timeline, cx),
-            RightPaneMode::Search => {
-                render_search_panel(conversation, search, video_render_cache, failed_video_urls, cx)
-            }
+            RightPaneMode::Search => render_search_panel(
+                conversation,
+                search,
+                video_render_cache,
+                failed_video_urls,
+                cx,
+            ),
             RightPaneMode::Profile(_) => crate::views::profile::render_profile_panel(
                 profile_panel,
                 profile_scroll,
@@ -909,9 +912,10 @@ fn render_link_previews(
                                             .min_w(px(16.))
                                             .min_h(px(16.))
                                             .with_fallback({
-                                                let site = preview.site.clone().unwrap_or_else(|| {
-                                                    "media".to_string()
-                                                });
+                                                let site = preview
+                                                    .site
+                                                    .clone()
+                                                    .unwrap_or_else(|| "media".to_string());
                                                 move || {
                                                     div()
                                                         .text_xs()

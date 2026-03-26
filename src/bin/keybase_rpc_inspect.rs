@@ -1,3 +1,5 @@
+#![cfg(not(target_os = "windows"))]
+
 use std::{env, path::PathBuf};
 
 use rmpv::Value;

@@ -180,8 +180,18 @@ pub fn detect_language(code: &str) -> Option<CodeLanguage> {
             score_keywords(
                 &lower,
                 &[
-                    "fn ", "let ", "impl ", "match ", "pub fn", "crate::", "mut ", "&self",
-                    "use std::", "-> ", "pub struct", "enum ",
+                    "fn ",
+                    "let ",
+                    "impl ",
+                    "match ",
+                    "pub fn",
+                    "crate::",
+                    "mut ",
+                    "&self",
+                    "use std::",
+                    "-> ",
+                    "pub struct",
+                    "enum ",
                 ],
             ),
         ),
@@ -190,8 +200,8 @@ pub fn detect_language(code: &str) -> Option<CodeLanguage> {
             score_keywords(
                 &lower,
                 &[
-                    "def ", "import ", "elif ", "print(", "class ", "__init__", "self.",
-                    "return ", "lambda ", "except ",
+                    "def ", "import ", "elif ", "print(", "class ", "__init__", "self.", "return ",
+                    "lambda ", "except ",
                 ],
             ),
         ),
@@ -234,7 +244,14 @@ pub fn detect_language(code: &str) -> Option<CodeLanguage> {
             score_keywords(
                 &lower,
                 &[
-                    "func ", "package ", ":=", "defer ", "go ", "fmt.", "chan ", "goroutine",
+                    "func ",
+                    "package ",
+                    ":=",
+                    "defer ",
+                    "go ",
+                    "fmt.",
+                    "chan ",
+                    "goroutine",
                 ],
             ),
         ),
@@ -243,8 +260,15 @@ pub fn detect_language(code: &str) -> Option<CodeLanguage> {
             score_keywords(
                 &lower,
                 &[
-                    "select ", "where ", "join ", "group by", "order by", "insert into",
-                    "create table", "alter table", "drop table",
+                    "select ",
+                    "where ",
+                    "join ",
+                    "group by",
+                    "order by",
+                    "insert into",
+                    "create table",
+                    "alter table",
+                    "drop table",
                 ],
             ),
         ),
@@ -472,7 +496,9 @@ fn is_probably_toml(text: &str) -> bool {
             let key = line[..eq_pos].trim();
             if !key.is_empty()
                 && !key.contains(' ')
-                && key.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '-' || c == '.')
+                && key
+                    .chars()
+                    .all(|c| c.is_alphanumeric() || c == '_' || c == '-' || c == '.')
             {
                 assignment_count += 1;
             }
@@ -502,7 +528,8 @@ fn looks_like_prose(text: &str) -> bool {
     if total_words < 8 {
         return false;
     }
-    let has_sentence_punctuation = text.contains(". ") || text.contains("? ") || text.contains("! ");
+    let has_sentence_punctuation =
+        text.contains(". ") || text.contains("? ") || text.contains("! ");
     let long_word_ratio = long_words as f64 / total_words as f64;
     let avg_words_per_line = total_words as f64 / lines.len() as f64;
     has_sentence_punctuation && long_word_ratio > 0.6 && avg_words_per_line > 5.0
