@@ -1,3 +1,5 @@
+#![cfg_attr(test, allow(dead_code))]
+
 use rmpv::Value;
 
 const KNOWN_NOTIFY_METHODS: &[&str] = &[

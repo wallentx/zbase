@@ -560,8 +560,7 @@ impl BackendRouter {
                 } else {
                     self.default_account_backend()?
                 };
-                let provider_ref =
-                    ProviderConversationRef::new(conversation_id.0.clone());
+                let provider_ref = ProviderConversationRef::new(conversation_id.0.clone());
                 let backend = self.backend_for_binding(&backend_id)?;
                 backend.execute(RoutedBackendCommand::ResolveChannelById {
                     account_id,

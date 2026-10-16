@@ -56,10 +56,10 @@ fn socket_path_linux() -> Option<PathBuf> {
     let app_name = linux_app_name(&run_mode);
     let runtime_dir = env::var("XDG_RUNTIME_DIR").ok();
 
-    if let Some(dir) = runtime_dir {
-        if !dir.trim().is_empty() {
-            return Some(PathBuf::from(dir).join(app_name).join(SOCKET_FILE));
-        }
+    if let Some(dir) = runtime_dir
+        && !dir.trim().is_empty()
+    {
+        return Some(PathBuf::from(dir).join(app_name).join(SOCKET_FILE));
     }
 
     let home = env::var(HOME_ENV).ok()?;
@@ -163,10 +163,7 @@ fn try_start_service() -> bool {
     };
 
     info!(target: "zbase.service", label = %label, "starting keybase via launchctl");
-    match Command::new("launchctl")
-        .args(["start", &label])
-        .output()
-    {
+    match Command::new("launchctl").args(["start", &label]).output() {
         Ok(output) if output.status.success() => true,
         Ok(output) => {
             let stderr = String::from_utf8_lossy(&output.stderr);

@@ -914,11 +914,11 @@ impl OverlayHost {
         normalized.sort_by_key(|&(s, e)| (s, e));
         let mut merged: Vec<(usize, usize)> = Vec::new();
         for (s, e) in normalized {
-            if let Some(last) = merged.last_mut() {
-                if s <= last.1 {
-                    last.1 = last.1.max(e);
-                    continue;
-                }
+            if let Some(last) = merged.last_mut()
+                && s <= last.1
+            {
+                last.1 = last.1.max(e);
+                continue;
             }
             merged.push((s, e));
         }

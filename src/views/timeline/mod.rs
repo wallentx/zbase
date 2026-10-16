@@ -39,7 +39,7 @@ use gpui::{
 };
 use std::{
     borrow::Cow,
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     sync::{Arc, OnceLock},
 };
 
@@ -236,6 +236,8 @@ impl TimelineList {
         &self,
         _timeline: &TimelineModel,
         list_state: &ListState,
+        _video_render_cache: &HashMap<String, Arc<RenderImage>>,
+        _failed_video_urls: &HashSet<String>,
         cx: &mut Context<AppWindow>,
     ) -> AnyElement {
         div()
@@ -266,6 +268,7 @@ impl TimelineList {
         timeline: &TimelineModel,
         row: &TimelineRow,
         video_render_cache: &HashMap<String, Arc<RenderImage>>,
+        failed_video_urls: &HashSet<String>,
         code_highlight_cache: &mut crate::views::code_highlight::CodeHighlightCache,
         selectable_texts: &mut HashMap<String, Entity<SelectableText>>,
         cx: &mut Context<AppWindow>,
@@ -279,6 +282,7 @@ impl TimelineList {
             None,
             None,
             video_render_cache,
+            failed_video_urls,
             code_highlight_cache,
             selectable_texts,
             cx,
@@ -290,6 +294,7 @@ impl TimelineList {
         row: &TimelineRow,
         thread_media_max_width: f32,
         video_render_cache: &HashMap<String, Arc<RenderImage>>,
+        failed_video_urls: &HashSet<String>,
         code_highlight_cache: &mut crate::views::code_highlight::CodeHighlightCache,
         selectable_texts: &mut HashMap<String, Entity<SelectableText>>,
         cx: &mut Context<AppWindow>,
@@ -303,6 +308,7 @@ impl TimelineList {
             Some(thread_media_max_width),
             None,
             video_render_cache,
+            failed_video_urls,
             code_highlight_cache,
             selectable_texts,
             cx,
@@ -316,6 +322,7 @@ impl TimelineList {
         row_render_cache: &mut TimelineRowRenderCache,
         find_query: Option<&str>,
         video_render_cache: &HashMap<String, Arc<RenderImage>>,
+        failed_video_urls: &HashSet<String>,
         code_highlight_cache: &mut crate::views::code_highlight::CodeHighlightCache,
         selectable_texts: &mut HashMap<String, Entity<SelectableText>>,
         cx: &mut Context<AppWindow>,
@@ -332,6 +339,7 @@ impl TimelineList {
                 None,
                 find_query,
                 video_render_cache,
+                failed_video_urls,
                 code_highlight_cache,
                 selectable_texts,
                 cx,
@@ -348,6 +356,7 @@ impl TimelineList {
             None,
             find_query,
             video_render_cache,
+            failed_video_urls,
             code_highlight_cache,
             selectable_texts,
             cx,
@@ -363,6 +372,7 @@ impl TimelineList {
         thread_media_max_width: Option<f32>,
         find_query: Option<&str>,
         video_render_cache: &HashMap<String, Arc<RenderImage>>,
+        failed_video_urls: &HashSet<String>,
         code_highlight_cache: &mut crate::views::code_highlight::CodeHighlightCache,
         selectable_texts: &mut HashMap<String, Entity<SelectableText>>,
         cx: &mut Context<AppWindow>,
@@ -405,9 +415,7 @@ impl TimelineList {
                             .font_weight(FontWeight::MEDIUM)
                             .child(name.clone())
                             .into_any_element(),
-                        EventSpan::Text(text) => {
-                            div().child(text.clone()).into_any_element()
-                        }
+                        EventSpan::Text(text) => div().child(text.clone()).into_any_element(),
                         EventSpan::ChannelLink {
                             channel_name,
                             team_name,
@@ -449,7 +457,8 @@ impl TimelineList {
                             let uid = user_id.clone();
                             div()
                                 .id(SharedString::from(format!(
-                                    "user-link-{row_identity}-{span_idx}-{}", user_id.0
+                                    "user-link-{row_identity}-{span_idx}-{}",
+                                    user_id.0
                                 )))
                                 .font_weight(FontWeight::MEDIUM)
                                 .text_color(rgb(accent()))
@@ -526,6 +535,7 @@ impl TimelineList {
                     is_last_message,
                     find_query,
                     video_render_cache,
+                    failed_video_urls,
                     code_highlight_cache,
                     selectable_texts,
                     cx,
@@ -550,6 +560,7 @@ impl TimelineList {
         is_last_message: bool,
         find_query: Option<&str>,
         video_render_cache: &HashMap<String, Arc<RenderImage>>,
+        failed_video_urls: &HashSet<String>,
         code_highlight_cache: &mut crate::views::code_highlight::CodeHighlightCache,
         selectable_texts: &mut HashMap<String, Entity<SelectableText>>,
         cx: &mut Context<AppWindow>,
@@ -717,6 +728,7 @@ impl TimelineList {
                 hover_toolbar_settled,
                 row.message.edited.is_some(),
                 video_render_cache,
+                failed_video_urls,
                 message_memo,
                 timeline.quick_react_recent.as_ref(),
                 code_highlight_cache,
@@ -863,6 +875,7 @@ impl TimelineList {
         hover_toolbar_settled: bool,
         show_edited_badge: bool,
         video_render_cache: &HashMap<String, Arc<RenderImage>>,
+        failed_video_urls: &HashSet<String>,
         message_memo: Option<&MessageRenderMemo>,
         quick_react_recent: Option<&QuickReactRecent>,
         code_highlight_cache: &mut crate::views::code_highlight::CodeHighlightCache,
@@ -943,6 +956,7 @@ impl TimelineList {
                     link_preview_max_width,
                     link_preview_max_height,
                     video_render_cache,
+                    failed_video_urls,
                     is_thread,
                     cx,
                 ))
@@ -1804,6 +1818,7 @@ impl TimelineList {
         media_max_width: f32,
         media_max_height: f32,
         video_render_cache: &HashMap<String, Arc<RenderImage>>,
+        failed_video_urls: &HashSet<String>,
         is_thread: bool,
         cx: &mut Context<AppWindow>,
     ) -> AnyElement {
@@ -1898,29 +1913,61 @@ impl TimelineList {
                                             .flex_shrink_0()
                                             .min_w(px(16.))
                                             .min_h(px(16.))
+                                            .into_any_element()
                                     } else {
-                                        img(SharedString::from(media_source))
-                                            .id(image_element_id.clone())
-                                            .w(px(media_width))
-                                            .h(px(media_height))
-                                            .rounded_md()
-                                            .object_fit(ObjectFit::Contain)
-                                            .flex_shrink_0()
-                                            .min_w(px(16.))
-                                            .min_h(px(16.))
-                                            .with_fallback({
+                                        let failed = failed_video_urls.contains(&media_source);
+                                        let image_source =
+                                            (!failed).then(|| ImageSource::from(media_source));
+
+                                        div()
+                                            .size_full()
+                                            .when_some(image_source, |d, source| {
+                                                d.child(
+                                                    img(source)
+                                                        .id(image_element_id.clone())
+                                                        .w(px(media_width))
+                                                        .h(px(media_height))
+                                                        .rounded_md()
+                                                        .object_fit(ObjectFit::Contain)
+                                                        .flex_shrink_0()
+                                                        .min_w(px(16.))
+                                                        .min_h(px(16.))
+                                                        .with_fallback({
+                                                            let site = preview
+                                                                .site
+                                                                .clone()
+                                                                .unwrap_or_else(|| {
+                                                                    "media".to_string()
+                                                                });
+                                                            move || {
+                                                                div()
+                                                                    .text_xs()
+                                                                    .text_color(rgb(
+                                                                        text_secondary(),
+                                                                    ))
+                                                                    .child(site.clone())
+                                                                    .into_any_element()
+                                                            }
+                                                        }),
+                                                )
+                                            })
+                                            .when(failed, |d| {
                                                 let site = preview
                                                     .site
                                                     .clone()
                                                     .unwrap_or_else(|| "media".to_string());
-                                                move || {
+                                                d.child(
                                                     div()
+                                                        .size_full()
+                                                        .flex()
+                                                        .items_center()
+                                                        .justify_center()
                                                         .text_xs()
                                                         .text_color(rgb(text_secondary()))
-                                                        .child(site.clone())
-                                                        .into_any_element()
-                                                }
+                                                        .child(site),
+                                                )
                                             })
+                                            .into_any_element()
                                     }
                                 })
                                 .when(preview.is_video, |container| {
@@ -2062,8 +2109,8 @@ impl TimelineList {
         let scale = (max_width / width).min(max_height / height).min(1.0);
         width *= scale;
         height *= scale;
-        let min_width = max_width.min(120.0).max(1.0);
-        let min_height = max_height.min(90.0).max(1.0);
+        let min_width = max_width.clamp(1.0, 120.0);
+        let min_height = max_height.clamp(1.0, 90.0);
         (width.max(min_width), height.max(min_height))
     }
 

@@ -1680,21 +1680,21 @@ fn upsert_message_in_state(state: &mut UiState, mut message: MessageRecord) {
     // If we're upserting our own message (e.g. from MessageUpserted when outbox wasn't
     // matched), remove a matching pending so we don't show the same message twice.
     let current_user = current_user_id(state);
-    if message.author_id == current_user {
-        if let Some(incoming_body) = message_body_text_for_matching(&message) {
-            let pending_id_to_remove = state
-                .timeline
-                .messages
-                .iter()
-                .rev()
-                .find(|m| {
-                    m.id.0.starts_with("local:")
-                        && message_body_text_for_matching(m).as_ref() == Some(&incoming_body)
-                })
-                .map(|m| m.id.clone());
-            if let Some(pending_id) = pending_id_to_remove {
-                replace_pending_message_id(state, &pending_id, &message.id);
-            }
+    if message.author_id == current_user
+        && let Some(incoming_body) = message_body_text_for_matching(&message)
+    {
+        let pending_id_to_remove = state
+            .timeline
+            .messages
+            .iter()
+            .rev()
+            .find(|m| {
+                m.id.0.starts_with("local:")
+                    && message_body_text_for_matching(m).as_ref() == Some(&incoming_body)
+            })
+            .map(|m| m.id.clone());
+        if let Some(pending_id) = pending_id_to_remove {
+            replace_pending_message_id(state, &pending_id, &message.id);
         }
     }
 
@@ -1758,10 +1758,7 @@ fn replace_pending_message_id(state: &mut UiState, pending_id: &MessageId, _serv
         .retain(|message| message.id != *pending_id);
 }
 
-fn preserve_local_attachment_sources(
-    existing: &MessageRecord,
-    incoming: &mut MessageRecord,
-) {
+fn preserve_local_attachment_sources(existing: &MessageRecord, incoming: &mut MessageRecord) {
     if existing.attachments.is_empty() || incoming.attachments.is_empty() {
         return;
     }
@@ -2208,7 +2205,7 @@ fn build_sidebar_sections(
             },
         ));
     }
-    unread_rows.sort_by(|left, right| right.0.cmp(&left.0));
+    unread_rows.sort_by_key(|entry| std::cmp::Reverse(entry.0));
     let unread_rows = unread_rows
         .into_iter()
         .map(|(_, row)| row)

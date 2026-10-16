@@ -1813,35 +1813,35 @@ impl AppModels {
             .recent_aliases
             .iter()
             .find(|alias| !is_builtin(alias))
-            .and_then(|alias| {
+            .map(|alias| {
                 let bare = alias
                     .strip_prefix(':')
                     .and_then(|s| s.strip_suffix(':'))
                     .unwrap_or(alias);
                 if let Some(render) = self.timeline.emoji_index.get(&bare.to_ascii_lowercase()) {
-                    Some(QuickReactRecent {
+                    QuickReactRecent {
                         alias: alias.clone(),
                         unicode: render.unicode.clone(),
                         asset_path: render.asset_path.clone(),
-                    })
+                    }
                 } else if let Some(stock) = emojis::get_by_shortcode(bare) {
-                    Some(QuickReactRecent {
+                    QuickReactRecent {
                         alias: bare.to_string(),
                         unicode: Some(stock.to_string()),
                         asset_path: None,
-                    })
+                    }
                 } else if emojis::get(alias).is_some() {
-                    Some(QuickReactRecent {
+                    QuickReactRecent {
                         alias: alias.clone(),
                         unicode: Some(alias.clone()),
                         asset_path: None,
-                    })
+                    }
                 } else {
-                    Some(QuickReactRecent {
+                    QuickReactRecent {
                         alias: alias.clone(),
                         unicode: None,
                         asset_path: None,
-                    })
+                    }
                 }
             });
     }
@@ -2388,9 +2388,7 @@ impl AppModels {
                 self.search.highlighted_index = (!self.search.results.is_empty()).then_some(0);
                 self.set_right_pane(RightPaneMode::Hidden);
             }
-            Route::Activity { .. }
-            | Route::Preferences
-            | Route::WorkspaceHome { .. } => {
+            Route::Activity { .. } | Route::Preferences | Route::WorkspaceHome { .. } => {
                 self.set_right_pane(RightPaneMode::Hidden);
             }
             Route::ActiveCall { .. } => {
@@ -3315,7 +3313,7 @@ fn normalize_tlf_name(tlf: &str) -> String {
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .collect();
-    parts.sort_unstable_by(|a, b| a.to_ascii_lowercase().cmp(&b.to_ascii_lowercase()));
+    parts.sort_unstable_by_key(|a| a.to_ascii_lowercase());
     parts.join(",")
 }
 
@@ -3496,13 +3494,12 @@ fn resolve_mention_username(
         return username.clone();
     }
 
-    if raw.contains(' ') {
-        if let Some((username, _)) = profile_names
+    if raw.contains(' ')
+        && let Some((username, _)) = profile_names
             .iter()
             .find(|(_, full_name)| full_name.trim().eq_ignore_ascii_case(raw))
-        {
-            return username.clone();
-        }
+    {
+        return username.clone();
     }
 
     raw_lower

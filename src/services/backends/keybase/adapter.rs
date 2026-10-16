@@ -1687,17 +1687,10 @@ impl ChatBackend for KeybaseBackend {
                                 .iter()
                                 .find(|item| {
                                     item.summary.kind == ConversationKind::Channel
-                                        && item
-                                            .summary
-                                            .group
-                                            .as_ref()
-                                            .is_some_and(|group| {
-                                                group.id.eq_ignore_ascii_case(&team_name)
-                                            })
-                                        && item
-                                            .summary
-                                            .title
-                                            .eq_ignore_ascii_case(&channel_name)
+                                        && item.summary.group.as_ref().is_some_and(|group| {
+                                            group.id.eq_ignore_ascii_case(&team_name)
+                                        })
+                                        && item.summary.title.eq_ignore_ascii_case(&channel_name)
                                 })
                                 .cloned();
                             if let Some(resolved) = resolved {
@@ -1753,8 +1746,7 @@ impl ChatBackend for KeybaseBackend {
                 workspace_id,
             } => {
                 let mut emitted = Vec::new();
-                let raw_conversation_id =
-                    provider_ref_to_conversation_id_bytes(&conversation);
+                let raw_conversation_id = provider_ref_to_conversation_id_bytes(&conversation);
                 if let Some(raw_id) = raw_conversation_id
                     && let Some(path) = socket_path()
                     && let Ok(runtime) = Builder::new_current_thread().enable_all().build()
@@ -1816,21 +1808,29 @@ impl ChatBackend for KeybaseBackend {
                     let join_result = runtime.block_on(async move {
                         let transport = FramedMsgpackTransport::connect(&path).await?;
                         let mut client = KeybaseRpcClient::new(transport);
-                        let raw_conversation_id =
-                            provider_ref_to_conversation_id_bytes(&conversation).ok_or_else(|| {
-                                io::Error::new(
-                                    io::ErrorKind::InvalidInput,
-                                    "invalid provider conversation reference",
-                                )
-                            })?;
-                        call_join_conversation_by_id_local(&mut client, &raw_conversation_id).await?;
+                        let raw_conversation_id = provider_ref_to_conversation_id_bytes(
+                            &conversation,
+                        )
+                        .ok_or_else(|| {
+                            io::Error::new(
+                                io::ErrorKind::InvalidInput,
+                                "invalid provider conversation reference",
+                            )
+                        })?;
+                        call_join_conversation_by_id_local(&mut client, &raw_conversation_id)
+                            .await?;
                         Ok::<_, io::Error>(raw_conversation_id)
                     });
                     match join_result {
                         Ok(raw_conversation_id) => {
-                            let conversation_id =
-                                ConversationId::new(format!("kb_conv:{}", hex_encode(&raw_conversation_id)));
-                            tracing::info!("JoinChannel: successfully joined {}", conversation_id.0);
+                            let conversation_id = ConversationId::new(format!(
+                                "kb_conv:{}",
+                                hex_encode(&raw_conversation_id)
+                            ));
+                            tracing::info!(
+                                "JoinChannel: successfully joined {}",
+                                conversation_id.0
+                            );
                             return Ok(vec![BackendEvent::ChannelJoined {
                                 workspace_id,
                                 conversation_id,
@@ -2051,10 +2051,10 @@ fn run_listener(
                                     live_message.conversation_id.clone(),
                                 );
                             }
-                            if let Some(ref meta) = pending_send_meta {
-                                if let Some(ref local_path) = meta.local_attachment_path {
-                                    stamp_local_attachment_path(&mut live_message, local_path);
-                                }
+                            if let Some(ref meta) = pending_send_meta
+                                && let Some(ref local_path) = meta.local_attachment_path
+                            {
+                                stamp_local_attachment_path(&mut live_message, local_path);
                             }
                             ingest_message_record(
                                 Some(&sender),
@@ -3028,12 +3028,8 @@ fn parse_conversation_participants_usernames(value: &Value) -> Option<Vec<String
         items
     } else if let Some(result) = map_get_any(value, &["result", "Result"]).and_then(as_array) {
         result
-    } else if let Some(result) =
-        map_get_any(value, &["participants", "Participants"]).and_then(as_array)
-    {
-        result
     } else {
-        return None;
+        map_get_any(value, &["participants", "Participants"]).and_then(as_array)?
     };
     let mut usernames = Vec::new();
     for item in items {
@@ -3578,12 +3574,11 @@ fn load_cached_profile_summary(
     let Some(profile) = profile else {
         return (fallback_username.to_string(), None);
     };
-    let display_name = profile
-        .display_name
-        .trim()
-        .is_empty()
-        .then_some(fallback_username.to_string())
-        .unwrap_or(profile.display_name);
+    let display_name = if profile.display_name.trim().is_empty() {
+        fallback_username.to_string()
+    } else {
+        profile.display_name
+    };
     let avatar = profile
         .avatar_path
         .clone()
@@ -3832,7 +3827,7 @@ fn run_background_inbox_conversation_cache_refresh(
             if conversations.is_empty() {
                 break;
             }
-            conversations.sort_by(|left, right| right.activity_time.cmp(&left.activity_time));
+            conversations.sort_by_key(|conversation| std::cmp::Reverse(conversation.activity_time));
             let returned_count = conversations.len();
             let fresh = conversations
                 .into_iter()
@@ -6184,12 +6179,12 @@ fn merge_cached_attachment_paths(local_store: &LocalStore, message: &mut Message
             .source
             .as_ref()
             .is_some_and(|s| matches!(s, AttachmentSource::LocalPath(p) if !p.trim().is_empty()));
-        if !fresh_has_local_source {
-            if let Some(AttachmentSource::LocalPath(ref p)) = cached.source {
-                if !p.trim().is_empty() && Path::new(p).exists() {
-                    fresh.source = cached.source.clone();
-                }
-            }
+        if !fresh_has_local_source
+            && let Some(AttachmentSource::LocalPath(ref p)) = cached.source
+            && !p.trim().is_empty()
+            && Path::new(p).exists()
+        {
+            fresh.source = cached.source.clone();
         }
         let fresh_has_local_preview = fresh
             .preview
@@ -6197,14 +6192,13 @@ fn merge_cached_attachment_paths(local_store: &LocalStore, message: &mut Message
             .is_some_and(|preview| {
                 matches!(&preview.source, AttachmentSource::LocalPath(p) if !p.trim().is_empty())
             });
-        if !fresh_has_local_preview {
-            if let Some(ref preview) = cached.preview {
-                if let AttachmentSource::LocalPath(ref p) = preview.source {
-                    if !p.trim().is_empty() && Path::new(p).exists() {
-                        fresh.preview = cached.preview.clone();
-                    }
-                }
-            }
+        if !fresh_has_local_preview
+            && let Some(ref preview) = cached.preview
+            && let AttachmentSource::LocalPath(ref p) = preview.source
+            && !p.trim().is_empty()
+            && Path::new(p).exists()
+        {
+            fresh.preview = cached.preview.clone();
         }
     }
 }
@@ -7694,7 +7688,12 @@ fn maybe_handle_new_conversation_notify(
         return;
     };
     let conversation_id = parsed.summary.id.clone();
-    if local_store.get_conversation(&conversation_id).ok().flatten().is_some() {
+    if local_store
+        .get_conversation(&conversation_id)
+        .ok()
+        .flatten()
+        .is_some()
+    {
         return;
     }
     tracing::info!(
@@ -7707,8 +7706,7 @@ fn maybe_handle_new_conversation_notify(
     let provider_ref = parsed.provider_ref.clone();
     let _ = local_store.persist_conversation(&parsed.summary, parsed.activity_time);
     let _ = local_store.persist_conversation_binding(&conversation_id, &provider_ref);
-    let (channels, direct_messages) = if matches!(parsed.summary.kind, ConversationKind::Channel)
-    {
+    let (channels, direct_messages) = if matches!(parsed.summary.kind, ConversationKind::Channel) {
         (vec![parsed.summary], Vec::new())
     } else {
         (Vec::new(), vec![parsed.summary])
@@ -8408,9 +8406,7 @@ fn maybe_handle_profile_notify(
 }
 
 fn resolve_username_from_uid(uid: &str) -> Option<String> {
-    let Some(socket) = socket_path() else {
-        return None;
-    };
+    let socket = socket_path()?;
     let runtime = Builder::new_current_thread().enable_all().build().ok()?;
     runtime.block_on(async move {
         let transport = FramedMsgpackTransport::connect(&socket).await.ok()?;
@@ -8821,10 +8817,9 @@ fn message_reaction_sync_event_for_message_ids(
         .ok()?;
     let reactions_by_message = message_ids
         .iter()
-        .cloned()
         .map(|message_id| MessageReactionsForMessage {
             message_id: message_id.clone(),
-            reactions: aggregate_message_reactions(loaded.get(&message_id)),
+            reactions: aggregate_message_reactions(loaded.get(message_id)),
         })
         .collect::<Vec<_>>();
     Some(BackendEvent::MessageReactionsSynced {
@@ -10516,10 +10511,8 @@ fn refresh_inbox_unread_state(sender: &Sender<BackendEvent>, local_store: &Local
             .is_none();
         let _ = local_store.persist_conversation(&conversation.summary, conversation.activity_time);
         if is_new {
-            let _ = local_store.persist_conversation_binding(
-                &conversation_id,
-                &conversation.provider_ref,
-            );
+            let _ = local_store
+                .persist_conversation_binding(&conversation_id, &conversation.provider_ref);
             new_bindings.push(ConversationBinding {
                 conversation_id: conversation_id.clone(),
                 backend_id: BackendId::new(KEYBASE_BACKEND_ID),
@@ -10600,11 +10593,8 @@ async fn bootstrap_payload_from_service(
     let account_display_name = status_username(&status);
 
     let conversations_value = fetch_inbox_unboxed(&mut client).await?;
-    let mut conversations = parse_inbox_conversations(
-        &conversations_value,
-        account_display_name.as_deref(),
-        false,
-    );
+    let mut conversations =
+        parse_inbox_conversations(&conversations_value, account_display_name.as_deref(), false);
     if conversations.is_empty() {
         return Ok(BootstrapPayload {
             workspace_ids: vec![WorkspaceId::new(WORKSPACE_ID)],
@@ -10621,7 +10611,7 @@ async fn bootstrap_payload_from_service(
         });
     }
 
-    conversations.sort_by(|left, right| right.activity_time.cmp(&left.activity_time));
+    conversations.sort_by_key(|conversation| std::cmp::Reverse(conversation.activity_time));
 
     let selected = conversations.first().cloned();
     let selected_page = if let Some(conversation) = &selected {
@@ -10813,7 +10803,10 @@ async fn fetch_inbox_for_team_topic(
         (Value::from("status"), Value::Array(Vec::new())),
         (Value::from("memberStatus"), all_member_statuses()),
         (Value::from("tlfName"), Value::from(team_name.to_string())),
-        (Value::from("topicName"), Value::from(topic_name.to_string())),
+        (
+            Value::from("topicName"),
+            Value::from(topic_name.to_string()),
+        ),
         (Value::from("membersType"), Value::from(TEAM_MEMBERS_TYPE)),
         (Value::from("unreadOnly"), Value::from(false)),
         (Value::from("readOnly"), Value::from(false)),
@@ -10900,7 +10893,10 @@ async fn call_find_conversations_local(
             CHAT_FIND_CONVERSATIONS_LOCAL,
             vec![Value::Map(vec![
                 (Value::from("tlfName"), Value::from(team_name.to_string())),
-                (Value::from("topicName"), Value::from(channel_name.to_string())),
+                (
+                    Value::from("topicName"),
+                    Value::from(channel_name.to_string()),
+                ),
                 (Value::from("topicType"), Value::from(TOPIC_TYPE_CHAT)),
                 (Value::from("membersType"), Value::from(TEAM_MEMBERS_TYPE)),
                 (
@@ -11053,8 +11049,8 @@ fn extract_find_conversation_raw_id(response: &Value) -> Option<Vec<u8>> {
     }
 
     for candidate in candidates {
-        let container = map_get_any(candidate, &["conv", "conversation", "info", "i"])
-            .unwrap_or(candidate);
+        let container =
+            map_get_any(candidate, &["conv", "conversation", "info", "i"]).unwrap_or(candidate);
         if let Some(bytes) = find_value_for_keys(
             container,
             &["id", "convID", "convId", "conversationID", "conversationId"],
@@ -12041,8 +12037,7 @@ fn parse_inbox_ui_item(
     value: &Value,
     self_username: Option<&str>,
 ) -> Option<BootstrapConversation> {
-    let conv_id_str = map_get_any(value, &["convID", "convId"])
-        .and_then(as_str)?;
+    let conv_id_str = map_get_any(value, &["convID", "convId"]).and_then(as_str)?;
     let raw_id = hex_decode(conv_id_str)?;
     let encoded_id = format!("kb_conv:{}", hex_encode(&raw_id));
     let conversation_id = ConversationId::new(encoded_id.clone());
@@ -12062,13 +12057,9 @@ fn parse_inbox_ui_item(
     let status = map_get_any(value, &["status", "s"])
         .and_then(as_i64)
         .unwrap_or(0);
-    let member_status = map_get_any(value, &["memberStatus"])
-        .and_then(as_i64);
-    let activity_time = map_get_any(value, &["time"])
-        .and_then(as_i64)
-        .unwrap_or(0);
-    let read_msg = map_get_any(value, &["readMsgID", "readMsgid"])
-        .and_then(as_i64);
+    let member_status = map_get_any(value, &["memberStatus"]).and_then(as_i64);
+    let activity_time = map_get_any(value, &["time"]).and_then(as_i64).unwrap_or(0);
+    let read_msg = map_get_any(value, &["readMsgID", "readMsgid"]).and_then(as_i64);
 
     let title = conversation_title(&tlf_name, &topic_name, members_type, self_username);
     let kind = conversation_kind(&tlf_name, members_type);
@@ -12125,17 +12116,21 @@ fn extract_conv_from_notify(event: &KeybaseNotifyEvent) -> Option<&Value> {
     };
     let activity = find_value_for_keys(raw_params, &["activity", "a"], 0)?;
     for container_key in &[
-        "incomingMessage", "im", "i",
-        "newConversation", "nc",
-        "setStatus", "ss",
-        "readMessage", "rm",
+        "incomingMessage",
+        "im",
+        "i",
+        "newConversation",
+        "nc",
+        "setStatus",
+        "ss",
+        "readMessage",
+        "rm",
     ] {
-        if let Some(container) = map_get(activity, container_key) {
-            if let Some(conv) = map_get_any(container, &["conv", "c"]) {
-                if map_get_any(conv, &["convID", "convId"]).is_some() {
-                    return Some(conv);
-                }
-            }
+        if let Some(container) = map_get(activity, container_key)
+            && let Some(conv) = map_get_any(container, &["conv", "c"])
+            && map_get_any(conv, &["convID", "convId"]).is_some()
+        {
+            return Some(conv);
         }
     }
     None
@@ -12350,16 +12345,15 @@ fn parse_thread_page(value: &Value, conversation_id: &ConversationId) -> ThreadP
             continue;
         }
         if let Some(mut message) = parse_thread_message(valid, conversation_id, message_type) {
-            if message.permalink.is_empty() {
-                if let Some((ref tlf_name, ref topic_name)) = permalink_base {
-                    if let Ok(msg_id) = message.id.0.parse::<i64>() {
-                        message.permalink = if topic_name == tlf_name {
-                            format!("keybase://chat/{}/{}", tlf_name, msg_id)
-                        } else {
-                            format!("keybase://chat/{}#{}/{}", tlf_name, topic_name, msg_id)
-                        };
-                    }
-                }
+            if message.permalink.is_empty()
+                && let Some((ref tlf_name, ref topic_name)) = permalink_base
+                && let Ok(msg_id) = message.id.0.parse::<i64>()
+            {
+                message.permalink = if topic_name == tlf_name {
+                    format!("keybase://chat/{}/{}", tlf_name, msg_id)
+                } else {
+                    format!("keybase://chat/{}#{}/{}", tlf_name, topic_name, msg_id)
+                };
             }
             page.reaction_deltas
                 .extend(parse_reaction_deltas_for_target(
@@ -15399,16 +15393,13 @@ fn media_hints_from_url(url: &str) -> UrlMediaHints {
                 continue;
             }
             match key.as_str() {
-                "width" | "w" => {
-                    if hints.width.is_none() {
-                        hints.width = value.parse::<u32>().ok().filter(|candidate| *candidate > 0);
-                    }
+                "width" | "w" if hints.width.is_none() => {
+                    hints.width = value.parse::<u32>().ok().filter(|candidate| *candidate > 0);
                 }
-                "height" | "h" => {
-                    if hints.height.is_none() {
-                        hints.height = value.parse::<u32>().ok().filter(|candidate| *candidate > 0);
-                    }
+                "height" | "h" if hints.height.is_none() => {
+                    hints.height = value.parse::<u32>().ok().filter(|candidate| *candidate > 0);
                 }
+                "width" | "w" | "height" | "h" => {}
                 "isvideo" | "video" => {
                     hints.is_video = hints.is_video
                         || matches!(
@@ -18195,8 +18186,10 @@ mod tests {
 
     #[test]
     fn parse_metadata_mentions_keeps_shortcode_text_inside_inline_code() {
-        let mut metadata = MentionParseMetadata::default();
-        metadata.has_hints = true;
+        let mut metadata = MentionParseMetadata {
+            has_hints: true,
+            ..MentionParseMetadata::default()
+        };
         metadata.at_mentions.insert("bob".to_string());
 
         let fragments =
@@ -18244,8 +18237,10 @@ mod tests {
 
     #[test]
     fn parse_metadata_mentions_keeps_shortcode_text_inside_fenced_code_block() {
-        let mut metadata = MentionParseMetadata::default();
-        metadata.has_hints = true;
+        let mut metadata = MentionParseMetadata {
+            has_hints: true,
+            ..MentionParseMetadata::default()
+        };
         metadata.at_mentions.insert("bob".to_string());
 
         let fragments =
@@ -18428,8 +18423,10 @@ mod tests {
 
     #[test]
     fn parse_metadata_mentions_supports_hash_suffix_custom_emoji_alias() {
-        let mut metadata = MentionParseMetadata::default();
-        metadata.has_hints = true;
+        let metadata = MentionParseMetadata {
+            has_hints: true,
+            ..MentionParseMetadata::default()
+        };
         let fragments = parse_metadata_mentions_from_text("hello :troll#2: world", &metadata);
         assert!(fragments.iter().any(|fragment| matches!(
             fragment,
@@ -18467,7 +18464,7 @@ mod tests {
         assert_eq!(parsed.get(&UserId::new("bob")), Some(&3));
         assert_eq!(parsed.get(&UserId::new("carol")), Some(&2));
         assert!(
-            parsed.get(&UserId::new("deleted")).is_none(),
+            !parsed.contains_key(&UserId::new("deleted")),
             "non-active team members should be ignored"
         );
     }

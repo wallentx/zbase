@@ -10,7 +10,7 @@ identifier = "com.zbase.app"
 icon = ["assets/macos/AppIcon.icns"]
 
 [dependencies]
-gpui = { version = "0.2.2", default-features = false, features = ["font-kit"] }
+gpui = { version = "0.2.2", default-features = false, features = ["font-kit", "wayland", "x11"] }
 unicode-segmentation = "1.12.0"
 tokio = { version = "1", features = ["rt-multi-thread", "net", "sync", "time", "io-util"] }
 tracing = "0.1"
@@ -42,3 +42,4 @@ tree-sitter-bash = "0.25.1"
 tree-sitter-go = "0.25.0"
 tree-sitter-toml-ng = "0.7.0"
 tree-sitter-sequel = "0.3.11"
+

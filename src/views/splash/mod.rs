@@ -37,14 +37,20 @@ impl SplashView {
             .items_center()
             .justify_center()
             .bg(rgb(app_bg()))
-            .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
-                this.clear_hovered_message_immediate(cx);
-                cx.stop_propagation();
-            }))
-            .on_mouse_down(MouseButton::Right, cx.listener(|this, _, _, cx| {
-                this.clear_hovered_message_immediate(cx);
-                cx.stop_propagation();
-            }))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    this.clear_hovered_message_immediate(cx);
+                    cx.stop_propagation();
+                }),
+            )
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(|this, _, _, cx| {
+                    this.clear_hovered_message_immediate(cx);
+                    cx.stop_propagation();
+                }),
+            )
             .on_mouse_move(cx.listener(|this, _, _, cx| {
                 this.clear_hovered_message_immediate(cx);
                 cx.stop_propagation();
